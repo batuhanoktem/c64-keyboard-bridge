@@ -163,6 +163,11 @@ pub trait KeyboardBackend: Send {
     fn type_text(&mut self, _text: &str) -> Result<(), BackendError> {
         Err(BackendError::Unsupported("text input".into()))
     }
+    /// Retry release of a temporary key owned by a partially failed text action.
+    /// Keep that ownership until release succeeds; this must bypass layout checks.
+    fn cleanup_pending_text(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingEvent {
@@ -843,7 +848,9 @@ impl Mapper {
     }
     fn release_owned(&mut self, backend: &mut dyn KeyboardBackend) -> Result<(), MappingError> {
         let keys: Vec<_> = self.pressed.iter().copied().collect();
-        let mut first_error = None;
+        // Temporary Unicode keys are ordinary keys too. Attempt their release
+        // before dropping modifiers, even when another release later fails.
+        let mut first_error = backend.cleanup_pending_text().err();
         for modifiers in [false, true] {
             for key in keys
                 .iter()
@@ -1307,6 +1314,62 @@ mod tests {
             vec![NativeKey::A, NativeKey::B, NativeKey::LeftShift]
         );
         assert_eq!(m.pressed_keys(), &BTreeSet::from([NativeKey::A]));
+    }
+    #[test]
+    fn pending_text_release_precedes_modifiers_and_is_retried_after_failure() {
+        struct PendingText {
+            events: Vec<&'static str>,
+            fail: bool,
+        }
+        impl KeyboardBackend for PendingText {
+            fn capabilities(&self) -> BackendCapabilities {
+                BackendCapabilities {
+                    key_events: true,
+                    text: true,
+                    repeat: true,
+                }
+            }
+            fn press(&mut self, _: NativeKey) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn release(&mut self, key: NativeKey) -> Result<(), BackendError> {
+                assert!(key.is_modifier());
+                self.events.push("modifier up");
+                Ok(())
+            }
+            fn repeat(&mut self, _: NativeKey) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn cleanup_pending_text(&mut self) -> Result<(), BackendError> {
+                self.events.push("text up");
+                if self.fail {
+                    Err(BackendError::Injection(
+                        "temporary text release refused".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut m = mapper(HostPlatform::MacOS);
+        let mut b = PendingText {
+            events: Vec::new(),
+            fail: true,
+        };
+        m.transition(
+            KeyEvent {
+                key: PhysicalKey::LeftShift,
+                pressed: true,
+                modifiers: MOD_SHIFT,
+            },
+            &mut b,
+        )
+        .unwrap();
+        assert!(m.release_all(&mut b).is_err());
+        assert_eq!(b.events, vec!["text up", "modifier up"]);
+        b.fail = false;
+        m.release_all(&mut b).unwrap();
+        assert_eq!(b.events, vec!["text up", "modifier up", "text up"]);
     }
     #[test]
     fn shipped_profile_files_are_valid() {
