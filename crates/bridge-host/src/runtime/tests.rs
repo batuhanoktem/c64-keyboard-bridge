@@ -515,7 +515,7 @@ async fn watchdog_releases_after_three_seconds_without_valid_traffic() {
 }
 
 #[tokio::test]
-async fn mid_session_sync_releases_and_quarantines_without_creating_presses() {
+async fn disagreeing_mid_session_snapshot_ends_session_and_releases_without_presses() {
     let h = Harness::new();
     h.worker.enable(true).await.unwrap();
     let mut c = h.client(TOKEN).await;
@@ -531,21 +531,61 @@ async fn mid_session_sync_releases_and_quarantines_without_creating_presses() {
     let mut held = MatrixState::default();
     held.set(PhysicalKey::B, true);
     c.sync(held).await;
+    let error = c.task.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("State synchronization disagrees")
+    );
     h.wait_for(|| h.events().contains(&RecordingEvent::Release(NativeKey::A)))
         .await;
     assert!(!h.events().contains(&RecordingEvent::Press(NativeKey::B)));
+}
+
+#[tokio::test]
+async fn agreeing_snapshot_releases_and_quarantines_until_fresh_physical_press() {
+    let h = Harness::new();
+    h.worker.enable(true).await.unwrap();
+    let mut c = h.client(TOKEN).await;
+    c.hello(TOKEN).await;
+    c.sync(MatrixState::default()).await;
+    c.send(Message::KeyDown {
+        key: PhysicalKey::A,
+        modifiers: 0,
+    })
+    .await;
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+    let mut held = MatrixState::default();
+    held.set(PhysicalKey::A, true);
+    c.sync(held).await;
+    h.wait_for(|| h.events().contains(&RecordingEvent::Release(NativeKey::A)))
+        .await;
+    assert_eq!(
+        h.events()
+            .iter()
+            .filter(|e| **e == RecordingEvent::Press(NativeKey::A))
+            .count(),
+        1
+    );
     c.send(Message::KeyUp {
-        key: PhysicalKey::B,
+        key: PhysicalKey::A,
         modifiers: 0,
     })
     .await;
     c.send(Message::KeyDown {
-        key: PhysicalKey::B,
+        key: PhysicalKey::A,
         modifiers: 0,
     })
     .await;
-    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::B)))
-        .await;
+    h.wait_for(|| {
+        h.events()
+            .iter()
+            .filter(|e| **e == RecordingEvent::Press(NativeKey::A))
+            .count()
+            == 2
+    })
+    .await;
     c.finish().await;
 }
 

@@ -410,7 +410,10 @@ async fn session(
                         worker.event(event)?;
                     }
                     Message::Heartbeat(snapshot)=>{if snapshot != *physical.lock().unwrap(){bail!("Heartbeat state disagrees with ordered transitions");}}
-                    Message::StateSync(snapshot)=>{*physical.lock().unwrap()=snapshot;worker.synchronize(snapshot);},
+                    Message::StateSync(snapshot)=>{
+                        if snapshot != *physical.lock().unwrap(){bail!("State synchronization disagrees with ordered transitions");}
+                        worker.synchronize(snapshot);
+                    },
                     Message::Disconnect {..}=>return Ok(()),
                     Message::Error {code,..}=>{if code!=0 {bail!("C64 reported client error code {code}");}},
                     _=>bail!("Unexpected message after session initialization"),
