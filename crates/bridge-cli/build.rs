@@ -1,5 +1,28 @@
 use std::{env, path::PathBuf, process::Command};
 fn main() {
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let floor = if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+            (11, 0)
+        } else {
+            (10, 15)
+        };
+        let configured = env::var("MACOSX_DEPLOYMENT_TARGET").ok().and_then(|value| {
+            let mut parts = value.split('.');
+            Some((
+                parts.next()?.parse::<u32>().ok()?,
+                parts.next().unwrap_or("0").parse::<u32>().ok()?,
+            ))
+        });
+        if configured.is_none_or(|version| version < floor) {
+            // CoreGraphics post-event authorization starts at 10.15. Rust's
+            // Intel default is older, so ordinary source builds need a floor too.
+            println!(
+                "cargo:rustc-link-arg=-mmacosx-version-min={}.{}",
+                floor.0, floor.1
+            );
+        }
+    }
     let workspace = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
     let source = workspace.join("c64");
     println!("cargo:rerun-if-changed={}", source.join("src").display());
