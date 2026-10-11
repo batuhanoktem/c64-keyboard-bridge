@@ -1,0 +1,6 @@
+name = "Authentic Commodore"
+profile = "authentic"
+layout = "US"
+
+# Shifted number legends follow the C64. Unicode £, ↑ and ← require a backend
+# with text support. Original PETSCII graphics have no general native-key match.

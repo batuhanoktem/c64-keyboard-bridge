@@ -1,0 +1,34 @@
+[workspace]
+members = ["crates/bridge-protocol", "crates/bridge-core"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-only"
+repository = "https://github.com/batuhanoktem/c64-keyboard-bridge"
+
+[workspace.dependencies]
+bridge-protocol = { path = "crates/bridge-protocol" }
+bridge-core = { path = "crates/bridge-core" }
+bridge-host = { path = "crates/bridge-host" }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "test-util"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dotenvy = "0.15.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+anyhow = "1.0"
+clap = { version = "4.6.7", features = ["derive"] }
+toml = "1.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+directories = "6.0"
+getrandom = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+

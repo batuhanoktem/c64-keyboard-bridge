@@ -1,0 +1,15 @@
+name = "Modern US"
+profile = "modern"
+layout = "US"
+
+# Optional modifier roles (defaults: CTRL=Control, C=Meta on macOS and Control
+# on Windows/Linux). Allowed values are Control, Alt and Meta.
+# commodore_modifier = "Alt"
+# control_modifier = "Control"
+
+# Optional ordinary-key overrides. Native key names are enum names, and source
+# modifiers are Shift, Control, Commodore. The most specific matching rule wins.
+# [[bindings]]
+# key = "RunStop"
+# keys = ["Escape"]
+# shift = "suppress"

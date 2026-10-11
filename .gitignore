@@ -1,0 +1,9 @@
+/target/
+.env
+.env.*
+!.env.example
+/c64/build/
+*.configured.prg
+*.configured.PRG
+*.log
+.DS_Store
