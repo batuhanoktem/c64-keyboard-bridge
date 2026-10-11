@@ -16,7 +16,7 @@ scripts/package.sh
 
 `build-prgs.sh` always rebuilds both PRGs into `target/c64-prgs/`. A file lock with a 60-second wait limit prevents simultaneous invocations from overwriting intermediate assembly and object files. The build rejects source changes before publishing its manifest. `verify-prgs.py` rejects a changed load address, missing/ambiguous configuration marker, configured destination/token, or mismatch between the PRGs, source hash and pinned-build manifest.
 
-The Windows native CI job preserves LF checkout bytes and downloads the PRGs and manifest from the Ubuntu C64 build job, so their source hashes agree across platforms. For an equivalent local host-only check using a matching build artifact:
+The Windows native CI job preserves LF checkout bytes and downloads the PRGs and manifest from the Ubuntu C64 build job. Hashing orders POSIX relative path strings consistently across platforms, so Windows and Unix source manifests agree. For an equivalent local host-only check using a matching build artifact:
 
 ```sh
 export C64_PRG_DIR=/path/to/verified/prgs

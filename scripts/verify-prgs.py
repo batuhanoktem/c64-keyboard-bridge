@@ -18,7 +18,7 @@ def source_hash() -> str:
     files = [ROOT / "c64/Makefile"]
     for folder in ("src", "include"):
         files.extend(p for p in (ROOT / "c64" / folder).rglob("*") if p.is_file())
-    for path in sorted(files):
+    for path in sorted(files, key=lambda item: item.relative_to(ROOT).as_posix()):
         digest.update(path.relative_to(ROOT).as_posix().encode() + b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")

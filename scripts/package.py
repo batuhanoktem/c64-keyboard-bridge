@@ -91,7 +91,7 @@ def source_files() -> list[Path]:
                 continue
             if path.is_file() and not path.is_symlink() and path.suffix.lower() in extensions:
                 result.append(path)
-    return sorted(set(result))
+    return sorted(set(result), key=lambda path: path.relative_to(ROOT).as_posix())
 
 
 def project_hash(files: list[Path]) -> str:
