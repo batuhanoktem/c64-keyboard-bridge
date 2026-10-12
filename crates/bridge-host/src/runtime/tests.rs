@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::atomic::AtomicBool};
 struct Trace {
     events: Mutex<Vec<RecordingEvent>>,
     block_press: AtomicBool,
+    block_key: Mutex<Option<NativeKey>>,
     entered: AtomicBool,
     fail_release: AtomicBool,
     fail_layout: AtomicBool,
@@ -35,7 +36,11 @@ impl KeyboardBackend for TestBackend {
             .push(RecordingEvent::Press(key));
         self.0.entered.store(true, Ordering::SeqCst);
         let until = Instant::now() + Duration::from_secs(2);
-        while self.0.block_press.load(Ordering::SeqCst) && Instant::now() < until {
+        let blocked_key = *self.0.block_key.lock().unwrap();
+        while blocked_key.is_none_or(|blocked| blocked == key)
+            && self.0.block_press.load(Ordering::SeqCst)
+            && Instant::now() < until
+        {
             thread::sleep(Duration::from_millis(1));
         }
         Ok(())
@@ -447,6 +452,48 @@ async fn host_repeat_stops_on_physical_release() {
     let count = h.events().len();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(h.events().len(), count);
+}
+
+#[tokio::test]
+async fn queued_release_precedes_expired_host_repeat() {
+    let h = Harness::new();
+    h.worker.enable(true).await.unwrap();
+    *h.trace.block_key.lock().unwrap() = Some(NativeKey::LeftShift);
+    h.event(PhysicalKey::A, true);
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+
+    // Stall a modifier transition without replacing A's repeat deadline. Queue
+    // its release while the worker is still gated and its deadline has expired.
+    h.trace.block_press.store(true, Ordering::SeqCst);
+    h.event(PhysicalKey::LeftShift, true);
+    h.wait_for(|| {
+        h.events()
+            .contains(&RecordingEvent::Press(NativeKey::LeftShift))
+    })
+    .await;
+    let mut expected = h.events();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    h.event(PhysicalKey::A, false);
+    h.trace.block_press.store(false, Ordering::SeqCst);
+    h.wait_for(|| h.events().contains(&RecordingEvent::Release(NativeKey::A)))
+        .await;
+    h.event(PhysicalKey::LeftShift, false);
+    h.wait_for(|| {
+        h.events()
+            .contains(&RecordingEvent::Release(NativeKey::LeftShift))
+    })
+    .await;
+
+    expected.extend([
+        RecordingEvent::Release(NativeKey::A),
+        RecordingEvent::Release(NativeKey::LeftShift),
+    ]);
+    assert_eq!(
+        h.events(),
+        expected,
+        "An expired repeat must not overtake an already queued key release"
+    );
 }
 
 #[tokio::test]

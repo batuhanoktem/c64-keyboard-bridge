@@ -235,6 +235,7 @@ fn spawn_worker_with_factory(
                 }
             }
             let input=if let Some(input)=pending.take(){Ok(input)}else{events_rx.recv_timeout(Duration::from_millis(5))};
+            let queue_idle=matches!(&input,Err(mpsc::RecvTimeoutError::Timeout));
             match input {
                 Ok(input) if input.generation>epoch=>{pending=Some(input);thread::sleep(Duration::from_millis(1));continue;},
                 Ok(input) if enabled && input.generation==epoch=>{
@@ -261,7 +262,14 @@ fn spawn_worker_with_factory(
                     let mut state=status.lock().unwrap();state.enabled=false;state.detail=input_failure("host layout change",error,cleanup);
                 }
             }
-            if enabled && repeat_at.is_some_and(|t|Instant::now()>=t) {
+            if queue_idle && enabled && repeat_at.is_some_and(|t|Instant::now()>=t) {
+                // A queued release must take precedence over an expired repeat,
+                // including transitions received during the native layout check.
+                match events_rx.try_recv() {
+                    Ok(input)=>{pending=Some(input);continue;},
+                    Err(mpsc::TryRecvError::Empty)=>{},
+                    Err(mpsc::TryRecvError::Disconnected)=>{return release(&mut mapper,&mut backend);},
+                }
                 if let Err(error)=mapper.repeat(backend.as_mut().unwrap().as_mut()) {
                     let cleanup=release(&mut mapper,&mut backend);enabled=false;
                     let mut state=status.lock().unwrap();state.enabled=false;state.detail=input_failure("repeat failure",error,cleanup);
