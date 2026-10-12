@@ -549,7 +549,7 @@ impl BridgeApp {
                 }
             });
             if snapshot.settings_pending {
-                ui.colored_label(ui.visuals().warn_fg_color, "Settings are pending for the CLI-owned session. Stop it explicitly before restarting with these settings.");
+                ui.colored_label(ui.visuals().warn_fg_color, if snapshot.owned {"Settings are saved. Apply them to restart GUI-owned hosting with input disabled."} else {"Settings are pending for the CLI-owned session. Stop it explicitly before restarting with these settings."});
             }
             ui.small("Connection changes may require redeploying the C64 program. Applying settings never deploys automatically.");
             if let Some(device) = &snapshot.device {
