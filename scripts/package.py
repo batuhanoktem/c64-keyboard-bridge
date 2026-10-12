@@ -214,7 +214,10 @@ def archive_cc65(destination: Path) -> None:
 
 def write_archive(directory: Path, path: Path, windows: bool = False) -> None:
     if windows:
-        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        # Cargo-vendored notices can retain epoch timestamps outside ZIP's
+        # 1980-2107 range. Clamp archive metadata without changing source files.
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=9, strict_timestamps=False) as archive:
             for file in sorted(directory.rglob("*")):
                 if file.is_file():
                     archive.write(file, Path(directory.name) / file.relative_to(directory))
