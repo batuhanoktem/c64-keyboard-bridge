@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Original C64 Keyboard Bridge icon; GPL-3.0-only. No manufacturer logo. -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="#282442"/>
+  <rect x="65" y="154" width="382" height="221" rx="30" fill="#b8b0a1"/>
+  <rect x="83" y="174" width="346" height="179" rx="17" fill="#655e63"/>
+  <g fill="#eee7da">
+    <path d="M105 195h39v31h-39z M156 195h39v31h-39z M207 195h39v31h-39z M258 195h39v31h-39z M309 195h39v31h-39z M360 195h46v31h-46z"/>
+    <path d="M105 238h46v31h-46z M163 238h39v31h-39z M214 238h39v31h-39z M265 238h39v31h-39z M316 238h39v31h-39z M367 238h39v31h-39z"/>
+    <path d="M105 281h51v31h-51z M168 281h188v31H168z M368 281h38v31h-38z"/>
+  </g>
+  <path d="M202 100h76m-20-20 20 20-20 20" fill="none" stroke="#91a7ee" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="399" cy="393" r="12" fill="#83d4b2"/>
+</svg>
