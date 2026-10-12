@@ -14,6 +14,7 @@ Start with `c64bridge doctor` or `c64bridge doctor --json`, then `c64bridge stat
 | Probe fails after REST success | UCI mapping and Network Target are separate facilities. Verify the device's Command Interface setting and inspect exact C64 statuses. |
 | Input disabled | Normal startup is disabled. Run `resume` after deliberate authorization; inspect any backend error first. |
 | Enabled but no text | Focus the intended application, match its input source, and run the explicit `test-input` test. Check platform authorization/integrity requirements. |
+| Windows reports missing `VCRUNTIME140.dll` | Install Microsoft's supported [x64 Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/). The release archive requires this system runtime. |
 | Host layout rejected or changed | Select a supported standard US/UK source matching configuration and profile, then deliberately resume. IMEs and unknown variants are rejected. |
 | XTEST refuses `DISPLAY` | Use the intended local AF_UNIX display, such as `:0` or `unix:0`, in that desktop session. Remote/TCP and SSH-forwarded displays such as `localhost:10.0` are unsupported. |
 | X11 operation exceeds 500 ms | Inspect the local X server and its authorization/session state. Connection/setup and request/reply waits use nonblocking I/O and finite polling; input disables on failure. Restore the connection before deliberately retrying cleanup/resume. |
