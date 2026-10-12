@@ -106,6 +106,9 @@ struct Harness {
 }
 impl Harness {
     fn new() -> Self {
+        Self::with_guard(None)
+    }
+    fn with_guard(guard: Option<Arc<AtomicBool>>) -> Self {
         let config = Config::from_values(
             BTreeMap::from([
                 ("INPUT_BACKEND".into(), "recording".into()),
@@ -119,8 +122,11 @@ impl Harness {
         let physical = Arc::new(Mutex::new(MatrixState::default()));
         let trace = Arc::new(Trace::default());
         let output = trace.clone();
-        let (worker, thread) =
-            spawn_worker_with_factory(&config, status.clone(), physical.clone(), move || {
+        let (worker, thread) = spawn_worker_with_factory_guarded(
+            &config,
+            status.clone(),
+            physical.clone(),
+            move || {
                 if output.fail_factory.load(Ordering::SeqCst) {
                     Err(BackendError::Injection(
                         "recorded permission failure".into(),
@@ -128,8 +134,10 @@ impl Harness {
                 } else {
                     Ok(Box::new(TestBackend(output.clone())))
                 }
-            })
-            .unwrap();
+            },
+            guard,
+        )
+        .unwrap();
         Self {
             worker,
             thread: Some(thread),
@@ -1851,4 +1859,257 @@ async fn managed_stop_preserves_failed_cleanup_for_retry_before_destroying_worke
         RecordingEvent::Release(NativeKey::LeftShift)
     ]));
     assert!(!parent.path().join("runtime.json").exists());
+}
+
+#[tokio::test]
+async fn gui_guard_releases_held_keys_and_reopening_requires_explicit_fresh_resume() {
+    let guard = Arc::new(AtomicBool::new(true));
+    let h = Harness::with_guard(Some(guard.clone()));
+    h.worker.enable(true).await.unwrap();
+    h.event(PhysicalKey::LeftShift, true);
+    h.event(PhysicalKey::A, true);
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+    guard.store(false, Ordering::SeqCst);
+    h.wait_for(|| !h.status.lock().unwrap().enabled).await;
+    assert!(h.events().ends_with(&[
+        RecordingEvent::Release(NativeKey::A),
+        RecordingEvent::Release(NativeKey::LeftShift)
+    ]));
+    let paused_events = h.events();
+    assert_eq!(h.status.lock().unwrap().diagnostics.failures.input, 0);
+    guard.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!h.status.lock().unwrap().enabled);
+    assert_eq!(h.events(), paused_events);
+    h.worker.enable(true).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        h.events(),
+        paused_events,
+        "held ordinary keys must remain quarantined after explicit resume"
+    );
+    h.event(PhysicalKey::LeftShift, false);
+    h.event(PhysicalKey::A, false);
+    h.event(PhysicalKey::A, true);
+    h.wait_for(|| h.events().len() > paused_events.len()).await;
+    assert_eq!(
+        h.events().last(),
+        Some(&RecordingEvent::Press(NativeKey::A))
+    );
+    assert!(
+        !h.events()[paused_events.len()..].contains(&RecordingEvent::Press(NativeKey::LeftShift))
+    );
+}
+
+#[tokio::test]
+async fn gui_guard_blocked_enable_never_constructs_native_backend() {
+    let parent = tempfile::tempdir().unwrap();
+    let config = managed_config(parent.path());
+    let status = Arc::new(Mutex::new(Status::default()));
+    let physical = Arc::new(Mutex::new(MatrixState::default()));
+    let constructions = Arc::new(AtomicU64::new(0));
+    let count = constructions.clone();
+    let (worker, thread) = spawn_worker_with_factory_guarded(
+        &config,
+        status.clone(),
+        physical,
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(bridge_core::RecordingBackend::default()))
+        },
+        Some(Arc::new(AtomicBool::new(false))),
+    )
+    .unwrap();
+    assert!(worker.enable(true).await.is_err());
+    assert_eq!(constructions.load(Ordering::SeqCst), 0);
+    assert!(!status.lock().unwrap().enabled);
+    assert_eq!(status.lock().unwrap().diagnostics.failures.input, 0);
+    worker.controls.send(WorkerControl::Shutdown).unwrap();
+    finish_worker(thread, Ok(())).unwrap();
+}
+
+#[tokio::test]
+async fn gui_guard_closing_during_backend_creation_prevents_late_enable_ack() {
+    let parent = tempfile::tempdir().unwrap();
+    let config = managed_config(parent.path());
+    let status = Arc::new(Mutex::new(Status::default()));
+    let physical = Arc::new(Mutex::new(MatrixState::default()));
+    let guard = Arc::new(AtomicBool::new(true));
+    let entered = Arc::new(AtomicBool::new(false));
+    let factory_guard = guard.clone();
+    let factory_entered = entered.clone();
+    let (worker, thread) = spawn_worker_with_factory_guarded(
+        &config,
+        status.clone(),
+        physical,
+        move || {
+            factory_entered.store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(2);
+            while factory_guard.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(Box::new(bridge_core::RecordingBackend::default()))
+        },
+        Some(guard.clone()),
+    )
+    .unwrap();
+    let request = worker.clone();
+    let enable = tokio::spawn(async move { request.enable(true).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    guard.store(false, Ordering::SeqCst);
+    assert!(enable.await.unwrap().is_err());
+    assert!(!status.lock().unwrap().enabled);
+    assert_eq!(status.lock().unwrap().diagnostics.failures.input, 0);
+    worker.controls.send(WorkerControl::Shutdown).unwrap();
+    finish_worker(thread, Ok(())).unwrap();
+}
+
+#[tokio::test]
+async fn gui_guard_cleanup_failure_is_retained_without_polling_retry_or_counter_spam() {
+    let guard = Arc::new(AtomicBool::new(true));
+    let h = Harness::with_guard(Some(guard.clone()));
+    h.worker.enable(true).await.unwrap();
+    h.event(PhysicalKey::A, true);
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+    h.trace.fail_release.store(true, Ordering::SeqCst);
+    guard.store(false, Ordering::SeqCst);
+    h.wait_for(|| !h.status.lock().unwrap().enabled).await;
+    assert_eq!(h.status.lock().unwrap().diagnostics.failures.cleanup, 1);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(h.status.lock().unwrap().diagnostics.failures.cleanup, 1);
+    assert!(!h.events().contains(&RecordingEvent::Release(NativeKey::A)));
+    h.trace.fail_release.store(false, Ordering::SeqCst);
+    h.worker.enable(false).await.unwrap();
+    assert_eq!(
+        h.events().last(),
+        Some(&RecordingEvent::Release(NativeKey::A))
+    );
+}
+
+#[test]
+fn gui_guard_checks_each_native_output_but_always_allows_releases() {
+    let trace = Arc::new(Trace::default());
+    let guard = Arc::new(AtomicBool::new(true));
+    let mut backend = GuardedBackend::new(Box::new(TestBackend(trace.clone())), guard.clone());
+    backend.press(NativeKey::LeftShift).unwrap();
+    guard.store(false, Ordering::SeqCst);
+    assert!(backend.press(NativeKey::A).is_err());
+    assert!(backend.repeat(NativeKey::A).is_err());
+    assert!(backend.type_text("sentinel text must never post").is_err());
+    backend.release(NativeKey::LeftShift).unwrap();
+    assert_eq!(
+        *trace.events.lock().unwrap(),
+        [
+            RecordingEvent::Press(NativeKey::LeftShift),
+            RecordingEvent::Release(NativeKey::LeftShift)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn managed_gui_guard_remains_compatible_with_external_control_without_late_resume() {
+    let parent = tempfile::tempdir().unwrap();
+    let guard = Arc::new(AtomicBool::new(false));
+    let mut runtime = ManagedRuntime::spawn_guarded(
+        managed_config(parent.path()),
+        managed_options(),
+        guard.clone(),
+    );
+    runtime.ready().await.unwrap();
+    let blocked = control::send(parent.path(), "resume").await.unwrap();
+    assert!(!blocked.ok && !blocked.status.enabled);
+    assert_eq!(blocked.status.backend, "disabled");
+    guard.store(true, Ordering::SeqCst);
+    assert!(
+        !control::send(parent.path(), "status")
+            .await
+            .unwrap()
+            .status
+            .enabled
+    );
+    let enabled = control::send(parent.path(), "resume").await.unwrap();
+    assert!(enabled.ok && enabled.status.enabled);
+    guard.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while control::send(parent.path(), "status")
+            .await
+            .unwrap()
+            .status
+            .enabled
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime.stop().await.unwrap();
+    assert!(!parent.path().join("runtime.json").exists());
+}
+
+#[tokio::test]
+async fn independent_focus_guard_prevents_stale_arming_during_factory_and_output() {
+    let parent = tempfile::tempdir().unwrap();
+    let config = managed_config(parent.path());
+    let status = Arc::new(Mutex::new(Status::default()));
+    let physical = Arc::new(Mutex::new(MatrixState::default()));
+    let allow = Arc::new(AtomicBool::new(true));
+    let focus = Arc::new(AtomicBool::new(true));
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let factory_entered = entered.clone();
+    let factory_release = release.clone();
+    let (worker, thread) = spawn_worker_with_factory_gate(
+        &config,
+        status.clone(),
+        physical,
+        move || {
+            factory_entered.store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(2);
+            while !factory_release.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(Box::new(bridge_core::RecordingBackend::default()))
+        },
+        Some(InputGuard {
+            allow: allow.clone(),
+            focus_allowed: Some(focus.clone()),
+        }),
+    )
+    .unwrap();
+    let request = worker.clone();
+    let enable = tokio::spawn(async move { request.enable(true).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    focus.store(false, Ordering::SeqCst);
+    allow.store(false, Ordering::SeqCst);
+    // A stale countdown cannot undo the independently recorded focus change.
+    allow.store(true, Ordering::SeqCst);
+    release.store(true, Ordering::SeqCst);
+    assert!(enable.await.unwrap().is_err());
+    assert!(!status.lock().unwrap().enabled);
+    worker.controls.send(WorkerControl::Shutdown).unwrap();
+    finish_worker(thread, Ok(())).unwrap();
+    let trace = Arc::new(Trace::default());
+    let mut backend = GuardedBackend::new_with_focus(
+        Box::new(TestBackend(trace.clone())),
+        allow.clone(),
+        focus.clone(),
+    );
+    assert!(backend.press(NativeKey::A).is_err());
+    assert!(backend.repeat(NativeKey::A).is_err());
+    assert!(backend.type_text("do not post").is_err());
+    assert!(trace.events.lock().unwrap().is_empty());
 }

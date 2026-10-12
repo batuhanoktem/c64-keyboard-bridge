@@ -5,6 +5,10 @@ use crate::{backend, config::Config, pairing, prg, rest::RestClient, runtime};
 use anyhow::{Context, Result, bail};
 use bridge_core::{KeyboardBackend, NativeKey};
 use serde::Serialize;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 pub type ProbeEvidence = serde_json::Value;
 
@@ -90,10 +94,55 @@ pub struct InputTestReport {
 /// Post the deliberate phrase immediately on a blocking worker. The caller must
 /// finish its focus countdown before calling; no host input is ever captured.
 pub async fn test_input(config: &Config) -> Result<InputTestReport> {
+    test_input_with_guard(config, None, None).await
+}
+
+/// GUI countdowns additionally gate construction and every concrete press so a
+/// focus change during backend authorization cannot post into the desktop UI.
+pub async fn test_input_guarded(
+    config: &Config,
+    guard: Arc<AtomicBool>,
+) -> Result<InputTestReport> {
+    test_input_with_guard(config, Some(guard), None).await
+}
+
+/// Focus state is written only by the window thread, independently from a
+/// background countdown rearming its own permission flag.
+pub async fn test_input_guarded_with_focus(
+    config: &Config,
+    allow: Arc<AtomicBool>,
+    focus_allowed: Arc<AtomicBool>,
+) -> Result<InputTestReport> {
+    test_input_with_guard(config, Some(allow), Some(focus_allowed)).await
+}
+
+async fn test_input_with_guard(
+    config: &Config,
+    guard: Option<Arc<AtomicBool>>,
+    focus_allowed: Option<Arc<AtomicBool>>,
+) -> Result<InputTestReport> {
     let selection = config.backend.clone();
     let layout = runtime::layout(config);
     tokio::task::spawn_blocking(move || {
-        let mut backend = backend::create_backend(&selection, layout)?;
+        if guard
+            .as_ref()
+            .is_some_and(|guard| !guard.load(Ordering::SeqCst))
+            || focus_allowed
+                .as_ref()
+                .is_some_and(|focus| !focus.load(Ordering::SeqCst))
+        {
+            bail!("GUI input guard is closed; input test stayed disabled");
+        }
+        let backend = backend::create_backend(&selection, layout)?;
+        let mut backend = if let Some(guard) = guard {
+            Box::new(if let Some(focus) = focus_allowed {
+                runtime::GuardedBackend::new_with_focus(backend, guard, focus)
+            } else {
+                runtime::GuardedBackend::new(backend, guard)
+            }) as Box<dyn KeyboardBackend>
+        } else {
+            backend
+        };
         post_input_test(backend.as_mut())
     })
     .await
@@ -205,6 +254,21 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn guarded_input_test_never_constructs_unknown_backend_when_closed() {
+        let mut config = Config::from_values(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            crate::config::Overrides::default(),
+        )
+        .unwrap();
+        config.backend = "invalid-backend-would-fail-construction".into();
+        let error = test_input_guarded(&config, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("guard is closed"));
+    }
+
     #[tokio::test]
     async fn disruptive_operations_reject_missing_opt_in_before_network_or_storage() {
         let parent = tempfile::tempdir().unwrap();

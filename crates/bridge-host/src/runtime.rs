@@ -13,7 +13,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -209,6 +209,134 @@ fn spawn_worker(
     })
 }
 
+fn spawn_worker_guarded(
+    config: &Config,
+    status: SharedStatus,
+    physical: SharedMatrix,
+    guard: Arc<AtomicBool>,
+) -> Result<(WorkerHandle, InputThread)> {
+    let selection = config.backend.clone();
+    let keyboard_layout = layout(config);
+    spawn_worker_with_factory_guarded(
+        config,
+        status,
+        physical,
+        move || backend::create_backend(&selection, keyboard_layout),
+        Some(guard),
+    )
+}
+
+#[derive(Clone)]
+struct InputGuard {
+    allow: Arc<AtomicBool>,
+    focus_allowed: Option<Arc<AtomicBool>>,
+}
+impl InputGuard {
+    fn open(&self) -> bool {
+        self.allow.load(Ordering::SeqCst)
+            && self
+                .focus_allowed
+                .as_ref()
+                .is_none_or(|focus| focus.load(Ordering::SeqCst))
+    }
+}
+
+fn spawn_worker_guarded_with_focus(
+    config: &Config,
+    status: SharedStatus,
+    physical: SharedMatrix,
+    allow: Arc<AtomicBool>,
+    focus_allowed: Arc<AtomicBool>,
+) -> Result<(WorkerHandle, InputThread)> {
+    let selection = config.backend.clone();
+    let keyboard_layout = layout(config);
+    spawn_worker_with_factory_gate(
+        config,
+        status,
+        physical,
+        move || backend::create_backend(&selection, keyboard_layout),
+        Some(InputGuard {
+            allow,
+            focus_allowed: Some(focus_allowed),
+        }),
+    )
+}
+
+/// A GUI gate never prevents releases. Check every concrete output, including
+/// modifier presses inside a resolved chord, rather than just its first event.
+pub(crate) struct GuardedBackend {
+    inner: Box<dyn KeyboardBackend>,
+    guard: InputGuard,
+}
+impl GuardedBackend {
+    pub(crate) fn new(inner: Box<dyn KeyboardBackend>, guard: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            guard: InputGuard {
+                allow: guard,
+                focus_allowed: None,
+            },
+        }
+    }
+    pub(crate) fn new_with_focus(
+        inner: Box<dyn KeyboardBackend>,
+        allow: Arc<AtomicBool>,
+        focus_allowed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            guard: InputGuard {
+                allow,
+                focus_allowed: Some(focus_allowed),
+            },
+        }
+    }
+    fn check(&self) -> std::result::Result<(), bridge_core::BackendError> {
+        if self.guard.open() {
+            Ok(())
+        } else {
+            Err(bridge_core::BackendError::Unavailable(
+                "GUI input guard is closed".into(),
+            ))
+        }
+    }
+}
+impl KeyboardBackend for GuardedBackend {
+    fn capabilities(&self) -> bridge_core::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    fn validate_layout(&mut self) -> std::result::Result<(), bridge_core::BackendError> {
+        self.inner.validate_layout()
+    }
+    fn press(
+        &mut self,
+        key: bridge_core::NativeKey,
+    ) -> std::result::Result<(), bridge_core::BackendError> {
+        self.check()?;
+        self.inner.press(key)
+    }
+    fn release(
+        &mut self,
+        key: bridge_core::NativeKey,
+    ) -> std::result::Result<(), bridge_core::BackendError> {
+        self.inner.release(key)
+    }
+    fn repeat(
+        &mut self,
+        key: bridge_core::NativeKey,
+    ) -> std::result::Result<(), bridge_core::BackendError> {
+        self.check()?;
+        self.inner.repeat(key)
+    }
+    fn type_text(&mut self, text: &str) -> std::result::Result<(), bridge_core::BackendError> {
+        self.check()?;
+        self.inner.type_text(text)
+    }
+    fn cleanup_pending_text(&mut self) -> std::result::Result<(), bridge_core::BackendError> {
+        self.inner.cleanup_pending_text()
+    }
+}
+
 fn spawn_worker_with_factory(
     config: &Config,
     status: SharedStatus,
@@ -216,6 +344,39 @@ fn spawn_worker_with_factory(
     factory: impl Fn() -> std::result::Result<Box<dyn KeyboardBackend>, bridge_core::BackendError>
     + Send
     + 'static,
+) -> Result<(WorkerHandle, InputThread)> {
+    spawn_worker_with_factory_guarded(config, status, physical, factory, None)
+}
+
+fn spawn_worker_with_factory_guarded(
+    config: &Config,
+    status: SharedStatus,
+    physical: SharedMatrix,
+    factory: impl Fn() -> std::result::Result<Box<dyn KeyboardBackend>, bridge_core::BackendError>
+    + Send
+    + 'static,
+    guard: Option<Arc<AtomicBool>>,
+) -> Result<(WorkerHandle, InputThread)> {
+    spawn_worker_with_factory_gate(
+        config,
+        status,
+        physical,
+        factory,
+        guard.map(|allow| InputGuard {
+            allow,
+            focus_allowed: None,
+        }),
+    )
+}
+
+fn spawn_worker_with_factory_gate(
+    config: &Config,
+    status: SharedStatus,
+    physical: SharedMatrix,
+    factory: impl Fn() -> std::result::Result<Box<dyn KeyboardBackend>, bridge_core::BackendError>
+    + Send
+    + 'static,
+    guard: Option<InputGuard>,
 ) -> Result<(WorkerHandle, InputThread)> {
     let profile = mapping_profile(config)?;
     let (events_tx, events_rx) = mpsc::sync_channel::<InputEvent>(256);
@@ -232,7 +393,15 @@ fn spawn_worker_with_factory(
         let release=|mapper:&mut Mapper,backend:&mut Option<Box<dyn KeyboardBackend>>| ->std::result::Result<(),String> {
             if let Some(backend)=backend.as_mut() {mapper.release_all(backend.as_mut()).map_err(|e|e.to_string())}else{Ok(())}
         };
+        let allowed=||guard.as_ref().is_none_or(InputGuard::open);
         loop {
+            if enabled && !allowed() {
+                enabled=false;repeat_at=None;
+                let cleanup=release(&mut mapper,&mut backend);
+                let mut state=status.lock().unwrap();state.enabled=false;
+                if cleanup.is_err(){state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}
+                state.detail=if let Err(error)=cleanup{format!("Input guard paused output; cleanup failed; ownership retained for retry: {error}")}else{"Input paused by GUI safety guard; fresh explicit enable required".into()};
+            }
             while let Ok(control)=controls_rx.try_recv() {
                 match control {
                     WorkerControl::Shutdown=>{
@@ -267,14 +436,19 @@ fn spawn_worker_with_factory(
                         let cleanup=release(&mut mapper,&mut backend);
                         let cleanup_failed=cleanup.is_err();
                         enabled=false;status.lock().unwrap().enabled=false;
-                        let result=if cleanup_failed{cleanup}else if requested {
-                            if backend.is_none() {match factory() {Ok(b)=>backend=Some(b),Err(e)=>{let mut state=status.lock().unwrap();state.diagnostics.record_worker_failure(FailureReason::Input,CleanupOutcome::Succeeded,&worker_context);state.detail=e.to_string();drop(state);let _=reply.send(Err(e.to_string()));continue;}}}
-                            mapper.synchronize(*physical.lock().unwrap(),backend.as_mut().unwrap().as_mut()).map_err(|e|e.to_string())
+                        let mut result=if cleanup_failed{cleanup}else if requested && !allowed() {Err("GUI input guard is closed; input remains disabled".into())}else if requested {
+                            if backend.is_none() {match factory() {Ok(b)=>backend=Some(if let Some(guard)=&guard {Box::new(GuardedBackend {inner:b,guard:guard.clone()})}else{b}),Err(e)=>{let mut state=status.lock().unwrap();state.diagnostics.record_worker_failure(FailureReason::Input,CleanupOutcome::Succeeded,&worker_context);state.detail=e.to_string();drop(state);let _=reply.send(Err(e.to_string()));continue;}}}
+                            if !allowed() {Err("GUI input guard closed during authorization; input remains disabled".into())}
+                            else {mapper.synchronize(*physical.lock().unwrap(),backend.as_mut().unwrap().as_mut()).map_err(|e|e.to_string())}
                         } else {Ok(())};
+                        if requested && result.is_ok() && !allowed() {result=Err("GUI input guard closed before enable acknowledgment; input remains disabled".into());}
                         let failure_cleanup=if result.is_err() && !cleanup_failed {Some(release(&mut mapper,&mut backend))}else{None};
                         enabled=requested && result.is_ok();
                         {let mut state=status.lock().unwrap();
-                        if cleanup_failed {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}else if let Some(cleanup)=failure_cleanup {state.diagnostics.record_worker_failure(FailureReason::Input,cleanup_outcome(&cleanup),&worker_context);}
+                        if cleanup_failed {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}else if let Some(cleanup)=failure_cleanup {
+                            if allowed() {state.diagnostics.record_worker_failure(FailureReason::Input,cleanup_outcome(&cleanup),&worker_context);}
+                            else if cleanup.is_err() {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}
+                        }
                         state.enabled=enabled;state.backend=if backend.is_some(){selection.clone()}else{"disabled".into()};state.detail=if let Err(error)=&result{format!("Input disabled; cleanup/authorization failed: {error}")}else if enabled{"Input enabled; held ordinary keys require release before typing".into()}else{"Input paused; all bridge-owned keys released".into()};}
                         let _=reply.send(result);
                     }
@@ -295,7 +469,9 @@ fn spawn_worker_with_factory(
                         tracing::debug!(key=?input.event.key,pressed=input.event.pressed,modifiers=input.event.modifiers,generation=input.generation,"Input worker rejected physical transition");
                         // A mapping rejection must not leave native keys held. Core also guards this.
                         let cleanup=release(&mut mapper,&mut backend);enabled=false;repeat_at=None;
-                        let mut state=status.lock().unwrap();state.enabled=false;state.diagnostics.record_worker_failure(failure_reason,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("mapping/backend failure",error,cleanup);
+                        let mut state=status.lock().unwrap();state.enabled=false;
+                        if allowed() {state.diagnostics.record_worker_failure(failure_reason,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("mapping/backend failure",error,cleanup);}
+                        else {if cleanup.is_err(){state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}state.detail=if let Err(error)=cleanup{format!("Input guard paused output; cleanup failed; ownership retained for retry: {error}")}else{"Input paused by GUI safety guard; fresh explicit enable required".into()};}
                     } else {
                         tracing::debug!(key=?input.event.key,pressed=input.event.pressed,modifiers=input.event.modifiers,generation=input.generation,admitted=mapper.is_key_admitted(input.event.key),blocked=mapper.blocked_combinations()>blocked_before,quarantined=mapper.is_quarantined(),"Input worker processed physical transition");
                         if input.event.pressed && !input.event.key.is_modifier() && mapper.is_key_admitted(input.event.key) {repeat_at=Some(Instant::now()+delay);}
@@ -323,7 +499,9 @@ fn spawn_worker_with_factory(
                 }
                 if let Err(error)=mapper.repeat(backend.as_mut().unwrap().as_mut()) {
                     let cleanup=release(&mut mapper,&mut backend);enabled=false;
-                    let mut state=status.lock().unwrap();state.enabled=false;state.diagnostics.record_worker_failure(FailureReason::Repeat,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("repeat failure",error,cleanup);
+                    let mut state=status.lock().unwrap();state.enabled=false;
+                    if allowed(){state.diagnostics.record_worker_failure(FailureReason::Repeat,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("repeat failure",error,cleanup);}
+                    else {if cleanup.is_err(){state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}state.detail=if let Err(error)=cleanup{format!("Input guard paused output; cleanup failed; ownership retained for retry: {error}")}else{"Input paused by GUI safety guard; fresh explicit enable required".into()};}
                 }
                 repeat_at=Some(Instant::now()+interval);
             }
@@ -664,6 +842,25 @@ impl ManagedRuntime {
     /// injection unless `enable_input` was deliberately requested.
     pub fn spawn(config: Config, options: StartOptions) -> Self {
         Self::spawn_with_worker(config, options, spawn_worker)
+    }
+    /// A GUI-owned runtime additionally gates every new native output against
+    /// a process-local safety flag. Reopening it never resumes input implicitly.
+    pub fn spawn_guarded(config: Config, options: StartOptions, guard: Arc<AtomicBool>) -> Self {
+        Self::spawn_with_worker(config, options, move |config, status, physical| {
+            spawn_worker_guarded(config, status, physical, guard)
+        })
+    }
+    /// Keep focus permission independent from asynchronous arming. A stale
+    /// countdown may reopen `allow`, but cannot overwrite GUI-owned focus state.
+    pub fn spawn_guarded_with_focus(
+        config: Config,
+        options: StartOptions,
+        allow: Arc<AtomicBool>,
+        focus_allowed: Arc<AtomicBool>,
+    ) -> Self {
+        Self::spawn_with_worker(config, options, move |config, status, physical| {
+            spawn_worker_guarded_with_focus(config, status, physical, allow, focus_allowed)
+        })
     }
     fn spawn_with_worker(
         config: Config,
