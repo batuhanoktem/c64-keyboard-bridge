@@ -499,7 +499,17 @@ def smoke(binary: Path) -> None:
                     if metadata.st_uid != os.getuid():
                         raise RuntimeError("Private Xvfb resources have an unexpected owner")
                     owned_paths.append((path, (metadata.st_dev, metadata.st_ino)))
-                extensions = run([shutil.which("xdpyinfo"), "-queryExtensions"], environment, 3)
+                # A socket can exist before a loaded CI server accepts its first
+                # authenticated query. Retry only this read-only readiness probe;
+                # never retry a typing or stalled-server acceptance operation.
+                for attempt in range(3):
+                    try:
+                        extensions = run([shutil.which("xdpyinfo"), "-queryExtensions"], environment, 3)
+                        break
+                    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+                        if server.poll() is not None or attempt == 2:
+                            raise
+                        time.sleep(.1)
                 if not all(name in extensions.stdout for name in ("XTEST", "XKEYBOARD")):
                     raise RuntimeError("Private Xvfb lacks XTEST or XKB")
                 unauthorized = environment.copy()
