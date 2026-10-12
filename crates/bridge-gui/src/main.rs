@@ -60,6 +60,10 @@ struct SmokeEvidence {
     quit_ready: bool,
     native_menu_quit_observed: bool,
     native_menu_dirty_preserved: bool,
+    native_termination_requests: u64,
+    native_termination_dirty_preserved: bool,
+    native_termination_hook_restored: bool,
+    hidden_window_exercised: bool,
     error: Option<String>,
 }
 
@@ -68,6 +72,8 @@ enum NativeEvent {
     Show,
     #[cfg(target_os = "macos")]
     Quit,
+    #[cfg(target_os = "macos")]
+    ApplicationQuit,
     ScreenshotSaved {
         page: String,
         result: std::result::Result<(), String>,
@@ -128,6 +134,7 @@ struct NativeApp {
     exiting: bool,
     service_joined: bool,
     smoke: bool,
+    smoke_hidden: bool,
     screenshot: Option<PathBuf>,
     captured: BTreeSet<String>,
     requested: BTreeSet<String>,
@@ -168,10 +175,18 @@ impl NativeApp {
         let quit_menu = {
             let quit_tx = sender.clone();
             let context = cc.egui_ctx.clone();
-            macos::QuitMenu::install(Arc::new(move || {
-                let _ = quit_tx.send(NativeEvent::Quit);
-                context.request_repaint();
-            }))?
+            let terminate_tx = sender.clone();
+            let terminate_context = cc.egui_ctx.clone();
+            macos::QuitMenu::install(
+                Arc::new(move || {
+                    let _ = quit_tx.send(NativeEvent::Quit);
+                    context.request_repaint();
+                }),
+                Arc::new(move || {
+                    let _ = terminate_tx.send(NativeEvent::ApplicationQuit);
+                    terminate_context.request_repaint();
+                }),
+            )?
         };
         cc.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(10.0, 8.0);
@@ -198,6 +213,7 @@ impl NativeApp {
             exiting: false,
             service_joined: false,
             smoke: args.smoke,
+            smoke_hidden: false,
             screenshot: args.screenshot.clone(),
             captured: BTreeSet::new(),
             requested: BTreeSet::new(),
@@ -321,7 +337,12 @@ impl NativeApp {
         }
         self.activation.take();
         #[cfg(target_os = "macos")]
-        self.quit_menu.take();
+        if self.quit_menu.take().is_some() && self.smoke {
+            let restored = macos::termination_hook_restored();
+            let mut evidence = self.evidence.lock().unwrap();
+            evidence.native_termination_hook_restored = restored;
+            evidence.ok &= restored;
+        }
         self.tray.take();
         for thread in self.capture_threads.drain(..) {
             let _ = thread.join();
@@ -336,6 +357,15 @@ impl eframe::App for NativeApp {
                 #[cfg(target_os = "macos")]
                 NativeEvent::Quit => {
                     self.evidence.lock().unwrap().native_menu_quit_observed = true;
+                    self.quit(ctx);
+                    self.menu_dirty_frame = self.evidence.lock().unwrap().frames;
+                }
+                #[cfg(target_os = "macos")]
+                NativeEvent::ApplicationQuit => {
+                    let mut evidence = self.evidence.lock().unwrap();
+                    evidence.native_termination_requests += 1;
+                    evidence.native_termination_dirty_preserved |= self.app.editor.is_dirty();
+                    drop(evidence);
                     self.quit(ctx);
                     self.menu_dirty_frame = self.evidence.lock().unwrap().frames;
                 }
@@ -365,6 +395,15 @@ impl eframe::App for NativeApp {
             self.dispatch(action, ctx);
         }
         self.capture(ctx);
+        if self.smoke && !self.smoke_hidden && self.tray_available && self.captured.len() == 4 {
+            self.smoke_hidden = true;
+            self.dispatch(GuiAction::CancelCountdown, ctx);
+            self.dispatch(GuiAction::FocusChanged(false), ctx);
+            self.focused = Some(false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.evidence.lock().unwrap().hidden_window_exercised = true;
+            ctx.request_repaint();
+        }
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         if self.focused != Some(focused) {
             self.focused = Some(focused);
@@ -400,8 +439,10 @@ impl eframe::App for NativeApp {
                 && !enabled;
             #[cfg(target_os = "macos")]
             {
-                evidence.ok &=
-                    evidence.native_menu_quit_observed && evidence.native_menu_dirty_preserved;
+                evidence.ok &= evidence.native_menu_quit_observed
+                    && evidence.native_menu_dirty_preserved
+                    && evidence.native_termination_requests >= 2
+                    && evidence.native_termination_dirty_preserved;
             }
             drop(evidence);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -424,9 +465,13 @@ impl eframe::App for NativeApp {
             } else if self.captured.len() == 4 && self.began.elapsed() >= Duration::from_secs(8) {
                 #[cfg(target_os = "macos")]
                 {
-                    let (dirty_preserved, frames) = {
+                    let (dirty_preserved, termination_dirty_preserved, frames) = {
                         let evidence = self.evidence.lock().unwrap();
-                        (evidence.native_menu_dirty_preserved, evidence.frames)
+                        (
+                            evidence.native_menu_dirty_preserved,
+                            evidence.native_termination_dirty_preserved,
+                            evidence.frames,
+                        )
                     };
                     if self.menu_smoke_stage == 0 {
                         self.app
@@ -442,10 +487,18 @@ impl eframe::App for NativeApp {
                         && dirty_preserved
                         && frames >= self.menu_dirty_frame + 2
                     {
-                        self.app.editor.discard();
                         self.menu_smoke_stage = 2;
                         if let Some(menu) = &self.quit_menu {
-                            menu.perform_quit();
+                            menu.perform_application_quit();
+                        }
+                    } else if self.menu_smoke_stage == 2
+                        && termination_dirty_preserved
+                        && frames >= self.menu_dirty_frame + 2
+                    {
+                        self.app.editor.discard();
+                        self.menu_smoke_stage = 3;
+                        if let Some(menu) = &self.quit_menu {
+                            menu.perform_application_quit();
                         }
                     }
                 }
