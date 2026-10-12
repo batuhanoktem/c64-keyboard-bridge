@@ -26,6 +26,8 @@ The extended Xvfb harness at `765cff1` passed [five-platform CI](https://github.
 
 The simulator typing path now completes its DISCONNECT, half-closes sending and drains to peer EOF under a two-second deadline and a 4096-byte budget. Host failure classification and exact smoke assertions remain strict. Three real-socket tests cover EOF waiting with a queued heartbeat, a peer that never closes and excessive peer data; reverting to immediate drop fails the EOF-wait regression. The full local Mac check passed with 84 Rust tests, portable C sanitizers, real PRG builds, formatting, Clippy and recording CLI smoke. Intentionally abrupt simulator scenarios are retained. Fresh packaged Windows validation is required before native testing of this candidate.
 
+The fixed checkpoint `8977ac0` passed [five-platform CI](https://github.com/batuhanoktem/c64-keyboard-bridge/actions/runs/38232259691): 84 Rust tests per Mac architecture, 83 on Windows and 90 per Linux architecture, with no failed or ignored tests. Both private Linux stall checks passed. All five native archives and matching source passed a separate integrity, dependency, PRG and licensing audit. On ACER, the verified packaged Windows executable then passed three unchanged recording smoke runs, each exiting successfully with empty stderr. Strict failure counters and intentionally failing scenarios remained covered; the earlier local teardown race no longer reproduced in those runs.
+
 The real templates load at `$0801` with a BASIC SYS stub and exactly one configuration block. The limited VICE check is:
 
 ```sh
@@ -84,6 +86,8 @@ The warning times below are all on 2026-10-12 in UTC. Each warning reported that
 | 02:47:05.817745 | Initial state synchronization timed out |
 
 The first warning occurred during recovery testing, but its exact relationship to the deliberate CPU stall is unproven. The other three remain unattributed. Preserve them alongside the focused application passes; the old trace cannot provide the new diagnostics retroactively. Actual Wi-Fi interruption and sustained-session checks are still required to assess these failures.
+
+The latest packaged Windows executable from `8977ac0` (SHA-256 `6408d3b6fd5b510e305f837a5a5259de712b08de00101016daa331347f99ce0d`) subsequently passed its deliberately authorized native phrase check. Notepad remained foreground with standard US layout before and after the five-second countdown; the command accepted 11 press/release pairs and exited successfully. The user confirmed exactly `c64 bridge` followed by a new line. This verifies that package's direct native posting path; it does not repeat the earlier full physical C64-to-Windows sequence or held-key tests. Both real hosts remained stopped, no C64 reset or deployment occurred, and pairing state was preserved.
 
 ### Mac diagnostics package observations
 
