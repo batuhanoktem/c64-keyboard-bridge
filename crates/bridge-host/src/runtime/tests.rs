@@ -1,4 +1,5 @@
 use super::*;
+use crate::session_diagnostics::{CleanupOutcome, FailureReason, SessionPhase};
 use bridge_core::{BackendCapabilities, BackendError, NativeKey, RecordingEvent};
 use bridge_protocol::PhysicalKey;
 use std::{collections::BTreeMap, sync::atomic::AtomicBool};
@@ -9,13 +10,28 @@ struct Trace {
     block_press: AtomicBool,
     block_key: Mutex<Option<NativeKey>>,
     entered: AtomicBool,
+    block_layout: AtomicBool,
+    layout_entered: AtomicBool,
+    fail_press: AtomicBool,
+    fail_factory: AtomicBool,
     fail_release: AtomicBool,
+    fail_repeat: AtomicBool,
     fail_layout: AtomicBool,
 }
 struct TestBackend(Arc<Trace>);
 impl KeyboardBackend for TestBackend {
     fn validate_layout(&mut self) -> std::result::Result<(), BackendError> {
-        if self.0.fail_layout.load(Ordering::SeqCst) {
+        // Capture the result at entry so tests can let a successful idle guard
+        // finish, then exercise the queued transition's own validation.
+        let failed = self.0.fail_layout.load(Ordering::SeqCst);
+        if self.0.block_layout.load(Ordering::SeqCst) {
+            self.0.layout_entered.store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(2);
+            while self.0.block_layout.load(Ordering::SeqCst) && Instant::now() < until {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if failed {
             Err(BackendError::Unsupported("recorded layout mismatch".into()))
         } else {
             Ok(())
@@ -43,7 +59,11 @@ impl KeyboardBackend for TestBackend {
         {
             thread::sleep(Duration::from_millis(1));
         }
-        Ok(())
+        if self.0.fail_press.load(Ordering::SeqCst) {
+            Err(BackendError::Injection("recorded press failure".into()))
+        } else {
+            Ok(())
+        }
     }
     fn release(&mut self, key: NativeKey) -> std::result::Result<(), BackendError> {
         if self.0.fail_release.load(Ordering::SeqCst) {
@@ -62,7 +82,11 @@ impl KeyboardBackend for TestBackend {
             .lock()
             .unwrap()
             .push(RecordingEvent::Repeat(key));
-        Ok(())
+        if self.0.fail_repeat.load(Ordering::SeqCst) {
+            Err(BackendError::Injection("recorded repeat failure".into()))
+        } else {
+            Ok(())
+        }
     }
     fn type_text(&mut self, text: &str) -> std::result::Result<(), BackendError> {
         self.0
@@ -97,7 +121,13 @@ impl Harness {
         let output = trace.clone();
         let (worker, thread) =
             spawn_worker_with_factory(&config, status.clone(), physical.clone(), move || {
-                Ok(Box::new(TestBackend(output.clone())))
+                if output.fail_factory.load(Ordering::SeqCst) {
+                    Err(BackendError::Injection(
+                        "recorded permission failure".into(),
+                    ))
+                } else {
+                    Ok(Box::new(TestBackend(output.clone())))
+                }
             })
             .unwrap();
         Self {
@@ -146,20 +176,10 @@ impl Harness {
         let worker = self.worker.clone();
         let status = self.status.clone();
         let physical = self.physical.clone();
-        let task = tokio::spawn(async move {
-            let result = session(
-                server,
-                token,
-                worker.clone(),
-                status,
-                physical.clone(),
-                stop_rx,
-            )
-            .await;
-            *physical.lock().unwrap() = MatrixState::default();
-            worker.reset();
-            result
-        });
+        let task =
+            tokio::spawn(
+                async move { session(server, token, worker, status, physical, stop_rx).await },
+            );
         Client {
             socket,
             sequence: Sequencer::new(),
@@ -171,6 +191,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         self.trace.block_press.store(false, Ordering::SeqCst);
+        self.trace.block_layout.store(false, Ordering::SeqCst);
         let _ = self.worker.controls.send(WorkerControl::Shutdown);
         if let Some(thread) = self.thread.take() {
             thread.join().unwrap().unwrap();
@@ -208,12 +229,69 @@ impl Client {
     async fn sync(&mut self, matrix: MatrixState) {
         self.send(Message::StateSync(matrix)).await;
     }
+    async fn hold_control_a(&mut self) {
+        self.send(Message::KeyDown {
+            key: PhysicalKey::Control,
+            modifiers: 2,
+        })
+        .await;
+        self.send(Message::KeyDown {
+            key: PhysicalKey::A,
+            modifiers: 2,
+        })
+        .await;
+    }
     async fn finish(mut self) {
         self.send(Message::Disconnect { reason: 0 }).await;
         self.task.await.unwrap().unwrap();
     }
 }
 const TOKEN: Token = Token([42; 16]);
+
+// Failure assertions may panic. Restore the recording backend first so the
+// harness can join its worker without a second panic during unwinding.
+struct FailureGuard(Arc<Trace>);
+impl Drop for FailureGuard {
+    fn drop(&mut self) {
+        self.0.fail_repeat.store(false, Ordering::SeqCst);
+        self.0.fail_release.store(false, Ordering::SeqCst);
+        self.0.fail_press.store(false, Ordering::SeqCst);
+        self.0.fail_factory.store(false, Ordering::SeqCst);
+        self.0.fail_layout.store(false, Ordering::SeqCst);
+        self.0.block_layout.store(false, Ordering::SeqCst);
+    }
+}
+
+async fn assert_control_a_released(h: &Harness) {
+    h.wait_for(|| {
+        h.events()
+            .contains(&RecordingEvent::Release(NativeKey::Control))
+            && h.status
+                .lock()
+                .unwrap()
+                .diagnostics
+                .last_failure
+                .as_ref()
+                .is_none_or(|failure| failure.cleanup != CleanupOutcome::Pending)
+    })
+    .await;
+    assert_control_a_release_order(h);
+    assert_eq!(*h.physical.lock().unwrap(), MatrixState::default());
+    assert!(!h.status.lock().unwrap().connected);
+}
+
+fn assert_control_a_release_order(h: &Harness) {
+    let events = h.events();
+    let ordinary = events
+        .iter()
+        .position(|event| *event == RecordingEvent::Release(NativeKey::A))
+        .expect("Session cleanup must release the held ordinary key");
+    let modifier = events
+        .iter()
+        .position(|event| *event == RecordingEvent::Release(NativeKey::Control))
+        .unwrap();
+    assert!(ordinary < modifier);
+}
 
 #[tokio::test]
 async fn reset_preserves_events_from_new_synchronization_generation() {
@@ -329,7 +407,74 @@ async fn authentication_precedes_all_input_and_connection_admission() {
             .contains("authentication")
     );
     assert!(h.events().is_empty());
-    assert!(!h.status.lock().unwrap().connected);
+    let status = h.status.lock().unwrap();
+    assert!(!status.connected);
+    assert_eq!(status.diagnostics.attempts, 1);
+    assert_eq!(status.diagnostics.authenticated_sessions, 0);
+    assert_eq!(status.diagnostics.failures.authentication, 1);
+    assert_eq!(
+        status.diagnostics.last_failure.as_ref().unwrap().reason,
+        FailureReason::Authentication
+    );
+}
+
+#[tokio::test]
+async fn handshake_timeouts_have_distinct_retained_reasons() {
+    for synchronized_hello in [false, true] {
+        let h = Harness::new();
+        let mut c = h.client(TOKEN).await;
+        let (phase, duration, reason) = if synchronized_hello {
+            c.hello(TOKEN).await;
+            (
+                SessionPhase::Synchronizing,
+                SESSION_TIMEOUT,
+                FailureReason::SyncTimeout,
+            )
+        } else {
+            (
+                SessionPhase::Hello,
+                Duration::from_secs(5),
+                FailureReason::HelloTimeout,
+            )
+        };
+        h.wait_for(|| h.status.lock().unwrap().diagnostics.current.phase == phase)
+            .await;
+        tokio::time::pause();
+        tokio::time::advance(duration + Duration::from_millis(1)).await;
+        tokio::time::timeout(Duration::from_millis(100), c.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        tokio::time::resume();
+        h.wait_for(|| {
+            h.status
+                .lock()
+                .unwrap()
+                .diagnostics
+                .last_failure
+                .as_ref()
+                .unwrap()
+                .cleanup
+                == CleanupOutcome::Succeeded
+        })
+        .await;
+        assert!(h.events().is_empty());
+        let status = h.status.lock().unwrap();
+        assert_eq!(status.diagnostics.current.phase, SessionPhase::Idle);
+        let failure = status.diagnostics.last_failure.as_ref().unwrap();
+        assert_eq!(failure.reason, reason);
+        assert_eq!(failure.phase, phase);
+        assert!(failure.elapsed_ms >= duration.as_millis() as u64);
+        assert_eq!(
+            status.diagnostics.failures.hello_timeout,
+            u64::from(!synchronized_hello)
+        );
+        assert_eq!(
+            status.diagnostics.failures.sync_timeout,
+            u64::from(synchronized_hello)
+        );
+    }
 }
 
 #[tokio::test]
@@ -559,6 +704,538 @@ async fn watchdog_releases_after_three_seconds_without_valid_traffic() {
     tokio::time::resume();
     h.wait_for(|| h.events().contains(&RecordingEvent::Release(NativeKey::A)))
         .await;
+}
+
+#[tokio::test]
+async fn partial_byte_trickle_does_not_extend_valid_frame_watchdog() {
+    let h = Harness::new();
+    h.worker.enable(true).await.unwrap();
+    let mut c = h.client(TOKEN).await;
+    c.hello(TOKEN).await;
+    c.sync(MatrixState::default()).await;
+    c.hold_control_a().await;
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+
+    // None of these bytes completes a frame. Advancing only after A is
+    // admitted separates the transport watchdog from the native worker clock.
+    tokio::time::pause();
+    let partial = Frame {
+        sequence: c.sequence.expected(),
+        message: Message::Heartbeat(*h.physical.lock().unwrap()),
+    }
+    .encode()
+    .unwrap();
+    for &byte in &partial[..5] {
+        tokio::time::advance(Duration::from_millis(500)).await;
+        c.socket.write_all(&[byte]).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!c.task.is_finished(), "Watchdog fired before its deadline");
+    }
+    tokio::time::advance(Duration::from_millis(501)).await;
+    let result = tokio::time::timeout(Duration::from_millis(100), c.task)
+        .await
+        .expect("Incomplete traffic must not restart the three-second deadline")
+        .unwrap();
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    tokio::time::resume();
+    assert_control_a_released(&h).await;
+    let status = h.status.lock().unwrap();
+    assert_eq!(status.diagnostics.failures.heartbeat_timeout, 1);
+    let failure = status.diagnostics.last_failure.as_ref().unwrap();
+    assert_eq!(failure.reason, FailureReason::HeartbeatTimeout);
+    assert_eq!(failure.phase, SessionPhase::Active);
+    assert_eq!(failure.cleanup, CleanupOutcome::Succeeded);
+    assert_eq!(
+        failure.validated_frames, 4,
+        "Partial bytes are not validated frames"
+    );
+    assert!(failure.valid_frame_age_ms.unwrap() >= 3000);
+}
+
+#[tokio::test]
+async fn sequence_gap_and_replay_release_held_keys_in_order() {
+    for replay in [false, true] {
+        let h = Harness::new();
+        h.worker.enable(true).await.unwrap();
+        let mut c = h.client(TOKEN).await;
+        c.hello(TOKEN).await;
+        c.sync(MatrixState::default()).await;
+        c.hold_control_a().await;
+        h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+            .await;
+        let expected = c.sequence.expected();
+        let sequence = if replay { expected - 1 } else { expected + 1 };
+        let frame = Frame {
+            sequence,
+            message: Message::Heartbeat(*h.physical.lock().unwrap()),
+        }
+        .encode()
+        .unwrap();
+        c.socket.write_all(&frame).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), c.task)
+            .await
+            .expect("Invalid sequencing must terminate immediately")
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("sequence mismatch"));
+        assert_control_a_released(&h).await;
+        assert!(
+            h.events()
+                .iter()
+                .all(|event| !matches!(event, RecordingEvent::Press(NativeKey::B)))
+        );
+        let status = h.status.lock().unwrap();
+        assert_eq!(status.diagnostics.failures.protocol, 1);
+        let failure = status.diagnostics.last_failure.as_ref().unwrap();
+        assert_eq!(failure.reason, FailureReason::Protocol);
+        assert_eq!(failure.cleanup, CleanupOutcome::Succeeded);
+        assert_eq!(
+            failure.validated_frames, 4,
+            "A gap or replay must not become valid traffic"
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_socket_queue_overflow_automatically_ends_session_and_cleans_up() {
+    let h = Harness::new();
+    h.worker.enable(true).await.unwrap();
+    let mut c = h.client(TOKEN).await;
+    c.hello(TOKEN).await;
+    c.sync(MatrixState::default()).await;
+    *h.trace.block_key.lock().unwrap() = Some(NativeKey::A);
+    h.trace.block_press.store(true, Ordering::SeqCst);
+    c.hold_control_a().await;
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+
+    // A is admitted but its native press is gated. Fill the bounded queue
+    // through TCP using valid alternating edges, with a consistent modifier.
+    // Do not reset manually: the session failure itself must own cleanup.
+    let mut bytes = Vec::new();
+    for index in 0..257 {
+        let message = if index % 2 == 0 {
+            Message::KeyDown {
+                key: PhysicalKey::B,
+                modifiers: 2,
+            }
+        } else {
+            Message::KeyUp {
+                key: PhysicalKey::B,
+                modifiers: 2,
+            }
+        };
+        bytes.extend(
+            Frame {
+                sequence: c.sequence.next_sequence(),
+                message,
+            }
+            .encode()
+            .unwrap(),
+        );
+    }
+    c.socket.write_all(&bytes).await.unwrap();
+    h.wait_for(|| h.status.lock().unwrap().diagnostics.failures.queue_overflow == 1)
+        .await;
+    h.trace.block_press.store(false, Ordering::SeqCst);
+    let error = tokio::time::timeout(Duration::from_secs(1), c.task)
+        .await
+        .expect("Overflow must terminate the network session")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("overflow"));
+    assert_control_a_released(&h).await;
+    assert!(!h.events().contains(&RecordingEvent::Press(NativeKey::B)));
+    assert_eq!(h.status.lock().unwrap().events, 259);
+    let status = h.status.lock().unwrap();
+    let failure = status.diagnostics.last_failure.as_ref().unwrap();
+    assert_eq!(failure.reason, FailureReason::QueueOverflow);
+    assert_eq!(failure.cleanup, CleanupOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn repeat_failure_disables_input_and_retains_secondary_cleanup_failure() {
+    let h = Harness::new();
+    let _guard = FailureGuard(h.trace.clone());
+    h.worker.enable(true).await.unwrap();
+    let mut c = h.client(TOKEN).await;
+    c.hello(TOKEN).await;
+    c.sync(MatrixState::default()).await;
+    // Configure failures before admitting A so this cannot race its short
+    // recording-backend repeat deadline on a slow CI machine.
+    h.trace.fail_repeat.store(true, Ordering::SeqCst);
+    h.trace.fail_release.store(true, Ordering::SeqCst);
+    c.hold_control_a().await;
+    h.wait_for(|| h.status.lock().unwrap().diagnostics.failures.repeat == 1)
+        .await;
+    let failure = {
+        let status = h.status.lock().unwrap();
+        assert!(!status.enabled);
+        assert!(status.detail.contains("recorded repeat failure"));
+        assert!(
+            status
+                .detail
+                .contains("cleanup failed; native keys may remain held")
+        );
+        assert_eq!(status.diagnostics.failures.cleanup, 1);
+        status.diagnostics.last_failure.as_ref().unwrap().clone()
+    };
+    assert_eq!(failure.reason, FailureReason::Repeat);
+    assert_eq!(failure.cleanup, CleanupOutcome::Failed);
+    assert!(h.events().contains(&RecordingEvent::Repeat(NativeKey::A)));
+
+    h.trace.fail_release.store(false, Ordering::SeqCst);
+    h.worker.enable(false).await.unwrap();
+    assert_control_a_release_order(&h);
+    assert_eq!(
+        h.status
+            .lock()
+            .unwrap()
+            .diagnostics
+            .last_failure
+            .as_ref()
+            .unwrap(),
+        &failure
+    );
+    c.finish().await;
+    assert_eq!(
+        h.status
+            .lock()
+            .unwrap()
+            .diagnostics
+            .last_failure
+            .as_ref()
+            .unwrap(),
+        &failure
+    );
+}
+
+#[tokio::test]
+async fn queued_transition_layout_failure_is_classified_as_layout() {
+    let h = Harness::new();
+    let _guard = FailureGuard(h.trace.clone());
+    h.worker.enable(true).await.unwrap();
+    let mut c = h.client(TOKEN).await;
+    c.hello(TOKEN).await;
+    c.sync(MatrixState::default()).await;
+    c.hold_control_a().await;
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+
+    // Gate the next successful idle validation. Queue B and change the layout
+    // while it is blocked, so B's transition check discovers the failure.
+    // This avoids relying on beating the worker's 100ms idle guard on slow CI.
+    h.trace.block_layout.store(true, Ordering::SeqCst);
+    h.wait_for(|| h.trace.layout_entered.load(Ordering::SeqCst))
+        .await;
+    c.send(Message::KeyDown {
+        key: PhysicalKey::B,
+        modifiers: 2,
+    })
+    .await;
+    h.wait_for(|| h.status.lock().unwrap().events == 3).await;
+    h.trace.fail_layout.store(true, Ordering::SeqCst);
+    h.trace.block_layout.store(false, Ordering::SeqCst);
+    h.wait_for(|| h.status.lock().unwrap().diagnostics.failures.layout == 1)
+        .await;
+    assert_control_a_release_order(&h);
+    assert!(!h.events().contains(&RecordingEvent::Press(NativeKey::B)));
+    {
+        let status = h.status.lock().unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.diagnostics.failures.input, 0);
+        assert!(status.detail.contains("mapping/backend failure"));
+        let failure = status.diagnostics.last_failure.as_ref().unwrap();
+        assert_eq!(failure.reason, FailureReason::Layout);
+        assert_eq!(failure.phase, SessionPhase::Active);
+        assert_eq!(failure.cleanup, CleanupOutcome::Succeeded);
+    }
+    h.trace.fail_layout.store(false, Ordering::SeqCst);
+    c.finish().await;
+}
+
+#[tokio::test]
+async fn stale_native_failure_preserves_timeout_or_newer_session_evidence() {
+    // Exercise ended-session Idle, a replacement HELLO, and a replacement
+    // session that has already failed before the old native call completes.
+    for replacement in 0..=2 {
+        let h = Harness::new();
+        let _guard = FailureGuard(h.trace.clone());
+        h.worker.enable(true).await.unwrap();
+        let mut c = h.client(TOKEN).await;
+        c.hello(TOKEN).await;
+        c.sync(MatrixState::default()).await;
+        *h.trace.block_key.lock().unwrap() = Some(NativeKey::A);
+        h.trace.block_press.store(true, Ordering::SeqCst);
+        c.hold_control_a().await;
+        h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+            .await;
+        let old_session = h.status.lock().unwrap().diagnostics.current.generation;
+        h.trace.fail_press.store(true, Ordering::SeqCst);
+        h.trace.fail_release.store(true, Ordering::SeqCst);
+
+        tokio::time::pause();
+        tokio::time::advance(SESSION_TIMEOUT + Duration::from_millis(1)).await;
+        let error = tokio::time::timeout(Duration::from_millis(100), c.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("heartbeat timed out"));
+        tokio::time::resume();
+        let timeout = h
+            .status
+            .lock()
+            .unwrap()
+            .diagnostics
+            .last_failure
+            .clone()
+            .unwrap();
+        assert_eq!(timeout.reason, FailureReason::HeartbeatTimeout);
+        assert_eq!(timeout.cleanup, CleanupOutcome::Pending);
+        assert_eq!(timeout.session_generation, old_session);
+        assert_eq!(timeout.phase, SessionPhase::Active);
+        assert_eq!(timeout.validated_frames, 4);
+
+        let mut next = if replacement != 0 {
+            let mut client = h.client(TOKEN).await;
+            client.hello(TOKEN).await;
+            assert_eq!(
+                h.status.lock().unwrap().diagnostics.current.generation,
+                old_session + 1
+            );
+            Some(client)
+        } else {
+            None
+        };
+        let retained = if replacement == 2 {
+            let mut client = next.take().unwrap();
+            client
+                .send(Message::Error {
+                    code: 31,
+                    text: "replacement fault".into(),
+                })
+                .await;
+            client.task.await.unwrap().unwrap_err();
+            let failure = h
+                .status
+                .lock()
+                .unwrap()
+                .diagnostics
+                .last_failure
+                .clone()
+                .unwrap();
+            assert_eq!(failure.reason, FailureReason::Protocol);
+            assert_eq!(failure.session_generation, old_session + 1);
+            assert_eq!(failure.phase, SessionPhase::Synchronizing);
+            assert_eq!(failure.cleanup, CleanupOutcome::Pending);
+            failure
+        } else {
+            timeout
+        };
+
+        // The old press now reports failure and its cleanup also fails. Neither
+        // may attribute the fault to the new HELLO or replace retained evidence.
+        h.trace.block_press.store(false, Ordering::SeqCst);
+        h.wait_for(|| {
+            let status = h.status.lock().unwrap();
+            status.diagnostics.failures.input == 1
+                && status.diagnostics.last_failure.as_ref().unwrap().cleanup
+                    == CleanupOutcome::Failed
+        })
+        .await;
+        let mut expected = retained;
+        expected.cleanup = CleanupOutcome::Failed;
+        {
+            let status = h.status.lock().unwrap();
+            assert!(!status.enabled);
+            assert_eq!(status.diagnostics.last_failure.as_ref(), Some(&expected));
+            assert_eq!(status.diagnostics.failures.heartbeat_timeout, 1);
+            assert_eq!(
+                status.diagnostics.failures.protocol,
+                u64::from(replacement == 2)
+            );
+            assert_eq!(
+                status.diagnostics.failures.cleanup,
+                2 + u64::from(replacement == 2)
+            );
+            assert_eq!(
+                status.diagnostics.current.phase,
+                if replacement == 1 {
+                    SessionPhase::Synchronizing
+                } else {
+                    SessionPhase::Idle
+                }
+            );
+        }
+        h.trace.fail_press.store(false, Ordering::SeqCst);
+        h.trace.fail_release.store(false, Ordering::SeqCst);
+        h.worker.enable(false).await.unwrap();
+        assert_control_a_release_order(&h);
+        if let Some(mut client) = next {
+            client.sync(MatrixState::default()).await;
+            client.finish().await;
+        }
+        assert_eq!(
+            h.status.lock().unwrap().diagnostics.last_failure.as_ref(),
+            Some(&expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_idle_resume_replaces_retained_network_failure() {
+    let h = Harness::new();
+    let _guard = FailureGuard(h.trace.clone());
+    // No backend has been created. A real authenticated session can time out
+    // with input disabled, then a fresh idle resume can fail authorization.
+    let mut c = h.client(TOKEN).await;
+    c.hello(TOKEN).await;
+    c.sync(MatrixState::default()).await;
+    h.wait_for(|| h.status.lock().unwrap().diagnostics.current.phase == SessionPhase::Active)
+        .await;
+    tokio::time::pause();
+    tokio::time::advance(SESSION_TIMEOUT + Duration::from_millis(1)).await;
+    tokio::time::timeout(Duration::from_millis(100), c.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    tokio::time::resume();
+    h.wait_for(|| {
+        h.status
+            .lock()
+            .unwrap()
+            .diagnostics
+            .last_failure
+            .as_ref()
+            .unwrap()
+            .cleanup
+            == CleanupOutcome::Succeeded
+    })
+    .await;
+    let timeout = h
+        .status
+        .lock()
+        .unwrap()
+        .diagnostics
+        .last_failure
+        .clone()
+        .unwrap();
+    h.trace.fail_factory.store(true, Ordering::SeqCst);
+    assert!(
+        h.worker
+            .enable(true)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("recorded permission failure")
+    );
+    let status = h.status.lock().unwrap();
+    assert!(!status.enabled);
+    assert_eq!(status.diagnostics.failures.heartbeat_timeout, 1);
+    assert_eq!(status.diagnostics.failures.input, 1);
+    assert_eq!(status.diagnostics.failures.cleanup, 0);
+    let failure = status.diagnostics.last_failure.as_ref().unwrap();
+    assert_eq!(failure.reason, FailureReason::Input);
+    assert_eq!(failure.phase, SessionPhase::Idle);
+    assert_eq!(failure.cleanup, CleanupOutcome::Succeeded);
+    assert_eq!(failure.session_generation, timeout.session_generation);
+    assert!(failure.generation > timeout.generation);
+    assert_eq!(failure.validated_frames, 0);
+    assert_eq!(failure.valid_frame_age_ms, None);
+    assert!(h.events().is_empty());
+}
+
+#[tokio::test]
+async fn diagnostics_survive_reconnect_and_pause_without_retaining_peer_secrets() {
+    const PRIVATE_TOKEN: Token = Token(*b"SECRET_TOKEN_123");
+    const PRIVATE_IDENTITY: &str = "SENTINEL-IDENTITY-PRIVATE";
+    const PRIVATE_TEXT: &str = "SENTINEL-PEER-TEXT-PRIVATE";
+    let h = Harness::new();
+    h.worker.enable(true).await.unwrap();
+    let mut c = h.client(PRIVATE_TOKEN).await;
+    c.send(Message::Hello {
+        token: PRIVATE_TOKEN.0,
+        capabilities: 1,
+        device_id: PRIVATE_IDENTITY.into(),
+    })
+    .await;
+    assert!(matches!(
+        FrameReader::default()
+            .next(&mut c.socket)
+            .await
+            .unwrap()
+            .message,
+        Message::HelloAck { .. }
+    ));
+    c.sync(MatrixState::default()).await;
+    c.hold_control_a().await;
+    h.wait_for(|| h.events().contains(&RecordingEvent::Press(NativeKey::A)))
+        .await;
+    c.send(Message::Error {
+        code: 17,
+        text: PRIVATE_TEXT.into(),
+    })
+    .await;
+    c.task.await.unwrap().unwrap_err();
+    assert_control_a_released(&h).await;
+    let retained = h
+        .status
+        .lock()
+        .unwrap()
+        .diagnostics
+        .last_failure
+        .clone()
+        .unwrap();
+    assert_eq!(retained.reason, FailureReason::Protocol);
+    h.worker.enable(false).await.unwrap();
+    let mut c = h.client(PRIVATE_TOKEN).await;
+    c.hello(PRIVATE_TOKEN).await;
+    c.sync(MatrixState::default()).await;
+    h.wait_for(|| h.status.lock().unwrap().diagnostics.current.phase == SessionPhase::Active)
+        .await;
+    {
+        let status = h.status.lock().unwrap().snapshot();
+        assert_eq!(status.diagnostics.attempts, 2);
+        assert_eq!(status.diagnostics.authenticated_sessions, 2);
+        assert_eq!(status.diagnostics.reconnects, 1);
+        assert_eq!(status.diagnostics.failures.protocol, 1);
+        assert_eq!(status.diagnostics.last_failure.as_ref(), Some(&retained));
+        let diagnostics = serde_json::to_string(&status.diagnostics).unwrap();
+        for sentinel in [
+            PRIVATE_IDENTITY,
+            PRIVATE_TEXT,
+            "SECRET_TOKEN_123",
+            &PRIVATE_TOKEN.hex(),
+            "127.0.0.1",
+        ] {
+            assert!(!diagnostics.contains(sentinel));
+        }
+        let response = ControlResponse {
+            ok: true,
+            status,
+            error: None,
+        };
+        assert!(serde_json::to_vec(&response).unwrap().len() < 4096);
+    }
+    c.finish().await;
+    let status = h.status.lock().unwrap().snapshot();
+    let json = serde_json::to_string(&ControlResponse {
+        ok: true,
+        status,
+        error: None,
+    })
+    .unwrap();
+    for sentinel in [
+        PRIVATE_IDENTITY,
+        PRIVATE_TEXT,
+        "SECRET_TOKEN_123",
+        &PRIVATE_TOKEN.hex(),
+    ] {
+        assert!(!json.contains(sentinel));
+    }
 }
 
 #[tokio::test]

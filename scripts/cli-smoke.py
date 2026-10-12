@@ -64,10 +64,33 @@ def smoke(binary: Path) -> None:
                 status_when(lambda s: s["running"] and s["enabled"] and s["backend"] == "recording")
                 assert json.loads(call("pause").stdout)["enabled"] is False
                 assert json.loads(call("resume").stdout)["enabled"] is True
-                for scenario in ("typing", "disconnect-held", "heartbeat-timeout", "malformed"):
+                # Inspect each completed session instead of relying on a total
+                # event count: an unrelated failure must not mask a missing
+                # watchdog/protocol check or an unprocessed simulator run.
+                scenarios = (
+                    ("typing", 6, None),
+                    ("disconnect-held", 2, "transport"),
+                    ("heartbeat-timeout", 2, "heartbeat_timeout"),
+                    ("malformed", 0, "protocol"),
+                )
+                for scenario, event_count, reason in scenarios:
+                    before = status_when(lambda s: not s["connected"])
+                    expected_failures = dict(before["diagnostics"]["failures"])
+                    if reason is not None:
+                        expected_failures[reason] += 1
                     call("simulate", "--scenario", scenario, "--fragment")
-                    status_when(lambda s: not s["connected"])
-                status = status_when(lambda s: s["events"] >= 10)
+                    status = status_when(lambda s: (
+                        not s["connected"]
+                        and s["diagnostics"]["attempts"] == before["diagnostics"]["attempts"] + 1
+                        and s["diagnostics"]["authenticated_sessions"] == before["diagnostics"]["authenticated_sessions"] + 1
+                        and s["diagnostics"]["failures"] == expected_failures
+                        and (reason is None or s["diagnostics"]["last_failure"]["cleanup"] == "succeeded")
+                    ))
+                    assert status["events"] - before["events"] == event_count, scenario
+                    assert status["diagnostics"]["current"]["phase"] == "idle", scenario
+                    if reason is not None:
+                        assert status["diagnostics"]["last_failure"]["reason"] == reason, scenario
+                assert status["events"] == 10
                 assert status["backend"] == "recording"
                 call("stop")
                 if process.wait(timeout=5) != 0:
