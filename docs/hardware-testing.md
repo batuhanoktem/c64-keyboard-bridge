@@ -20,6 +20,8 @@ The complete scripted check is `scripts/check.sh` on macOS/Linux: pinned cc65 bu
 
 The [CI run for `bed6826`](https://github.com/batuhanoktem/c64-keyboard-bridge/actions/runs/38195188174) passed on macOS ARM64/Intel, Windows x64 and Linux x64/ARM64, including formatting, Clippy, native tests, recording smoke tests, pinned PRG builds and all six release/source archives. Rust test totals were 67 per macOS target, 66 on Windows and 73 per Linux target. Both Linux native Xvfb checks passed. The packages were separately audited against the exact commit, including unconfigured embedded PRGs, dependency/source checksums and licensing notices; this remains separate from physical acceptance.
 
+The subsequent [diagnostics checkpoint at `6b5116a`](https://github.com/batuhanoktem/c64-keyboard-bridge/actions/runs/38201421171) passed the same five-platform pipeline: 81 Rust tests on each Mac architecture, 80 on Windows and 87 on each Linux architecture. Recording tests now cover incomplete-frame trickles, held-key sequence gaps/replay, socket-driven queue overflow, repeat and secondary cleanup failures, and retained diagnostics through reconnect. All six matching binary/source packages passed a separate source, dependency, PRG and licensing audit. These tests add software failure evidence; they do not establish additional physical acceptance.
+
 The real templates load at `$0801` with a BASIC SYS stub and exactly one configuration block. The limited VICE check is:
 
 ```sh
@@ -63,6 +65,19 @@ With explicit timing consent and Shift+A held in the VS Code scratch editor, a t
 The user confirmed output stopped during that traffic stall, remained quiet after resume while Shift+A stayed held, and produced exactly one lowercase `a` after release and a fresh tap. The user then paused input successfully. This passed the observed physical-client traffic-loss/cleanup/recovery path; exact host timeout/reconnect timestamps still require log correlation. Wi-Fi radio and access-point outage recovery remain untested. The operations continue the same program without a reset; see the [official Machine API](https://1541u-documentation.readthedocs.io/en/latest/api/api_calls.html#machine).
 
 Finally, the user focused a blank GTK text area titled `C64 Bridge WSLg scratch`, running under the normal Ubuntu user. Through the same Windows backend and standard US layout, `hello linux` and Return, the six punctuation symbols with each fully released, held A repeat stopping on release, shifted cursors for Left/Up, INST/DEL Backspace and Commodore+A Select All all passed. The user paused input and confirmed `enabled: false`, then held Commodore+RUN/STOP and confirmed the fixed C64 client returned cleanly to BASIC. This verifies the observed Windows-to-WSLg application path; it does not establish native Linux X11 or uinput support on Weston.
+
+The final updated Windows trace contained 373 raw transitions, zero ERROR-level entries and four WARN-level session failures. The stream ended during local exit with Commodore still down in the received ledger; that ledger does not establish the physical key state after disconnection. The native held-key ledger was empty at shutdown. The user separately confirmed the stopped host, closed scratch window and return to BASIC.
+
+The warning times below are all on 2026-10-12 in UTC. Each warning reported that the C64 session ended after a network or protocol failure:
+
+| UTC time | Recorded reason |
+| --- | --- |
+| 02:33:34.943764 | C64 heartbeat timed out |
+| 02:45:56.012130 | C64 heartbeat timed out |
+| 02:46:53.323818 | C64 heartbeat timed out |
+| 02:47:05.817745 | Initial state synchronization timed out |
+
+The first warning occurred during recovery testing, but its exact relationship to the deliberate CPU stall is unproven. The other three remain unattributed. Preserve them alongside the focused application passes; the old trace cannot provide the new diagnostics retroactively. Actual Wi-Fi interruption and sustained-session checks are still required to assess these failures.
 
 ## 1. Device and REST baseline
 
