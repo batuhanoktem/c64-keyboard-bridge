@@ -19,7 +19,7 @@ Configuration comes from CLI overrides, then process environment variables, then
 | `INPUT_BACKEND` | `auto` | `auto`, `recording`, `macos`, `windows`, `x11`, or `uinput`. |
 | `REPEAT_DELAY_MS` | `500` | Host repeat delay, 100–5000 ms; macOS/Windows/recording only. |
 | `REPEAT_INTERVAL_MS` | `40` | Host repeat interval, 10–1000 ms. Linux uses desktop repeat settings. |
-| `LOG_LEVEL` | `info` | Tracing filter. Key text and passwords are not logged by the bridge. |
+| `LOG_LEVEL` | `info` | Tracing filter. Default logs omit key text; DEBUG key traces can reveal bridge typing and must remain private. Passwords are not logged. |
 | `BRIDGE_STATE_DIR` | OS application data | Private directory for pairing and runtime state. |
 
 Global CLI overrides are `--device-host`, `--bind-address`, `--advertise-ip`, `--bridge-port`, `--layout`, `--profile`, and `--backend`. They are available on every subcommand. There is deliberately no password option. Input authorization is separate from configuration: each host starts disabled unless `start --enable-input` is supplied, and `resume` deliberately enables it.
