@@ -25,9 +25,10 @@ cd "$C64BRIDGE_ROOT"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
-cargo build --locked --bin c64bridge
+cargo build --locked --bin c64bridge --bin c64bridge-gui
 binary="$C64BRIDGE_ROOT/target/debug/c64bridge"
 if [[ "${OS:-}" == "Windows_NT" ]]; then
     binary="${binary}.exe"
 fi
 "$C64BRIDGE_PYTHON" "$C64BRIDGE_ROOT/scripts/cli-smoke.py" --binary "$binary"
+"$C64BRIDGE_PYTHON" "$C64BRIDGE_ROOT/scripts/package-tests.py"

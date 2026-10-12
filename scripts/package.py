@@ -19,6 +19,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 PRGS = runpy.run_path(str(ROOT / "scripts/verify-prgs.py"))
+INSTALLERS = runpy.run_path(str(ROOT / "scripts/installers.py"))
 REVISION = PRGS["CC65_REVISION"]
 SUPPORTED_TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu",
                      "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc")
@@ -31,6 +32,10 @@ SOURCE_FOLDERS = {
     "config/layouts": {".toml"},
     "scripts": {".sh", ".py", ".md"},
     ".github": {".yml", ".yaml", ".md"},
+    "assets": {".svg", ".png", ".ico", ".icns", ".py", ".md"},
+    "installers": {".nsi", ".desktop", ".plist", ".md"},
+    "build-support": {".rs", ".md"},
+    "third-party/notices": {".json", ".txt", ".md", ".orig"},
 }
 
 
@@ -89,7 +94,9 @@ def source_files() -> list[Path]:
             relative = path.relative_to(ROOT)
             if any(part in {"build", "target", ".git", "__pycache__", "node_modules"} for part in relative.parts):
                 continue
-            if path.is_file() and not path.is_symlink() and path.suffix.lower() in extensions:
+            if (path.is_file() and not path.is_symlink()
+                    and (path.suffix.lower() in extensions or path.name == "COPYING"
+                         or folder == "third-party/notices" and path.name.startswith(("LICENSE", "NOTICE")))):
                 result.append(path)
     return sorted(set(result), key=lambda path: path.relative_to(ROOT).as_posix())
 
@@ -156,8 +163,12 @@ def collect_crate_notices(vendored: Path, destination: Path) -> None:
             if not path.is_file():
                 continue
             lower = path.name.lower()
-            is_notice = lower.startswith(("license", "licence", "copying", "notice", "copyright", "authors"))
+            is_notice = (lower.startswith(("license", "licence", "copying", "notice", "copyright", "authors"))
+                         or "license" in lower or "licence" in lower)
             supplement = name in {"r-efi", "valuable"} and lower == "readme.md"
+            supplement |= name == "epaint_default_fonts" and path.suffix.lower() in {".md", ".txt"}
+            # Generated graphics APIs retain Khronos/XML source notices too.
+            supplement |= name == "khronos_api" and path.suffix.lower() == ".xml"
             if is_notice or supplement or path == manifest:
                 copy_file(path, destination / f"{name}-{version}" / path.relative_to(package))
         license_file = metadata.get("license-file")
@@ -166,6 +177,22 @@ def collect_crate_notices(vendored: Path, destination: Path) -> None:
             if not path.is_relative_to(package.resolve()):
                 raise ValueError(f"Escaping license-file metadata in {name}")
             copy_file(path, destination / f"{name}-{version}" / license_file)
+        supplemental = ROOT / "third-party/notices" / f"{name}-{version}"
+        if supplemental.is_dir():
+            origins = json.loads((ROOT / "third-party/notices/origins.json").read_text())
+            origin = next((entry for entry in origins["packages"]
+                           if entry["package"] == name and entry["version"] == version), None)
+            if origin is None:
+                raise ValueError(f"Missing notice provenance for {name}-{version}")
+            revision = json.loads((package / ".cargo_vcs_info.json").read_text())["git"]["sha1"]
+            if origin["revision"] != revision:
+                raise ValueError(f"Supplemental notices do not match the published {name} revision")
+            for notice in origin["notices"]:
+                path = supplemental / notice["file"]
+                if not path.resolve().is_relative_to(supplemental.resolve()) or hash_file(path) != notice["sha256"]:
+                    raise ValueError(f"Changed or escaping supplemental notice in {name}")
+                copy_file(path, destination / f"{name}-{version}" / "upstream-supplement" / notice["file"])
+            (destination / f"{name}-{version}" / "upstream-supplement/origin.json").write_text(json.dumps(origin, indent=2) + "\n")
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
 
@@ -233,6 +260,9 @@ def main() -> None:
     scope.add_argument("--source-only", action="store_true")
     parser.add_argument("--target", choices=SUPPORTED_TARGETS, help="Binary target (default: native Rust host)")
     parser.add_argument("--output", type=Path, default=ROOT / "target/dist")
+    parser.add_argument("--sign-macos", action="store_true",
+                        help="Explicit local Developer ID signing; never usable in public CI")
+    parser.add_argument("--notarize-profile", help="Existing local notarytool Keychain profile (requires --sign-macos)")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -243,6 +273,14 @@ def main() -> None:
     host = next(line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: "))
     target = args.target or host
     validate_target(host, target)
+    if (args.sign_macos or args.notarize_profile) and ("apple-darwin" not in target or args.source_only):
+        raise ValueError("Local signing/notarization apply only to macOS binary packaging")
+    if args.notarize_profile and not args.sign_macos:
+        raise ValueError("--notarize-profile requires explicit --sign-macos")
+    if args.sign_macos and (os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS")):
+        raise ValueError("Developer ID signing is local-only; CI packages remain unsigned")
+    if args.sign_macos and revision_info()["working_tree_modified"]:
+        raise ValueError("Sign only a clean committed checkout after reviewing its matching source and checks")
     files = source_files()
     before = project_hash(files)
 
@@ -256,13 +294,18 @@ def main() -> None:
     environment["CARGO_TARGET_DIR"] = str(ROOT / "target")
     macos_minimum = configure_macos_deployment(target, environment)
     if not args.source_only:
-        run("cargo", "build", "--release", "--locked", "--bin", "c64bridge", "--target", target, env=environment)
+        run("cargo", "build", "--release", "--locked", "--bin", "c64bridge", "--bin", "c64bridge-gui", "--target", target, env=environment)
     require_stable_sources()
-    provenance = {"schema": 1, "version": version, **revision_info(), "project_source_sha256": before,
+    provenance = {"schema": 2, "version": version, **revision_info(), "project_source_sha256": before,
                   "rustc": rustc.strip(), "build_host_target": host, "binary_target": target, "prgs": prg_manifest,
-                  "minimum_os": f"macOS {macos_minimum}" if macos_minimum else None,
+                  "minimum_os": f"macOS {macos_minimum}" if macos_minimum else ("Ubuntu 24.04+" if "linux" in target else "Windows 10/11 x64"),
                   "cc65_build_id": "Git 55528249",
-                  "verification": "compiled; physical C64 and native input delivery are not asserted"}
+                  "verification": "compiled; physical C64 and native input delivery are not asserted",
+                  "signing": "signed-only" if args.sign_macos else "unsigned"}
+    if not args.source_only:
+        suffix = ".exe" if target == "x86_64-pc-windows-msvc" else ""
+        provenance["executables"] = {name + suffix: hash_file(ROOT / "target" / target / "release" / (name + suffix))
+                                    for name in ("c64bridge", "c64bridge-gui")}
     (ROOT / "target/package-staging").mkdir(parents=True, exist_ok=True)
     archives = []
     with tempfile.TemporaryDirectory(prefix="release-", dir=ROOT / "target/package-staging") as temporary:
@@ -280,6 +323,9 @@ def main() -> None:
                 "Install Rust 1.99.0, Python 3.11 or newer, Git, GNU Make and a native C compiler. "
                 "The archive contains all locked Cargo sources in `vendor/`, `.cargo/config.toml`, and the exact cc65 V2.19 source in `third-party/cc65/`. "
                 "The tools themselves and operating system SDKs are not bundled.\n\n"
+                "GUI builds on Ubuntu 24.04 also need pkg-config, libxkbcommon-dev, "
+                "libwayland-dev, libegl1-mesa-dev, libgl1-mesa-dev and libxcb-render0-dev, "
+                "libxcb-shape0-dev, libxcb-xfixes0-dev. See scripts/README.md for native installers.\n\n"
                 "On macOS or Linux run `scripts/check.sh` to compile cc65, both unconfigured PRGs, and the host, "
                 "then run Rust/C tests and recording CLI smoke. Cargo uses the included vendored sources; "
                 "an already installed Rust toolchain is required for an offline build.\n\n"
@@ -297,7 +343,12 @@ def main() -> None:
             binary = stage / f"c64-keyboard-bridge-{version}-{target}"
             binary.mkdir()
             suffix = ".exe" if target == "x86_64-pc-windows-msvc" else ""
-            copy_file(ROOT / "target" / target / "release" / ("c64bridge" + suffix), binary / ("c64bridge" + suffix))
+            for name in ("c64bridge", "c64bridge-gui"):
+                copy_file(ROOT / "target" / target / "release" / (name + suffix), binary / (name + suffix))
+            if args.sign_macos:
+                INSTALLERS["macos_sign_binaries"](binary, INSTALLERS["SIGNING_IDENTITY"])
+                provenance["executables"] = {name: hash_file(binary / name)
+                                            for name in ("c64bridge", "c64bridge-gui")}
             for name in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", ".env.example"):
                 copy_file(ROOT / name, binary / name)
             for path in files:
@@ -309,12 +360,43 @@ def main() -> None:
                 copy_file(prg_directory / name, binary / "c64" / name)
             collect_crate_notices(source / "vendor", binary / "third-party/rust-crates")
             collect_runtime_notices(binary / "third-party/rust-runtime")
+            if suffix:
+                copy_file(ROOT / "installers/nsis-notices/COPYING", binary / "third-party/nsis/COPYING")
+            copy_file(ROOT / "assets/c64bridge.png", binary / "assets/c64bridge.png")
+            copy_file(ROOT / "assets/c64bridge.svg", binary / "assets/c64bridge.svg")
             (binary / "build-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+            app = None
+            if macos_minimum:
+                app = INSTALLERS["macos_bundle"](binary, version, macos_minimum)
+                if args.sign_macos:
+                    INSTALLERS["macos_sign"](app, INSTALLERS["SIGNING_IDENTITY"])
             extension = ".zip" if suffix else ".tar.gz"
             path = output / (binary.name + extension)
             require_stable_sources()
             write_archive(binary, path, windows=bool(suffix))
             archives.append(path)
+            if app:
+                path = output / (binary.name + ".dmg")
+                status = INSTALLERS["macos_dmg"](app, path,
+                    INSTALLERS["SIGNING_IDENTITY"] if args.sign_macos else None, args.notarize_profile)
+                metadata = output / (binary.name + ".metadata.json")
+                metadata.write_text(json.dumps({"schema": 1, "artifact": path.name,
+                    "project_revision": provenance["project_revision"], "signing": status,
+                    "developer_id": INSTALLERS["SIGNING_IDENTITY"] if args.sign_macos else None,
+                    "notarized_artifacts": [path.name] if status == "notarized" else [],
+                    "app_executables": {name: hash_file(app / "Contents/MacOS" / name)
+                                        for name in ("c64bridge", "c64bridge-gui")}}, indent=2) + "\n")
+                archives.extend([path, metadata])
+            elif suffix:
+                path = output / (binary.name + "-setup.exe")
+                INSTALLERS["windows_installer"](binary, path, version)
+                archives.append(path)
+            else:
+                path = output / f"c64-keyboard-bridge_{version}_{'arm64' if target.startswith('aarch64') else 'amd64'}.deb"
+                INSTALLERS["linux_deb"](binary, path, version,
+                                          "arm64" if target.startswith("aarch64") else "amd64")
+                archives.append(path)
+            require_stable_sources()
     checksums = output / ("SHA256SUMS-source" if args.source_only else f"SHA256SUMS-{target}")
     checksums.write_text("".join(f"{hash_file(path)}  {path.name}\n" for path in archives))
     for path in archives:

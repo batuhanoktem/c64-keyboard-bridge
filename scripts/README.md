@@ -2,6 +2,12 @@
 
 Use Rust 1.99.0, Python 3.11 or newer, Git, GNU Make and a native C compiler. Run scripts from the project checkout; they resolve its root themselves. Build output and toolchain caches stay under ignored `target/` directories. They never read `.env` for build inputs.
 
+GUI builds use eframe/Glow and the native window-system libraries. On Ubuntu 24.04 install the build dependencies before running the workspace checks:
+
+```sh
+sudo apt install pkg-config libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev
+```
+
 On macOS and Linux:
 
 ```sh
@@ -10,7 +16,7 @@ rustup component add rust-docs --toolchain 1.99.0
 scripts/package.sh
 ```
 
-`check.sh` performs a pinned cc65 build, both real C64 PRG builds, portable C tests with and without AddressSanitizer/UndefinedBehaviorSanitizer, Rust formatting, clippy, workspace tests, and a real CLI smoke test. The smoke test creates a temporary state directory, forces the recording backend, and talks only to the loopback simulator. It never requests native input permission, opens a virtual keyboard device, deploys software or contacts physical hardware.
+`check.sh` performs a pinned cc65 build, both real C64 PRG builds, portable C tests with and without AddressSanitizer/UndefinedBehaviorSanitizer, Rust formatting, clippy, workspace tests, both frontend builds, portable packaging contract tests, and the unchanged real CLI smoke test. The CLI smoke test creates a temporary state directory, forces the recording backend, and talks only to the loopback simulator. It never requests native input permission, opens a virtual keyboard device, deploys software or contacts physical hardware.
 
 `bootstrap-cc65.sh` fetches cc65 V2.19 at full commit `555282497c3ecf8b313d87d5973093af19c35bd5`, checks tracked source changes, and builds only the compiler/assembler/linker tools and C64 runtime. It prints the source root on stdout, with build output on stderr. V2.19's tools report V2.18, so provenance is checked using the full revision and source manifests, not the displayed version. Build identification is explicitly `Git 55528249`.
 
@@ -57,7 +63,20 @@ python3 scripts/cli-smoke.py --binary target/release/c64bridge
 
 ## Release packaging
 
-`package.sh` writes archives and checksums to `target/dist/`, with an executable, `.env.example`, mapping templates, documentation, both unconfigured PRGs and their manifest, build provenance, crate notices and Rust runtime notices. It defaults to the native Rust host. `--target` accepts the five CI target triples, and executable suffixes, archive names and ZIP/tar.gz format follow that binary target. `--binary-only`, `--source-only`, and `--output DIR` are also supported. Distribute the matching source archive with GPL-covered binaries, even when creating archives in separate jobs.
+`package.sh` writes portable archives, native installers and checksums to `target/dist/`, with both `c64bridge` and `c64bridge-gui`, `.env.example`, mapping templates, documentation, both unconfigured PRGs and their manifest, build provenance, crate/font notices and Rust runtime notices. It defaults to the native Rust host. `--target` accepts the five CI target triples, and executable suffixes, archive names and ZIP/tar.gz format follow that binary target. `--binary-only`, `--source-only`, and `--output DIR` are also supported. Distribute the matching source archive with GPL-covered binaries, even when creating archives in separate jobs.
+
+Native packaging produces an `.app` plus DMG on each Mac architecture, a per-user NSIS installer on Windows x64 and an Ubuntu 24.04+ DEB on each Linux architecture. Windows packaging downloads the checksum-pinned official NSIS 3.13 portable compiler under `target/tools/` and checks `v3.13` before execution. Its Zlib runtime notices accompany the installer. Linux requires `dpkg-deb`; packages have no maintainer scripts, uinput permission changes or automatic startup. `installer-smoke.py target/dist` mounts DMGs read-only, silently installs/uninstalls NSIS on the ephemeral CI user, or installs/purges DEBs under a private dpkg root, checking that both frontends and resources match the portable package.
+
+Public CI does not use signing keys. Explicit local Mac signing uses the already provisioned Keychain identity without exporting it:
+
+```sh
+scripts/package.sh --binary-only --sign-macos --output target/dist-signed
+python3 scripts/installer-smoke.py target/dist-signed
+```
+
+The approved identity is `Developer ID Application: Flame Lion Ltd (TUGY329T35)`. Signing verifies both nested executables and the app, then signs the DMG. To notarize, provision a local `notarytool` Keychain profile through Apple's tool and use `--notarize-profile "$C64BRIDGE_NOTARY_PROFILE"` with `--sign-macos`. Packaging never reads Apple passwords or private keys from the repository. An accepted notarization response and successful staple validation are required before DMG metadata says `notarized`; otherwise it is `signed-only` or `unsigned`. The portable app is not labelled notarized solely because its DMG was notarized.
+
+`build-provenance.json` schema 2 records hashes of both packaged executables. Mac `.metadata.json` also records the signed app executable hashes and precise DMG signing/notarization status, since signing changes binary bytes. Checksums cover all portable archives, source, DMGs, installer EXEs, DEBs and Mac metadata files. Regenerate the dependency inventory with `python3 scripts/update-dependency-notices.py` after lockfile changes, then review `python3 scripts/supplement-notices.py` results for crates whose published payload omits licenses. It fetches licenses at each crate's published upstream commit and records origin URLs and hashes; packaging validates those stored hashes and commits without network access for this step. Git attributes preserve exact notice and binary artwork bytes across operating systems. Complete vendored sources and nested font/API notices are retained independently.
 
 On macOS, an installed alternate Rust architecture target can be cross linked with the native SDK. For example, on Apple Silicon:
 
@@ -71,3 +90,13 @@ Packaging sets `MACOSX_DEPLOYMENT_TARGET` to at least 10.15 for Intel and 11.0 f
 The source archive uses an explicit project-source allowlist, excluding private `.env`, runtime state, generated objects and configured PRGs. It includes complete Cargo-vendored dependencies and `.cargo/config.toml`, plus the exact cc65 source tree and a source hash manifest. With build tools already installed, the included sources allow dependency builds without fetching crates or cc65. Rebuilding a source archive uses its included cc65 tree and verifies its original source files before compiling.
 
 CI runs native jobs on macOS ARM64/x86_64, Linux ARM64/x86_64 and Windows x86_64. All GitHub actions are pinned to full commit SHAs. Artifacts are compiled and synthetically checked; native input delivery and physical C64 operation still require the acceptance tests. GitHub publication occurs only on a version tag or a manual workflow run with `publish` enabled and an existing version tag pointing to the checked-out commit.
+
+## Isolated desktop GUI check
+
+On Ubuntu 24.04, install `xvfb xauth libgl1-mesa-dri dbus-x11 python3-dbus python3-gi` and run:
+
+```sh
+python3 scripts/gui-smoke.py --binary target/debug/c64bridge-gui
+```
+
+This launches the actual window/event loop with Mesa software rendering on a private authenticated Xvfb display and an isolated D-Bus StatusNotifierWatcher fixture. Smoke mode uses fake services, private settings/state and a working directory without `.env`; it never connects to a C64, reads the real credential store or enables native input. The harness requires successful rendered frames, a PNG screenshot, actual tray registration and clean exit. Results and screenshots are retained under `target/gui-smoke/`. On other systems a deliberately invoked `gui-smoke.py` requires an available graphical session; the five-platform native CI always compiles and tests GUI logic, while the Linux jobs also exercise the real graphical fixtures. Physical native GUI input, real desktop tray/vault interaction and permission acceptance remain separate checks.

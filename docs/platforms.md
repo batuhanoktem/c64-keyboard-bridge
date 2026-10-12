@@ -2,6 +2,8 @@
 
 Build and type checking establish that the backend code compiles. They do not establish that events reach a real application's focused window. Run `doctor`, then the deliberate `test-input` command, and complete the physical tests on each platform you use.
 
+Both the CLI and [desktop companion](gui.md) use these same backends. Native installers contain both frontends and retain the documented permission and layout checks. Existing CLI acceptance results do not automatically cover a newly installed GUI process's permission or credentials. The companion requires a working OpenGL/EGL graphics driver; Linux builds use X11 or Wayland for the window independently of the input backend's stricter admission policy.
+
 ## macOS
 
 The minimum host OS is macOS 10.15 on Intel or macOS 11.0 on Apple Silicon. The CoreGraphics event-posting permission APIs require macOS 10.15. These requirements apply to both source installations and packaged executables. Install the pinned Rust 1.99.0 toolchain and Apple's command-line developer tools; install the C64 tools with `brew install cc65`, or use the pinned [build scripts](../scripts/README.md). The backend posts CoreGraphics events with explicit modifier flags. It uses no input hook, event tap, or keyboard capture.

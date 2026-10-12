@@ -4,9 +4,9 @@
 [![License](https://img.shields.io/github/license/batuhanoktem/c64-keyboard-bridge)](LICENSE)
 [![Latest commit](https://img.shields.io/github/last-commit/batuhanoktem/c64-keyboard-bridge)](https://github.com/batuhanoktem/c64-keyboard-bridge/commits/main/)
 
-Use the physical Commodore 64 Ultimate keyboard as a keyboard for a modern computer. A real C64 PRG scans CIA1, sends physical key transitions through Ultimate UCI TCP sockets, and a Rust command-line host maps them to native input. No hardware modification or firmware replacement is required by the design.
+Use the physical Commodore 64 Ultimate keyboard as a keyboard for a modern computer. A real C64 PRG scans CIA1, sends physical key transitions through Ultimate UCI TCP sockets, and a Rust desktop companion or command-line host maps them to native input. No hardware modification or firmware replacement is required by the design.
 
-This is GPL-3.0-only software, with dependency attribution in [third-party notices](THIRD_PARTY_NOTICES.md). There is no GUI. Physical testing passed on C64 Ultimate firmware 1.1.0, FPGA 122, core 1.49 with ARM macOS and US layout: UCI binary networking, TextEdit/VS Code typing and shortcuts, held-key pause/resume, and local exit to BASIC. On 2026-10-12, after fixing per-key debounce and queued-release ordering, user-observed Windows US tests passed in Notepad, VS Code and a WSLg Linux scratch window, including repeat, pause/resume and recovery from a six-second C64 CPU traffic stall. The fixed client returned cleanly to BASIC. Linux XTEST passed on isolated authenticated Xvfb servers on both architectures. Native physical Linux/uinput, broader layouts, rollover, Wi-Fi outages and sustained scan/latency measurements still require the [hardware acceptance tests](docs/hardware-testing.md).
+This is GPL-3.0-only software, with dependency attribution in [third-party notices](THIRD_PARTY_NOTICES.md). The [desktop companion](docs/gui.md) includes a visual keyboard mapping editor, tray controls, retained diagnostics and optional OS credential storage. The CLI remains independently usable. Physical testing of the CLI passed on C64 Ultimate firmware 1.1.0, FPGA 122, core 1.49 with ARM macOS and US layout: UCI binary networking, TextEdit/VS Code typing and shortcuts, held-key pause/resume, and local exit to BASIC. On 2026-10-12, after fixing per-key debounce and queued-release ordering, user-observed Windows US tests passed in Notepad, VS Code and a WSLg Linux scratch window, including repeat, pause/resume and recovery from a six-second C64 CPU traffic stall. The fixed client returned cleanly to BASIC. Linux XTEST passed on isolated authenticated Xvfb servers on both architectures. GUI native input acceptance, physical Linux/uinput, broader layouts, rollover, Wi-Fi outages and sustained scan/latency measurements still require the [hardware acceptance tests](docs/hardware-testing.md).
 
 A limited VICE 3.10 check passed for the production scanner at idle, preserved interrupt state/CIA directions, and the client exit path with a mocked exit chord. It does not emulate UCI or prove physical key input.
 
@@ -21,9 +21,15 @@ cargo test --workspace --locked
 cargo install --path crates/bridge-cli --locked
 ```
 
-The desktop executable is `target/release/c64bridge` (`c64bridge.exe` on Windows). The standalone templates are `c64/build/KEYBRIDGE.PRG` and `c64/build/NETWORKTEST.PRG`; Cargo also builds and embeds both in its output directory. Unconfigured templates display `NO CONFIG`. The host patches a copy in memory before deployment. See [C64 client details](c64/README.md).
+The executables are `target/release/c64bridge-gui` and `target/release/c64bridge` (with `.exe` on Windows). Linux GUI builds need the development libraries listed in [build instructions](scripts/README.md). The standalone templates are `c64/build/KEYBRIDGE.PRG` and `c64/build/NETWORKTEST.PRG`; Cargo also builds and embeds the same verified templates in both frontends. Unconfigured templates display `NO CONFIG`. The host patches a copy in memory before deployment. See [C64 client details](c64/README.md).
 
 For the pinned cc65 build, sanitizers, CLI smoke checks, and release archives, use [the build and package scripts](scripts/README.md). `scripts/check.sh` runs the complete local check path on macOS/Linux; pinned PRGs are emitted under `target/c64-prgs/` and archives under `target/dist/`.
+
+## Desktop companion
+
+Install the architecture-specific macOS DMG, Windows per-user installer or Ubuntu 24.04+ DEB, or run `c64bridge-gui` from a portable archive. Hosting and input start disabled. Enter your C64 address on Connection, choose a matching US/UK host layout, then start the host. Deploying either C64 program requires a separate confirmation because it resets the C64 and replaces its current program.
+
+Enable Input gives you five seconds to focus a scratch application. Returning to the companion pauses its owned input. Closing the window keeps it in the tray when a tray is available; Quit releases keys and stops GUI-owned hosting. An existing separately started CLI session is identified and survives GUI Quit. Read [the GUI guide](docs/gui.md) for mappings, credential storage and installer signing status.
 
 ## Configure and test
 

@@ -94,6 +94,11 @@ jobs:
         with:
           name: c64-unconfigured-prgs
           path: target/ci-prgs
+      - name: Install Linux GUI build and isolated acceptance dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libegl1-mesa-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev xvfb xauth x11-xkb-utils x11-utils libx11-6 libgl1-mesa-dri dbus-x11 python3-dbus python3-gi
       - name: Native Rust checks and recording CLI smoke
         env:
           C64_PRG_DIR: ${{ github.workspace }}/target/ci-prgs
@@ -103,18 +108,26 @@ jobs:
           else
             scripts/check.sh
           fi
-      - name: Install isolated X11 acceptance dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y xvfb xauth x11-xkb-utils x11-utils libx11-6
       - name: Native XTEST acceptance on a private authenticated Xvfb display
         if: runner.os == 'Linux'
         run: python3 scripts/x11-smoke.py --binary target/debug/c64bridge
-      - name: Package native binary with notices and verified PRGs
+      - name: Real GUI under isolated Xvfb and StatusNotifier fixture
+        if: runner.os == 'Linux'
+        run: python3 scripts/gui-smoke.py --binary target/debug/c64bridge-gui
+      - name: Retain isolated GUI layout evidence
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: gui-smoke-${{ matrix.target }}
+          path: target/gui-smoke/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Package both frontends, native installers, notices and verified PRGs
         env:
           C64_PRG_DIR: ${{ github.workspace }}/target/ci-prgs
         run: scripts/package.sh --binary-only
+      - name: Verify isolated native installer install/extraction and uninstall
+        run: python scripts/installer-smoke.py target/dist
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: release-${{ matrix.target }}
@@ -177,4 +190,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$RELEASE_TAG" target/release-assets/*.tar.gz target/release-assets/*.zip target/release-assets/SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG"
+          assets=(target/release-assets/*.tar.gz target/release-assets/*.zip target/release-assets/*.dmg target/release-assets/*.exe target/release-assets/*.deb target/release-assets/*.metadata.json target/release-assets/SHA256SUMS)
+          gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --generate-notes --title "$RELEASE_TAG"

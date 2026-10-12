@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=C64 Keyboard Bridge
+Comment=Use a C64 Ultimate keyboard with this computer
+Exec=c64bridge-gui
+Icon=c64bridge
+Terminal=false
+Categories=Utility;Accessibility;
+StartupNotify=true
+StartupWMClass=net.c64bridge.desktop
