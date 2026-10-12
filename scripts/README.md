@@ -26,6 +26,33 @@ bash scripts/package.sh --binary-only
 
 This runs native Windows Rust checks and recording CLI smoke. The source-bound PRG manifest is required. GNU Make/C compiler checks for the C64 application remain covered by the Unix jobs. Windows release packaging requires Rust runtime notices (`rust-docs`) too.
 
+## Isolated Linux X11 check
+
+The Linux-only `x11-smoke.py` harness tests the real XTEST backend without using the logged-in desktop or a C64. It starts its own Xvfb server on a free display with a private MIT authentication cookie and `-nolisten tcp`, then creates and focuses a collector window on that display. Standard US and UK maps are applied only to this server. The harness removes Wayland session variables only from child processes that use the private display; it leaves the caller's WSLg or other desktop environment unchanged.
+
+On Ubuntu 24.04, install the public distribution packages and run the harness as your ordinary user:
+
+```sh
+sudo apt install python3 xvfb xauth x11-xkb-utils libx11-6 x11-utils
+python3 scripts/x11-smoke.py --binary target/release/c64bridge
+```
+
+CI uses Python 3.12 and runs this test on its Ubuntu Linux jobs. A debug executable or an extracted Linux release executable can also be supplied through `--binary`. The executable must run on the distribution's architecture and libc; the packaged Linux binaries are built on Ubuntu 24.04. For an older Ubuntu with an incompatible glibc, rebuild the matching source locally rather than changing its system libc. On other operating systems the harness reports a skip.
+
+For each layout, the actual CLI's `test-input` command must deliver `c64 bridge` plus Return, with 11 presses and 11 releases, and leave no held keys in `XQueryKeymap`. A mismatched configured layout must refuse before producing events. After the owned server stops, a new CLI connection must fail within a process deadline. That last check establishes an absent-server failure, not cleanup of held keys after a live server disconnect or a stalled socket.
+
+All generated events target the harness-owned collector. A supervisor bounds Xlib operations in killable process groups; cleanup removes the harness's authentication files and terminates its own processes. Success establishes Linux input delivery to a virtual X server; it does not establish physical desktop, WSLg Weston, or Wayland uinput acceptance. See the [WSLg support distinction](../docs/platforms.md#ubuntu-in-wslg).
+
+On 2026-10-12, this harness passed against the packaged ARM64 Linux executable in an isolated Ubuntu 24.04 container running as UID 1000, with network access disabled and no host display sockets or private configuration mounted. The [acceptance record](../docs/hardware-testing.md#isolated-linux-x11-observation) lists the observed checks and their limits.
+
+The separate recording test can be run inside Ubuntu without any display packages:
+
+```sh
+python3 scripts/cli-smoke.py --binary target/release/c64bridge
+```
+
+## Release packaging
+
 `package.sh` writes archives and checksums to `target/dist/`, with an executable, `.env.example`, mapping templates, documentation, both unconfigured PRGs and their manifest, build provenance, crate notices and Rust runtime notices. It defaults to the native Rust host. `--target` accepts the five CI target triples, and executable suffixes, archive names and ZIP/tar.gz format follow that binary target. `--binary-only`, `--source-only`, and `--output DIR` are also supported. Distribute the matching source archive with GPL-covered binaries, even when creating archives in separate jobs.
 
 On macOS, an installed alternate Rust architecture target can be cross linked with the native SDK. For example, on Apple Silicon:

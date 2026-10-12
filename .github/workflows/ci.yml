@@ -103,6 +103,14 @@ jobs:
           else
             scripts/check.sh
           fi
+      - name: Install isolated X11 acceptance dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y xvfb xauth x11-xkb-utils x11-utils libx11-6
+      - name: Native XTEST acceptance on a private authenticated Xvfb display
+        if: runner.os == 'Linux'
+        run: python3 scripts/x11-smoke.py --binary target/debug/c64bridge
       - name: Package native binary with notices and verified PRGs
         env:
           C64_PRG_DIR: ${{ github.workspace }}/target/ci-prgs

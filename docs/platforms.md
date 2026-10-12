@@ -24,9 +24,11 @@ The selected foreground application's layout must be standard US or United Kingd
 
 Install Rust, a C/linker toolchain, and cc65 from your distribution or [upstream](https://cc65.github.io/). The X11 backend uses the Rust `x11rb` client and the XTEST extension. It accepts only a local AF_UNIX display such as `DISPLAY=:0` or `DISPLAY=unix:0`; remote/TCP displays and SSH-forwarded displays such as `localhost:10.0` are refused. It requires an authenticated connection, XKB support, and a matching standard US/UK map in active group zero. Physical-row and punctuation fingerprints reject unknown layouts and dead-key variants. `auto` selects X11 outside a detected Wayland session.
 
+Linux release binaries are dynamically linked GNU/Linux builds produced on Ubuntu 24.04 CI runners. They do not promise compatibility with every older distribution's glibc. If an older Ubuntu installation reports a missing `GLIBC_*` version, build the matching source on that distribution with the pinned toolchain instead of replacing its system libc. The executable architecture must also match the distribution's architecture. CI uses Python 3.12 for the accompanying scripts.
+
 The local X11 connection is nonblocking. Abstract/named socket connection attempts and the setup handshake share a 500 ms deadline; subsequent request/reply operations use a fresh 500 ms deadline and finite polling. A stalled server disables input instead of blocking the worker indefinitely. Failed releases retain ownership for another cleanup attempt rather than claiming the native key was released.
 
-Production-stream mock tests were exercised on macOS, and the Linux mock test module was cross-compiled. Those checks do not establish a connection to a real Linux X server or native application delivery; both remain unverified.
+Production-stream mock tests were exercised on macOS, and the Linux mock test module was cross-compiled. On 2026-10-12, the [isolated Xvfb smoke test](../scripts/README.md#isolated-linux-x11-check) passed with the packaged ARM64 Linux executable in an Ubuntu 24.04 container: standard US/UK typing, balanced events, no held keys, layout-mismatch refusal and a bounded absent-server connection failure. This establishes real Linux XTEST delivery in a private virtual X server. Physical desktop, WSLg, Wayland uinput and physical C64-to-Linux acceptance remain unverified; see the [recorded test scope](hardware-testing.md#isolated-linux-x11-observation).
 
 Under Wayland, `auto` selects `uinput`. XTEST through XWayland cannot establish delivery to native Wayland applications, so this implementation refuses that path in a detected Wayland session. The uinput backend requires a usable `/dev/uinput` or `/dev/input/uinput` and explicit administrator-configured access for this user. Do not run the network server as root or grant arbitrary users unrestricted uinput access. The bridge does not change device permissions or load a kernel module automatically. [Kernel uinput documentation](https://docs.kernel.org/input/uinput.html).
 
@@ -35,6 +37,25 @@ Wayland uinput support is currently limited to Sway with `swaymsg` and Hyprland 
 `doctor` can check that uinput opens, without creating a virtual keyboard. If the device is absent, its layout remains unverified. The virtual keyboard is created only when injection is deliberately enabled, then checked before any key. Queries are bounded to 500 ms and 64 KiB, and a matching result is cached for at most 100 ms. Compositor acceptance and device discovery timing still require a focused-application test. Linux currently supports physical keys only: Unicode text actions are blocked, and repeat follows desktop settings rather than `REPEAT_*`.
 
 Native backends check layout before input and during enabled operation. A mismatch disables input and attempts cleanup; key releases bypass the layout guard so a switch cannot prevent cleanup solely because the new layout differs.
+
+### Ubuntu in WSLg
+
+WSLg presents Linux X11 and Wayland application windows on the Windows desktop. Its system distribution runs Weston and XWayland and exposes their sockets with `DISPLAY` and `WAYLAND_DISPLAY` set in the user distribution. See [Microsoft's GUI guide](https://learn.microsoft.com/en-us/windows/wsl/tutorials/gui-apps) and [official WSLg architecture](https://github.com/microsoft/wslg#wslg-architecture-overview).
+
+Use these paths as separate acceptance results:
+
+| Test path | What it can establish |
+| --- | --- |
+| Windows executable → focused Windows scratch editor | Windows `SendInput`, layout, modifiers, repeat and cleanup |
+| Windows executable → focused WSLg scratch editor | Windows input delivery through WSLg's remoting path, if observed in that application |
+| Ubuntu executable → recording simulator | Linux execution, protocol, runtime controls and cleanup |
+| Ubuntu executable → private Xvfb collector | Real Linux XTEST/XKB delivery in an isolated virtual X server |
+
+The Windows-to-WSLg path needs an empirical focused-window test; WSLg documentation does not guarantee delivery of this bridge's injected events. It exercises the Windows backend, so record it separately from Linux backend acceptance.
+
+The default WSLg desktop is currently unsupported by the Linux native backend. A present `WAYLAND_DISPLAY`, or `XDG_SESSION_TYPE=wayland`, makes `auto` select uinput. Weston cannot satisfy the current Sway/Hyprland device-layout admission policy, even if a uinput device is writable. Selecting `--backend x11` also refuses a detected Wayland session. Do not remove Wayland environment variables to bypass this guard on the real WSLg desktop. The Xvfb harness removes them only from children directed to its own authenticated private display.
+
+Start with the native Windows bridge for physical C64 tests. A C64 connecting directly to a server inside WSL2 additionally needs a reachable Linux listener. Default NAT does not expose it to the LAN automatically; mirrored mode and applicable firewall rules can permit LAN connections. Any forwarding arrangement must preserve or explicitly validate the peer address used by the bridge's allowlist. See [Microsoft's WSL networking guide](https://learn.microsoft.com/en-us/windows/wsl/networking). Loopback recording and Xvfb tests require no LAN forwarding or firewall changes.
 
 ## Using prebuilt C64 templates
 

@@ -26,6 +26,14 @@ It requires `x64sc` on PATH, cc65 tools, and separately installed C64 ROMs; no R
 
 The observed VICE 3.10 result checks the production assembly scanner's idle bitmap, preservation of the processor interrupt-enable flag with both initial states, and saved CIA DDR restoration. It also compiles the production client main with a mocked local-exit matrix provider, holds that chord for at least 60 KERNAL jiffies, and checks saved `$0289`/`$0291` settings and cleared `$C6` on return. It does not emulate UCI, verify held-key scanning/ghosting, execute physical Ultimate networking, or prove hardware return to BASIC. Keep that limited result separate from the physical observations below and remaining acceptance tests.
 
+### Isolated Linux X11 observation
+
+On 2026-10-12, `scripts/x11-smoke.py` passed using the packaged `aarch64-unknown-linux-gnu` version 0.1.0 executable from commit `371faa66798b0bb2404103d0d40c96488d8a2087`. The run used an Ubuntu 24.04 ARM64 container as UID 1000, with network access disabled, capabilities dropped, and only the harness and unconfigured release bundle mounted. No host desktop sockets or private device configuration were mounted. The harness created its own authenticated Xvfb server and collector window; it contacted no C64.
+
+For both standard US and UK maps, the actual CLI's `test-input` produced `c64 bridge` plus Return, exactly 11 presses and 11 matching releases, and an empty final `XQueryKeymap`. Both opposite-layout configurations refused before producing events. An unauthenticated client was denied. After the owned server stopped, a new CLI connection was refused in 0.025 seconds within the harness's process deadline.
+
+This verifies native Linux executable and XTEST/XKB behavior on a private virtual X server. The absent-server check does not test a stalled established connection or release of held keys after a live server disconnect. Physical desktop application delivery, WSLg input paths, Wayland uinput, physical C64-to-Linux operation, and x86_64 execution of this harness remain separate acceptance tests. See the [harness instructions](../scripts/README.md#isolated-linux-x11-check).
+
 ## 1. Device and REST baseline
 
 Set the private configuration and run `c64bridge doctor --json` and `c64bridge device info`. Record firmware, FPGA, core, host OS, backend, layout, and commit. Confirm the product is C64 Ultimate. These commands do not reset or type. Review diagnostic metadata before sharing it.
