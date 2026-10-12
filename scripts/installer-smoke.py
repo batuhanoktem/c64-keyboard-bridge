@@ -84,11 +84,17 @@ def windows_check(directory):
                 uninstaller = install / "uninstall.exe"
                 if uninstaller.is_file():
                     subprocess.run(f'"{uninstaller}" /S', check=True, timeout=120)
-            deadline = time.monotonic() + 10
-            while (install / 'c64bridge-gui.exe').exists() and time.monotonic() < deadline:
+            # The NSIS launcher returns after handing off to a temporary executable.
+            # Its manifest deletes the frontends before the remaining resource files,
+            # so disappearance of one binary does not establish uninstall completion.
+            deadline = time.monotonic() + 30
+            while (install.exists() and {path.name for path in install.iterdir()} != {'.env'}
+                   and time.monotonic() < deadline):
                 time.sleep(.1)
             if not install.exists() or {path.name for path in install.iterdir()} != {'.env'}:
-                raise ValueError("Uninstall left program files behind")
+                remaining = sorted(path.relative_to(install).as_posix() for path in install.rglob('*')
+                                   if path.name != '.env')[:12] if install.exists() else []
+                raise ValueError(f"Uninstall did not reach the expected preserved-user-data state: {remaining}")
             if sentinel.read_text() != "PRIVATE_USER_SENTINEL" or (install / '.env').read_text() != 'PRIVATE_USER_SENTINEL':
                 raise ValueError("Uninstall altered user settings")
             print(f"PASS per-user NSIS install/uninstall: {package.name}")

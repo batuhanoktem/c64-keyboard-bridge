@@ -83,8 +83,10 @@ def main():
                 wait_for(tray_report.exists, fixture)
             report = output / 'gui-result.json'
             screenshot = output / 'gui.png'
+            images = [output / f'gui-{page}.png' for page in ('connection', 'diagnostics', 'settings')]
             report.unlink(missing_ok=True)
-            screenshot.unlink(missing_ok=True)
+            for image in [screenshot, *images]:
+                image.unlink(missing_ok=True)
             state_dir = private / 'state'
             with (output / 'gui.log').open('w') as log:
                 primary = subprocess.Popen([str(binary), '--smoke', '--state-dir', str(state_dir),
@@ -99,10 +101,15 @@ def main():
                                    env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT,
                                    check=True, timeout=10)
                     wait_for(lambda: json.loads(tray_report.read_text()).get('items_registered', 0) >= 1, primary)
-                    images = [output / f'gui-{page}.png' for page in ('connection', 'diagnostics', 'settings')]
                     wait_for(lambda: screenshot.is_file() and all(image.is_file() for image in images), primary, seconds=15)
-                    # Let the adapter's first bounded watcher/host/item ownership proof complete.
+                    # Let screenshot acknowledgments hide the window and the adapter's bounded
+                    # watcher/host/item ownership proof complete before exercising hidden Show.
                     time.sleep(.75)
+                    subprocess.run([str(binary), '--smoke', '--state-dir', str(state_dir),
+                                    '--smoke-report', str(private / 'hidden-duplicate-unused.json'),
+                                    '--screenshot', str(private / 'hidden-duplicate-unused.png')],
+                                   env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT,
+                                   check=True, timeout=10)
                     terminate(fixture)
                 returncode = primary.wait(timeout=45)
             if returncode != 0:
@@ -122,8 +129,10 @@ def main():
                 tray = json.loads(tray_report.read_text())
                 if tray.get('items_registered', 0) < 1:
                     raise ValueError('GUI did not register an actual StatusNotifier tray item')
-                if evidence.get('tray_loss_observed') is not True or evidence.get('activation_requests', 0) < 1:
-                    raise ValueError('Actual GUI did not observe watcher loss and authenticated duplicate launch')
+                if evidence.get('hidden_window_exercised') is not True:
+                    raise ValueError('Actual GUI did not exercise a hidden window with its tray present')
+                if evidence.get('tray_loss_observed') is not True or evidence.get('activation_requests', 0) < 2:
+                    raise ValueError('Actual GUI did not observe watcher loss and both authenticated duplicate launches')
                 (output / 'tray-result.json').write_text(json.dumps(tray, indent=2) + '\n')
             print('PASS real GUI launch, four rendered pages, software-only defaults and clean exit')
         finally:
