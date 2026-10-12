@@ -1,5 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 use anyhow::{Context, Result, bail};
 use bridge_gui::{
     app::BridgeApp,
@@ -55,12 +58,16 @@ struct SmokeEvidence {
     tray_loss_observed: bool,
     activation_requests: u64,
     quit_ready: bool,
+    native_menu_quit_observed: bool,
+    native_menu_dirty_preserved: bool,
     error: Option<String>,
 }
 
 enum NativeEvent {
     Tray(TrayEvent),
     Show,
+    #[cfg(target_os = "macos")]
+    Quit,
     ScreenshotSaved {
         page: String,
         result: std::result::Result<(), String>,
@@ -107,6 +114,12 @@ struct NativeApp {
     events: mpsc::Receiver<NativeEvent>,
     sender: mpsc::Sender<NativeEvent>,
     tray: Option<Tray>,
+    #[cfg(target_os = "macos")]
+    quit_menu: Option<macos::QuitMenu>,
+    #[cfg(target_os = "macos")]
+    menu_smoke_stage: u8,
+    #[cfg(target_os = "macos")]
+    menu_dirty_frame: u64,
     activation: Option<ActivationServer>,
     _instance: InstanceGuard,
     focused: Option<bool>,
@@ -151,6 +164,15 @@ impl NativeApp {
             wake();
         }))
         .ok();
+        #[cfg(target_os = "macos")]
+        let quit_menu = {
+            let quit_tx = sender.clone();
+            let context = cc.egui_ctx.clone();
+            macos::QuitMenu::install(Arc::new(move || {
+                let _ = quit_tx.send(NativeEvent::Quit);
+                context.request_repaint();
+            }))?
+        };
         cc.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(10.0, 8.0);
             style.spacing.button_padding = egui::vec2(12.0, 8.0);
@@ -162,6 +184,12 @@ impl NativeApp {
             events,
             sender,
             tray,
+            #[cfg(target_os = "macos")]
+            quit_menu: Some(quit_menu),
+            #[cfg(target_os = "macos")]
+            menu_smoke_stage: 0,
+            #[cfg(target_os = "macos")]
+            menu_dirty_frame: 0,
             activation: Some(activation),
             _instance: guard,
             focused: None,
@@ -196,6 +224,10 @@ impl NativeApp {
         if let Some(action) = self.app.request_quit() {
             self.dispatch(action, ctx);
         } else {
+            if self.smoke {
+                self.evidence.lock().unwrap().native_menu_dirty_preserved =
+                    self.app.editor.is_dirty();
+            }
             self.show(ctx);
         }
     }
@@ -288,6 +320,8 @@ impl NativeApp {
             self.service_joined = true;
         }
         self.activation.take();
+        #[cfg(target_os = "macos")]
+        self.quit_menu.take();
         self.tray.take();
         for thread in self.capture_threads.drain(..) {
             let _ = thread.join();
@@ -299,6 +333,12 @@ impl eframe::App for NativeApp {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 NativeEvent::Tray(event) => self.on_tray(event, ctx),
+                #[cfg(target_os = "macos")]
+                NativeEvent::Quit => {
+                    self.evidence.lock().unwrap().native_menu_quit_observed = true;
+                    self.quit(ctx);
+                    self.menu_dirty_frame = self.evidence.lock().unwrap().frames;
+                }
                 NativeEvent::Show => {
                     self.evidence.lock().unwrap().activation_requests += 1;
                     self.show(ctx);
@@ -358,6 +398,11 @@ impl eframe::App for NativeApp {
                 && self.captured.len() == 4
                 && !evidence.hosting
                 && !enabled;
+            #[cfg(target_os = "macos")]
+            {
+                evidence.ok &=
+                    evidence.native_menu_quit_observed && evidence.native_menu_dirty_preserved;
+            }
             drop(evidence);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if ctx.input(|input| input.viewport().close_requested()) {
@@ -377,6 +422,34 @@ impl eframe::App for NativeApp {
                     Some("GUI smoke did not finish rendering within its bound".into());
                 self.quit(ctx);
             } else if self.captured.len() == 4 && self.began.elapsed() >= Duration::from_secs(8) {
+                #[cfg(target_os = "macos")]
+                {
+                    let (dirty_preserved, frames) = {
+                        let evidence = self.evidence.lock().unwrap();
+                        (evidence.native_menu_dirty_preserved, evidence.frames)
+                    };
+                    if self.menu_smoke_stage == 0 {
+                        self.app
+                            .editor
+                            .document
+                            .name
+                            .push_str("-unsaved-software-smoke");
+                        self.menu_smoke_stage = 1;
+                        if let Some(menu) = &self.quit_menu {
+                            menu.perform_quit();
+                        }
+                    } else if self.menu_smoke_stage == 1
+                        && dirty_preserved
+                        && frames >= self.menu_dirty_frame + 2
+                    {
+                        self.app.editor.discard();
+                        self.menu_smoke_stage = 2;
+                        if let Some(menu) = &self.quit_menu {
+                            menu.perform_quit();
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
                 self.quit(ctx);
             }
             ctx.request_repaint_after(Duration::from_millis(33));
