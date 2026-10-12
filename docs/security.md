@@ -17,3 +17,5 @@ Bridge-owned output is released on pause, session failure, disconnect, and host 
 The C64 client suspends forwarding on ambiguous matrix rectangles or controller interference. These precautions can reject legitimate rollover combinations. Commodore+RUN/STOP held for one second is a reserved local exit chord. RESTORE has no ordinary matrix transition; an abrupt warm start or reset bypasses local cleanup and relies on the host watchdog. Full behavioral acceptance is covered by [hardware testing](hardware-testing.md).
 
 There is no host keyboard capture, keylogger, GUI, or password-bearing CLI argument. Default logs omit key text and authentication tokens. Diagnostic reports contain device and network metadata, so review them before sharing.
+
+`LOG_LEVEL=debug` records physical C64 key identities, worker decisions and accepted Windows native key events, including repeat. These traces can reveal text typed through the bridge. Keep them private and review them before sharing; credentials and Unicode action content are not logged by these traces.

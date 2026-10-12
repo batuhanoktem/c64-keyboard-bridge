@@ -16,6 +16,8 @@ These exercise protocol fragmentation/coalescing/bounds, sequence wrap, matrix I
 
 The complete scripted check is `scripts/check.sh` on macOS/Linux: pinned cc65 build, PRG provenance validation, portable C tests with sanitizers, Rust checks, and a temporary loopback recording CLI smoke test. The [script documentation](../scripts/README.md) covers Windows host-only checks and packaging. The CI definition includes native build jobs; an unexecuted workflow is not evidence of a successful job or real keyboard injection.
 
+The [CI run for `21cc295`](https://github.com/batuhanoktem/c64-keyboard-bridge/actions/runs/38192661621) passed on macOS ARM64/Intel, Windows x64 and Linux x64/ARM64, including formatting, Clippy, native tests, recording smoke tests, pinned PRG builds and all six release/source archives. Rust test totals were 67 per macOS target, 66 on Windows and 73 per Linux target. Both Linux native Xvfb checks passed. The packages were separately audited against the exact commit, including unconfigured embedded PRGs, dependency/source checksums and licensing notices; this remains separate from physical acceptance.
+
 The real templates load at `$0801` with a BASIC SYS stub and exactly one configuration block. The limited VICE check is:
 
 ```sh
@@ -32,7 +34,25 @@ On 2026-10-12, `scripts/x11-smoke.py` passed using the packaged `aarch64-unknown
 
 For both standard US and UK maps, the actual CLI's `test-input` produced `c64 bridge` plus Return, exactly 11 presses and 11 matching releases, and an empty final `XQueryKeymap`. Both opposite-layout configurations refused before producing events. An unauthenticated client was denied. After the owned server stopped, a new CLI connection was refused in 0.025 seconds within the harness's process deadline.
 
-This verifies native Linux executable and XTEST/XKB behavior on a private virtual X server. The absent-server check does not test a stalled established connection or release of held keys after a live server disconnect. Physical desktop application delivery, WSLg input paths, Wayland uinput, physical C64-to-Linux operation, and x86_64 execution of this harness remain separate acceptance tests. See the [harness instructions](../scripts/README.md#isolated-linux-x11-check).
+The [five-platform CI run at `c1165d9`](https://github.com/batuhanoktem/c64-keyboard-bridge/actions/runs/38189731022) also passed the native Xvfb harness on Linux x86_64 and ARM64 runners. Both architectures therefore have isolated native XTEST observations, in addition to their recording tests and builds.
+
+This verifies native Linux executable and XTEST/XKB behavior on a private virtual X server. The absent-server check does not test a stalled established connection or release of held keys after a live server disconnect. Physical desktop application delivery, WSLg input paths, Wayland uinput, and physical C64-to-Linux operation remain separate acceptance tests. See the [harness instructions](../scripts/README.md#isolated-linux-x11-check).
+
+### Windows and WSLg observations
+
+On 2026-10-12, the packaged Windows x64 version 0.1.0 executable from commit `371faa6` ran on Windows 11 Enterprise build 26200.9457. With Notepad focused and standard US layout (`0x04090409`), the deliberately authorized `test-input` command delivered exactly `c64 bridge` and Return; the user confirmed the phrase and new line. Windows and Ubuntu 26.04.1 (glibc 2.43) recording smoke tests also passed. These Ubuntu checks used recording output, not a native desktop backend.
+
+The C64 client connected and authenticated to Windows with native input disabled. After an initial mistaken sequence was repeated cleanly with detailed logging enabled, A, Shift+A, Return, INST/DEL, Right, Shift+Right, F1 and Shift+F1 produced 22 expected balanced transitions, correct modifier masks and an empty final physical state. Both Shift keys appeared in that sequence. There were no logged errors or blocked combinations.
+
+The subsequent authorized physical C64-to-Notepad test did **not** pass full acceptance: the user reported that quick taps sometimes missed or duplicated, although typing was generally correct. Input was paused and the logs preserved. This phase contained 324 balanced received transitions without logged errors or blocked combinations, but had no native emission or repeat timestamps. Balanced receipt alone does not establish exact application delivery.
+
+A controlled test with input disabled then produced exactly ten slow A taps, one Return separator and ten quick A taps: 42 expected transitions, zero modifier masks and an empty final physical state. Received down/up intervals ranged from 1.364 to 1832.527 ms in the slow group and 1.504 to 252.690 ms in the quick group. These are host receive timings, not measurements of physical hold duration, scanner cadence or end-to-end latency. They do not explain the original application mismatch.
+
+Investigation reproduced two independent software defects: whole-matrix debounce lost rolling taps even when each individual key agreed across two samples, and the host worker could repeat before processing an already queued release. Per-key debounce (`e2bb25d`) and release-before-repeat (`094195a`) now have regressions that fail against the earlier implementations. The fixed C64 client was deliberately redeployed with input disabled. Ten rolling `ab` pairs then produced 40 expected balanced transitions, zero modifier masks and an empty final physical state. This establishes received transitions for that sequence; full native acceptance and the original duplicate/miss cause still require observation. Do not infer application delivery from the regression tests or raw receipt.
+
+The WSLg Weston desktop is currently unsupported by the Linux native backend's layout policy. A Windows-to-WSLg focused-window test, private Xvfb execution in this Ubuntu distribution, and physical C64-to-Linux/native Wayland acceptance remain unperformed. See [WSLg test paths](platforms.md#ubuntu-in-wslg).
+
+After the scanner fix and verified Windows host update to `21cc295`, the user repeated quick typing at normal pace in a new Notepad document: three `hello world` lines, ten `ab` pairs and `+ = * @ : ;` with spaces. The user confirmed every character was exact with no omissions or duplicates. This focused retest passed; repeat, additional application checks and interruption recovery for the updated Windows build remain separate tests. The two software defects were reproduced independently; the original mismatch was not instrumented enough to attribute every symptom to either defect.
 
 ## 1. Device and REST baseline
 
