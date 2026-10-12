@@ -1,6 +1,6 @@
 # Desktop companion
 
-The companion and CLI share the keyboard protocol, native input backends, mappings, diagnostics and real C64 PRGs. Open **C64 Keyboard Bridge** from the installed application shortcut, or run `c64bridge-gui`. Version 0.1.0 does not start a network host, deploy a C64 program or enable input automatically.
+The companion and CLI share the keyboard protocol, native input backends, mappings, diagnostics and real C64 PRGs. Open **C64 Keyboard Bridge** from the installed application shortcut, or run `c64bridge-gui`. Version 0.1.0 does not start a network host, deploy a C64 program or enable input automatically. The desktop application identifier is `com.flameliongames.c64bridge`; the CLI and GUI retain their shared state directory.
 
 ## Install
 

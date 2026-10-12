@@ -1,0 +1,37 @@
+[package]
+name = "bridge-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "c64bridge-gui"
+path = "src/main.rs"
+
+[dependencies]
+bridge-protocol.workspace = true
+bridge-core.workspace = true
+bridge-host.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+dotenvy.workspace = true
+directories.workspace = true
+getrandom.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+eframe = { version = "=0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "x11", "wayland"] }
+keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon = { version = "=0.26.1", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "=0.3.6", default-features = false, features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }

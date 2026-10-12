@@ -11,7 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_NAME = "C64 Keyboard Bridge.app"
-BUNDLE_ID = "net.c64bridge.desktop"
+BUNDLE_ID = "com.flameliongames.c64bridge"
 SIGNING_IDENTITY = "Developer ID Application: Flame Lion Ltd (TUGY329T35)"
 
 
@@ -135,8 +135,8 @@ def linux_deb(payload, output, version, architecture):
             (executable / name).symlink_to(f"../lib/c64-keyboard-bridge/{name}")
         desktop = stage / "usr/share/applications"
         desktop.mkdir(parents=True)
-        shutil.copy2(ROOT / "installers/linux/net.c64bridge.desktop.desktop",
-                     desktop / "net.c64bridge.desktop.desktop")
+        shutil.copy2(ROOT / "installers/linux/com.flameliongames.c64bridge.desktop",
+                     desktop / "com.flameliongames.c64bridge.desktop")
         icons = stage / "usr/share/icons/hicolor/256x256/apps"
         icons.mkdir(parents=True)
         shutil.copy2(ROOT / "assets/c64bridge.png", icons / "c64bridge.png")

@@ -18,7 +18,7 @@ class PackagingTests(unittest.TestCase):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE["source_files"]()}
         for name in ["assets/c64bridge.png", "assets/c64bridge.svg", "assets/c64bridge.ico",
                      "assets/c64bridge.icns", "assets/generate-icons.py", "installers/nsis-notices/COPYING",
-                     "installers/windows/c64bridge.nsi", "installers/linux/net.c64bridge.desktop.desktop"]:
+                     "installers/windows/c64bridge.nsi", "installers/linux/com.flameliongames.c64bridge.desktop"]:
             self.assertIn(name, names)
         self.assertTrue(any(name.startswith("crates/bridge-gui/") for name in names))
         self.assertFalse(any(name == ".env" or name.startswith("target/")
@@ -35,7 +35,7 @@ class PackagingTests(unittest.TestCase):
             (payload / "LICENSE").write_text("license fixture")
             app = INSTALLERS["macos_bundle"](payload, "0.1.0", "11.0")
             info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-            self.assertEqual(info["CFBundleIdentifier"], "net.c64bridge.desktop")
+            self.assertEqual(info["CFBundleIdentifier"], "com.flameliongames.c64bridge")
             self.assertEqual(info["CFBundleExecutable"], "c64bridge-gui")
             self.assertEqual(info["LSMinimumSystemVersion"], "11.0")
             for name in ("c64bridge", "c64bridge-gui"):

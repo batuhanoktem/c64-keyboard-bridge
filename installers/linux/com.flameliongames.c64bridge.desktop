@@ -8,4 +8,4 @@ Icon=c64bridge
 Terminal=false
 Categories=Utility;Accessibility;
 StartupNotify=true
-StartupWMClass=net.c64bridge.desktop
+StartupWMClass=com.flameliongames.c64bridge

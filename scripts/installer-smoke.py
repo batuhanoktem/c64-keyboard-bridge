@@ -57,7 +57,7 @@ def linux_check(directory):
             for name in ("c64bridge", "c64bridge-gui"):
                 if not (root / "usr/bin" / name).is_symlink():
                     raise ValueError("Installed command launcher is missing")
-            if not (root / "usr/share/applications/net.c64bridge.desktop.desktop").is_file():
+            if not (root / "usr/share/applications/com.flameliongames.c64bridge.desktop").is_file():
                 raise ValueError("Installed desktop launcher is missing")
             run(*args, "--purge", "c64-keyboard-bridge")
             if (root / "usr/lib/c64-keyboard-bridge").exists():
@@ -104,7 +104,7 @@ def macos_check(directory):
                 attached = True
                 app = mount / "C64 Keyboard Bridge.app"
                 info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-                if info["CFBundleIdentifier"] != "net.c64bridge.desktop":
+                if info["CFBundleIdentifier"] != "com.flameliongames.c64bridge":
                     raise ValueError("Wrong macOS application identity")
                 resources = app / "Contents/Resources"
                 provenance = json.loads((resources / "build-provenance.json").read_text())
