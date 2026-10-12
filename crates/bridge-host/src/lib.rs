@@ -6,4 +6,5 @@ pub mod pairing;
 pub mod prg;
 pub mod rest;
 pub mod runtime;
+pub mod session_diagnostics;
 pub mod simulator;

@@ -1,4 +1,5 @@
 use crate::pairing::{Token, read_token};
+use crate::session_diagnostics::SessionDiagnostics;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,6 +29,8 @@ pub struct Status {
     pub events: u64,
     pub blocked_combinations: u64,
     pub detail: String,
+    #[serde(default)]
+    pub diagnostics: SessionDiagnostics,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -40,7 +43,15 @@ impl Default for Status {
             events: 0,
             blocked_combinations: 0,
             detail: "Waiting for authenticated C64 connection".into(),
+            diagnostics: SessionDiagnostics::default(),
         }
+    }
+}
+impl Status {
+    pub(crate) fn snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.diagnostics.refresh();
+        snapshot
     }
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,4 +110,41 @@ pub async fn send(state_dir: &Path, command: &str) -> Result<ControlResponse> {
 }
 pub fn authorized(token: Token, request: &ControlRequest) -> bool {
     Token::from_hex(&request.token).is_ok_and(|other| token.matches(&other.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_diagnostics::{CleanupOutcome, FailureReason};
+
+    #[test]
+    fn legacy_status_defaults_diagnostics_and_full_response_stays_bounded() {
+        let mut status = Status::default();
+        let mut legacy = serde_json::to_value(&status).unwrap();
+        legacy.as_object_mut().unwrap().remove("diagnostics");
+        let legacy: Status = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.diagnostics.attempts, 0);
+        assert!(legacy.diagnostics.last_failure.is_none());
+        status.diagnostics.begin();
+        status.diagnostics.valid_frame();
+        status
+            .diagnostics
+            .record_failure(FailureReason::HeartbeatTimeout, CleanupOutcome::Pending);
+        let mut value = serde_json::to_value(&status).unwrap();
+        fn maximize(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Number(_) => *value = serde_json::Value::from(u64::MAX),
+                serde_json::Value::Object(fields) => fields.values_mut().for_each(maximize),
+                _ => {}
+            }
+        }
+        maximize(&mut value);
+        let status: Status = serde_json::from_value(value).unwrap();
+        let response = ControlResponse {
+            ok: true,
+            status,
+            error: None,
+        };
+        assert!(serde_json::to_vec(&response).unwrap().len() < 4096);
+    }
 }

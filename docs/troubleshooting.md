@@ -10,6 +10,7 @@ Start with `c64bridge doctor` or `c64bridge doctor --json`, then `c64bridge stat
 | REST endpoint unavailable | Confirm installed firmware and REST service. No automatic update is attempted. |
 | Listener port in use | Check `status`, stop an existing host, or choose another `BRIDGE_PORT` and redeploy. |
 | C64 never connects | Check its displayed UCI identity/status, reachable advertised interface, allowlist, firewall, and client destination after redeployment. |
+| C64 reconnects or times out intermittently | Inspect `status` diagnostics for the latest normalized failure, phase, valid-traffic age and cleanup outcome. The failure remains available after reconnect; keep input paused while investigating. |
 | Client displays `NO CONFIG` | An unpatched PRG was run. Deploy through `device run --allow-reset` or startup deployment. |
 | Probe fails after REST success | UCI mapping and Network Target are separate facilities. Verify the device's Command Interface setting and inspect exact C64 statuses. |
 | Input disabled | Normal startup is disabled. Run `resume` after deliberate authorization; inspect any backend error first. |
@@ -34,5 +35,9 @@ Pause and stop attempt to release every bridge-owned native key. If permission r
 On X11, a failed release keeps ownership recorded and disables input; a timeout is not evidence that the server received a key-up. The transport's mock tests and Linux cross-compilation do not verify real-server input or cleanup. Observe those cases in the intended Linux desktop before claiming acceptance.
 
 For a transport-only reproduction, use the README's loopback recording host and simulator. `--fragment` sends frames one byte at a time. `disconnect-held`, `heartbeat-timeout`, and `malformed` exercise cleanup paths without synthetic native input. Reproducing those scenarios does not establish real UCI or OS behavior.
+
+`status` retains failure diagnostics for the running process even when `detail` changes to a reconnect or pause message. `doctor` summarizes the same runtime information when the host is reachable. HELLO and initial synchronization timeouts are distinct from the three-second valid-traffic watchdog and a host write timeout. Transport, authentication, protocol and input-queue failures have separate normalized reasons. Cleanup may still be `pending`; a `failed` outcome must not be treated as release of all keys. Cleanup acknowledgments are associated with the failed generation so delayed work cannot overwrite a newer failure record.
+
+Counters reset on process restart, and the latest record is replaced by a later failure. Capture the relevant status before stopping the process if you need it for a bug report, reviewing the surrounding metadata before sharing. These diagnostics cannot reconstruct the causes of warnings from older builds.
 
 When reporting a bug, include the commit, host OS, selected backend/layout/profile, non-secret error text, firmware/FPGA/core versions, and which acceptance step failed. Review diagnostics for private addresses or identifiers. Never include `.env`, the pairing token, or configured PRGs.

@@ -4,6 +4,7 @@ use crate::{
     control::{self, ControlRequest, ControlResponse, RuntimeRecord, Status},
     pairing::{RuntimeGuard, Token},
     rest::DeviceInfo,
+    session_diagnostics::{CleanupOutcome, CurrentSession, FailureReason, SessionPhase},
 };
 use anyhow::{Context, Result, bail};
 use bridge_core::{HostPlatform, KeyboardBackend, KeyboardLayout, Mapper, MappingProfile};
@@ -93,22 +94,34 @@ fn input_failure(
     }
     detail
 }
+fn cleanup_outcome(result: &std::result::Result<(), String>) -> CleanupOutcome {
+    if result.is_ok() {
+        CleanupOutcome::Succeeded
+    } else {
+        CleanupOutcome::Failed
+    }
+}
 struct InputEvent {
     generation: u64,
     event: KeyEvent,
+    context: CurrentSession,
 }
 enum WorkerControl {
     Enable {
         enabled: bool,
         generation: u64,
         reply: oneshot::Sender<std::result::Result<(), String>>,
+        context: CurrentSession,
     },
     Reset {
         generation: u64,
+        failure: Option<u64>,
+        context: CurrentSession,
     },
     Synchronize {
         generation: u64,
         matrix: MatrixState,
+        context: CurrentSession,
     },
     Shutdown,
 }
@@ -118,6 +131,7 @@ struct WorkerHandle {
     controls: mpsc::Sender<WorkerControl>,
     generation: Arc<AtomicU64>,
     control_order: Arc<Mutex<()>>,
+    status: SharedStatus,
 }
 impl WorkerHandle {
     async fn enable(&self, enabled: bool) -> Result<()> {
@@ -130,6 +144,7 @@ impl WorkerHandle {
                     enabled,
                     generation,
                     reply: tx,
+                    context: self.status.lock().unwrap().diagnostics.current.clone(),
                 })
                 .context("Input worker stopped")?;
         }
@@ -137,17 +152,30 @@ impl WorkerHandle {
             .context("Input worker stopped")?
             .map_err(anyhow::Error::msg)
     }
+    #[cfg(test)]
     fn reset(&self) {
+        let context = self.status.lock().unwrap().diagnostics.current.clone();
+        self.reset_after_failure(None, context);
+    }
+    fn reset_after_failure(&self, failure: Option<u64>, context: CurrentSession) -> bool {
         let _order = self.control_order.lock().unwrap();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.controls.send(WorkerControl::Reset { generation });
+        self.controls
+            .send(WorkerControl::Reset {
+                generation,
+                failure,
+                context,
+            })
+            .is_ok()
     }
     fn synchronize(&self, matrix: MatrixState) {
         let _order = self.control_order.lock().unwrap();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self
-            .controls
-            .send(WorkerControl::Synchronize { generation, matrix });
+        let _ = self.controls.send(WorkerControl::Synchronize {
+            generation,
+            matrix,
+            context: self.status.lock().unwrap().diagnostics.current.clone(),
+        });
     }
     fn event(&self, event: KeyEvent) -> Result<()> {
         let _order = self.control_order.lock().unwrap();
@@ -155,9 +183,17 @@ impl WorkerHandle {
             .try_send(InputEvent {
                 generation: self.generation.load(Ordering::SeqCst),
                 event,
+                context: self.status.lock().unwrap().diagnostics.current.clone(),
             })
-            .map_err(|_| {
-                anyhow::anyhow!("Input queue overflow; disconnecting to preserve key state")
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => classified_failure(
+                    FailureReason::QueueOverflow,
+                    anyhow::anyhow!("Input queue overflow; disconnecting to preserve key state"),
+                ),
+                mpsc::TrySendError::Disconnected(_) => classified_failure(
+                    FailureReason::Input,
+                    anyhow::anyhow!("Input worker stopped before processing transition"),
+                ),
             })
     }
 }
@@ -188,10 +224,11 @@ fn spawn_worker_with_factory(
     let selection = config.backend.clone();
     let delay = config.repeat_delay;
     let interval = config.repeat_interval;
+    let handle_status = status.clone();
     let thread=thread::Builder::new().name("c64bridge-input".into()).spawn(move || {
         let mut mapper=Mapper::new(profile,platform());
         let mut backend:Option<Box<dyn KeyboardBackend>>=None;
-        let mut enabled=false;let mut epoch=0;let mut repeat_at:Option<Instant>=None;let mut pending:Option<InputEvent>=None;let mut layout_check_at=Instant::now();
+        let mut enabled=false;let mut epoch=0;let mut repeat_at:Option<Instant>=None;let mut pending:Option<InputEvent>=None;let mut layout_check_at=Instant::now();let mut worker_context=CurrentSession::default();
         let release=|mapper:&mut Mapper,backend:&mut Option<Box<dyn KeyboardBackend>>| ->std::result::Result<(),String> {
             if let Some(backend)=backend.as_mut() {mapper.release_all(backend.as_mut()).map_err(|e|e.to_string())}else{Ok(())}
         };
@@ -202,34 +239,43 @@ fn spawn_worker_with_factory(
                         let cleanup=release(&mut mapper,&mut backend);
                         if let Err(error)=&cleanup {
                             tracing::error!(%error,"Shutdown cleanup failed; native keys may remain held");
-                            let mut state=status.lock().unwrap();state.enabled=false;state.detail=format!("Shutdown cleanup failed; native keys may remain held: {error}");
+                            let mut state=status.lock().unwrap();state.enabled=false;state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);state.detail=format!("Shutdown cleanup failed; native keys may remain held: {error}");
                         }
                         return cleanup;
                     },
-                    WorkerControl::Reset {generation}=>{
-                        epoch=generation;repeat_at=None;
+                    WorkerControl::Reset {generation,failure,context}=>{
+                        worker_context=context;epoch=generation;repeat_at=None;
                         let cleanup=release(&mut mapper,&mut backend);
                         let mut state=status.lock().unwrap();
+                        if let Some(failure)=failure {state.diagnostics.complete_cleanup(failure,cleanup.is_ok());}else if cleanup.is_err(){state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}
                         state.detail=if let Err(error)=cleanup{enabled=false;state.enabled=false;format!("Input disabled; native key release failed: {error}")}else{"C64 disconnected; all bridge-owned keys released; waiting for reconnect".into()};
                     },
-                    WorkerControl::Synchronize {generation,matrix}=>{
-                        epoch=generation;repeat_at=None;
-                        let result=release(&mut mapper,&mut backend).and_then(|()| {
+                    WorkerControl::Synchronize {generation,matrix,context}=>{
+                        worker_context=context;epoch=generation;repeat_at=None;
+                        let cleanup=release(&mut mapper,&mut backend);
+                        let cleanup_failed=cleanup.is_err();
+                        let result=cleanup.and_then(|()| {
                             if enabled {mapper.synchronize(matrix,backend.as_mut().unwrap().as_mut()).map_err(|e|e.to_string())}else{Ok(())}
                         });
+                        let failure_cleanup=if result.is_err() && !cleanup_failed {Some(release(&mut mapper,&mut backend))}else{None};
                         let mut state=status.lock().unwrap();
+                        if cleanup_failed {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}else if let Some(cleanup)=failure_cleanup {state.diagnostics.record_worker_failure(FailureReason::Input,cleanup_outcome(&cleanup),&worker_context);}
                         state.detail=if let Err(error)=result{enabled=false;state.enabled=false;format!("Input disabled after synchronization failure: {error}")}else if enabled{"C64 synchronized; input enabled; held ordinary keys require release before typing".into()}else{"C64 synchronized; input disabled; receiving physical transitions".into()};
                     },
-                    WorkerControl::Enable {enabled:requested,generation,reply}=>{
-                        epoch=generation;repeat_at=None;
+                    WorkerControl::Enable {enabled:requested,generation,reply,context}=>{
+                        worker_context=context;epoch=generation;repeat_at=None;
                         let cleanup=release(&mut mapper,&mut backend);
+                        let cleanup_failed=cleanup.is_err();
                         enabled=false;status.lock().unwrap().enabled=false;
-                        let result=if cleanup.is_err(){cleanup}else if requested {
-                            if backend.is_none() {match factory() {Ok(b)=>backend=Some(b),Err(e)=>{let _=reply.send(Err(e.to_string()));status.lock().unwrap().detail=e.to_string();continue;}}}
+                        let result=if cleanup_failed{cleanup}else if requested {
+                            if backend.is_none() {match factory() {Ok(b)=>backend=Some(b),Err(e)=>{let mut state=status.lock().unwrap();state.diagnostics.record_worker_failure(FailureReason::Input,CleanupOutcome::Succeeded,&worker_context);state.detail=e.to_string();drop(state);let _=reply.send(Err(e.to_string()));continue;}}}
                             mapper.synchronize(*physical.lock().unwrap(),backend.as_mut().unwrap().as_mut()).map_err(|e|e.to_string())
                         } else {Ok(())};
+                        let failure_cleanup=if result.is_err() && !cleanup_failed {Some(release(&mut mapper,&mut backend))}else{None};
                         enabled=requested && result.is_ok();
-                        {let mut state=status.lock().unwrap();state.enabled=enabled;state.backend=if backend.is_some(){selection.clone()}else{"disabled".into()};state.detail=if let Err(error)=&result{format!("Input disabled; cleanup/authorization failed: {error}")}else if enabled{"Input enabled; held ordinary keys require release before typing".into()}else{"Input paused; all bridge-owned keys released".into()};}
+                        {let mut state=status.lock().unwrap();
+                        if cleanup_failed {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}else if let Some(cleanup)=failure_cleanup {state.diagnostics.record_worker_failure(FailureReason::Input,cleanup_outcome(&cleanup),&worker_context);}
+                        state.enabled=enabled;state.backend=if backend.is_some(){selection.clone()}else{"disabled".into()};state.detail=if let Err(error)=&result{format!("Input disabled; cleanup/authorization failed: {error}")}else if enabled{"Input enabled; held ordinary keys require release before typing".into()}else{"Input paused; all bridge-owned keys released".into()};}
                         let _=reply.send(result);
                     }
                 }
@@ -239,14 +285,17 @@ fn spawn_worker_with_factory(
             match input {
                 Ok(input) if input.generation>epoch=>{pending=Some(input);thread::sleep(Duration::from_millis(1));continue;},
                 Ok(input) if enabled && input.generation==epoch=>{
+                    worker_context=input.context.clone();
                     let blocked_before=mapper.blocked_combinations();
                     let output=backend.as_mut().unwrap().as_mut();
-                    let result=output.validate_layout().map_err(bridge_core::MappingError::Backend).and_then(|()|mapper.transition(input.event,output));
+                    let validation=output.validate_layout();
+                    let failure_reason=if validation.is_err(){FailureReason::Layout}else{FailureReason::Input};
+                    let result=validation.map_err(bridge_core::MappingError::Backend).and_then(|()|mapper.transition(input.event,output));
                     if let Err(error)=result {
                         tracing::debug!(key=?input.event.key,pressed=input.event.pressed,modifiers=input.event.modifiers,generation=input.generation,"Input worker rejected physical transition");
                         // A mapping rejection must not leave native keys held. Core also guards this.
                         let cleanup=release(&mut mapper,&mut backend);enabled=false;repeat_at=None;
-                        let mut state=status.lock().unwrap();state.enabled=false;state.detail=input_failure("mapping/backend failure",error,cleanup);
+                        let mut state=status.lock().unwrap();state.enabled=false;state.diagnostics.record_worker_failure(failure_reason,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("mapping/backend failure",error,cleanup);
                     } else {
                         tracing::debug!(key=?input.event.key,pressed=input.event.pressed,modifiers=input.event.modifiers,generation=input.generation,admitted=mapper.is_key_admitted(input.event.key),blocked=mapper.blocked_combinations()>blocked_before,quarantined=mapper.is_quarantined(),"Input worker processed physical transition");
                         if input.event.pressed && !input.event.key.is_modifier() && mapper.is_key_admitted(input.event.key) {repeat_at=Some(Instant::now()+delay);}
@@ -261,7 +310,7 @@ fn spawn_worker_with_factory(
                 layout_check_at=Instant::now()+Duration::from_millis(100);
                 if let Err(error)=backend.as_mut().unwrap().validate_layout() {
                     let cleanup=release(&mut mapper,&mut backend);enabled=false;repeat_at=None;
-                    let mut state=status.lock().unwrap();state.enabled=false;state.detail=input_failure("host layout change",error,cleanup);
+                    let mut state=status.lock().unwrap();state.enabled=false;state.diagnostics.record_worker_failure(FailureReason::Layout,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("host layout change",error,cleanup);
                 }
             }
             if queue_idle && enabled && repeat_at.is_some_and(|t|Instant::now()>=t) {
@@ -274,7 +323,7 @@ fn spawn_worker_with_factory(
                 }
                 if let Err(error)=mapper.repeat(backend.as_mut().unwrap().as_mut()) {
                     let cleanup=release(&mut mapper,&mut backend);enabled=false;
-                    let mut state=status.lock().unwrap();state.enabled=false;state.detail=input_failure("repeat failure",error,cleanup);
+                    let mut state=status.lock().unwrap();state.enabled=false;state.diagnostics.record_worker_failure(FailureReason::Repeat,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("repeat failure",error,cleanup);
                 }
                 repeat_at=Some(Instant::now()+interval);
             }
@@ -286,6 +335,7 @@ fn spawn_worker_with_factory(
             controls: controls_tx,
             generation,
             control_order: Arc::new(Mutex::new(())),
+            status: handle_status,
         },
         thread,
     ))
@@ -322,6 +372,30 @@ impl FrameReader {
         }
     }
 }
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+struct SessionFailure {
+    reason: FailureReason,
+    #[source]
+    source: anyhow::Error,
+}
+fn classified_failure(reason: FailureReason, source: anyhow::Error) -> anyhow::Error {
+    SessionFailure { reason, source }.into()
+}
+fn protocol_failure(source: anyhow::Error) -> anyhow::Error {
+    classified_failure(FailureReason::Protocol, source)
+}
+fn read_failure(source: anyhow::Error) -> anyhow::Error {
+    let reason = if source
+        .downcast_ref::<bridge_protocol::ProtocolError>()
+        .is_some()
+    {
+        FailureReason::Protocol
+    } else {
+        FailureReason::Transport
+    };
+    classified_failure(reason, source)
+}
 pub async fn write_frame(
     socket: &mut TcpStream,
     sequence: &mut Sequencer,
@@ -331,14 +405,76 @@ pub async fn write_frame(
         sequence: sequence.next_sequence(),
         message,
     }
-    .encode()?;
-    tokio::time::timeout(SESSION_TIMEOUT, socket.write_all(&bytes))
-        .await
-        .context("TCP write timed out")??;
-    Ok(())
+    .encode()
+    .map_err(|error| protocol_failure(error.into()))?;
+    match tokio::time::timeout(SESSION_TIMEOUT, socket.write_all(&bytes)).await {
+        Err(error) => Err(classified_failure(
+            FailureReason::WriteTimeout,
+            anyhow::Error::new(error).context("TCP write timed out"),
+        )),
+        Ok(Err(error)) => Err(classified_failure(FailureReason::Transport, error.into())),
+        Ok(Ok(())) => Ok(()),
+    }
 }
 
+// All callers, including the recording harness, use this termination path.
+// Record the failure before asynchronous reset can replace the human-readable detail.
 async fn session(
+    socket: TcpStream,
+    token: Token,
+    worker: WorkerHandle,
+    status: SharedStatus,
+    physical: SharedMatrix,
+    stopping: watch::Receiver<bool>,
+) -> Result<()> {
+    status.lock().unwrap().diagnostics.begin();
+    let result = session_inner(
+        socket,
+        token,
+        worker.clone(),
+        status.clone(),
+        physical.clone(),
+        stopping,
+    )
+    .await;
+    let (failure, context) = {
+        let mut state = status.lock().unwrap();
+        let context = state.diagnostics.current.clone();
+        let failure = result.as_ref().err().map(|error| {
+            let reason = error
+                .downcast_ref::<SessionFailure>()
+                .map(|error| error.reason)
+                .unwrap_or(FailureReason::Transport);
+            state
+                .diagnostics
+                .record_failure(reason, CleanupOutcome::Pending)
+        });
+        state.diagnostics.end();
+        state.connected = false;
+        state.device = None;
+        state.detail = "C64 session ended; releasing bridge-owned keys".into();
+        (failure, context)
+    };
+    *physical.lock().unwrap() = MatrixState::default();
+    if !worker.reset_after_failure(failure, context.clone()) {
+        let mut state = status.lock().unwrap();
+        state.enabled = false;
+        if let Some(failure) = failure {
+            state.diagnostics.complete_cleanup(failure, false);
+        } else {
+            state.diagnostics.record_worker_failure(
+                FailureReason::Cleanup,
+                CleanupOutcome::Failed,
+                &context,
+            );
+        }
+        state.detail =
+            "Input worker stopped before session cleanup; native keys may remain held".into();
+    }
+    result
+}
+
+async fn session_inner(
     mut socket: TcpStream,
     token: Token,
     worker: WorkerHandle,
@@ -346,31 +482,46 @@ async fn session(
     physical: SharedMatrix,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<()> {
-    socket.set_nodelay(true)?;
+    socket
+        .set_nodelay(true)
+        .map_err(|error| classified_failure(FailureReason::Transport, error.into()))?;
     let mut reader = FrameReader::default();
     let mut incoming = Sequencer::new();
     let mut outgoing = Sequencer::new();
     let hello = tokio::select! {
         _=stopping.changed()=>return Ok(()),
-        hello=tokio::time::timeout(Duration::from_secs(5),reader.next(&mut socket))=>hello.context("HELLO timed out")??,
+        hello=tokio::time::timeout(Duration::from_secs(5),reader.next(&mut socket))=>{
+            hello.map_err(|error|classified_failure(FailureReason::HelloTimeout,anyhow::Error::new(error).context("HELLO timed out")))?.map_err(read_failure)?
+        },
     };
-    incoming.check(hello.sequence)?;
+    incoming
+        .check(hello.sequence)
+        .map_err(|error| protocol_failure(error.into()))?;
     let Message::Hello {
         token: offered,
         device_id,
         capabilities,
     } = hello.message
     else {
-        bail!("HELLO required before keyboard events");
+        return Err(protocol_failure(anyhow::anyhow!(
+            "HELLO required before keyboard events"
+        )));
     };
     if !token.matches(&offered) {
-        bail!("Client authentication failed");
+        return Err(classified_failure(
+            FailureReason::Authentication,
+            anyhow::anyhow!("Client authentication failed"),
+        ));
     }
     if capabilities & 1 == 0 {
-        bail!("Client does not advertise keyboard capability");
+        return Err(protocol_failure(anyhow::anyhow!(
+            "Client does not advertise keyboard capability"
+        )));
     }
     {
         let mut state = status.lock().unwrap();
+        state.diagnostics.authenticated();
+        state.diagnostics.valid_frame();
         state.connected = true;
         state.device = Some(device_id);
         state.detail = "Authenticated C64; waiting for state synchronization".into();
@@ -379,54 +530,85 @@ async fn session(
     write_frame(&mut socket, &mut outgoing, Message::HelloAck { enabled }).await?;
     let first = tokio::select! {
         _=stopping.changed()=>return Ok(()),
-        first=tokio::time::timeout(SESSION_TIMEOUT,reader.next(&mut socket))=>first.context("Initial state synchronization timed out")??,
+        first=tokio::time::timeout(SESSION_TIMEOUT,reader.next(&mut socket))=>{
+            first.map_err(|error|classified_failure(FailureReason::SyncTimeout,anyhow::Error::new(error).context("Initial state synchronization timed out")))?.map_err(read_failure)?
+        },
     };
-    incoming.check(first.sequence)?;
+    incoming
+        .check(first.sequence)
+        .map_err(|error| protocol_failure(error.into()))?;
     let Message::StateSync(matrix) = first.message else {
-        bail!("Initial STATE_SYNC required");
+        return Err(protocol_failure(anyhow::anyhow!(
+            "Initial STATE_SYNC required"
+        )));
     };
     *physical.lock().unwrap() = matrix;
+    {
+        let mut state = status.lock().unwrap();
+        state.diagnostics.valid_frame();
+        state.diagnostics.phase(SessionPhase::Active);
+    }
     worker.synchronize(matrix);
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_received = tokio::time::Instant::now();
     loop {
         tokio::select! {
-            _=tokio::time::sleep_until(last_received+SESSION_TIMEOUT)=>bail!("C64 heartbeat timed out"),
+            _=tokio::time::sleep_until(last_received+SESSION_TIMEOUT)=>return Err(classified_failure(FailureReason::HeartbeatTimeout,anyhow::anyhow!("C64 heartbeat timed out"))),
             changed=stopping.changed()=>{
                 if changed.is_err() || *stopping.borrow() {
+                    status.lock().unwrap().diagnostics.phase(SessionPhase::Closing);
                     let _=write_frame(&mut socket,&mut outgoing,Message::Disconnect {reason:0}).await;
                     return Ok(());
                 }
             }
             _=heartbeat.tick()=>{
-                if last_received.elapsed()>=SESSION_TIMEOUT {bail!("C64 heartbeat timed out");}
+                if last_received.elapsed()>=SESSION_TIMEOUT {return Err(classified_failure(FailureReason::HeartbeatTimeout,anyhow::anyhow!("C64 heartbeat timed out")));}
                 let enabled=status.lock().unwrap().enabled;
                 write_frame(&mut socket,&mut outgoing,Message::HostHeartbeat {enabled}).await?;
             }
             frame=reader.next(&mut socket)=>{
-                let frame=frame?;incoming.check(frame.sequence)?;last_received=tokio::time::Instant::now();
-                match frame.message {
+                let frame=frame.map_err(read_failure)?;
+                incoming.check(frame.sequence).map_err(|error|protocol_failure(error.into()))?;
+                let mut synchronization=None;
+                let event=match frame.message {
                     message @ (Message::KeyDown {..}|Message::KeyUp {..})=>{
                         let event=message.key_event().expect("key message");
                         {
                             let mut matrix=physical.lock().unwrap();
-                            if matrix.get(event.key)==event.pressed {bail!("Duplicate physical transition");}
+                            if matrix.get(event.key)==event.pressed {return Err(protocol_failure(anyhow::anyhow!("Duplicate physical transition")));}
                             matrix.set(event.key,event.pressed);
-                            if matrix.modifiers()!=event.modifiers {bail!("Modifier mask disagrees with physical state");}
+                            if matrix.modifiers()!=event.modifiers {return Err(protocol_failure(anyhow::anyhow!("Modifier mask disagrees with physical state")));}
                         }
-                        status.lock().unwrap().events+=1;
+                        let mut state=status.lock().unwrap();
+                        state.events=state.events.saturating_add(1);
                         tracing::debug!(key=?event.key,pressed=event.pressed,modifiers=event.modifiers,"Physical C64 transition");
-                        worker.event(event)?;
+                        Some(event)
                     }
-                    Message::Heartbeat(snapshot)=>{if snapshot != *physical.lock().unwrap(){bail!("Heartbeat state disagrees with ordered transitions");}}
+                    Message::Heartbeat(snapshot)=>{
+                        if snapshot != *physical.lock().unwrap(){return Err(protocol_failure(anyhow::anyhow!("Heartbeat state disagrees with ordered transitions")));}
+                        None
+                    }
                     Message::StateSync(snapshot)=>{
-                        if snapshot != *physical.lock().unwrap(){bail!("State synchronization disagrees with ordered transitions");}
-                        worker.synchronize(snapshot);
+                        if snapshot != *physical.lock().unwrap(){return Err(protocol_failure(anyhow::anyhow!("State synchronization disagrees with ordered transitions")));}
+                        synchronization=Some(snapshot);
+                        None
                     },
-                    Message::Disconnect {..}=>return Ok(()),
-                    Message::Error {code,..}=>{if code!=0 {bail!("C64 reported client error code {code}");}},
-                    _=>bail!("Unexpected message after session initialization"),
+                    Message::Disconnect {..}=>{
+                        status.lock().unwrap().diagnostics.valid_frame();
+                        return Ok(());
+                    },
+                    Message::Error {code,..}=>{
+                        if code!=0 {return Err(protocol_failure(anyhow::anyhow!("C64 reported client error code {code}")));}
+                        None
+                    },
+                    _=>return Err(protocol_failure(anyhow::anyhow!("Unexpected message after session initialization"))),
+                };
+                status.lock().unwrap().diagnostics.valid_frame();
+                last_received=tokio::time::Instant::now();
+                if let Some(snapshot)=synchronization {worker.synchronize(snapshot);}
+                if let Some(event)=event {
+                    worker.event(event)?;
                 }
             }
         }
@@ -551,12 +733,7 @@ pub async fn start(config: Config, options: StartOptions) -> Result<()> {
                 if let Some(task)=active.take(){let _=task.await;}
                 let worker=worker.clone();let state=status.clone();let matrix=physical.clone();let stopping=stopping_rx.clone();
                 active=Some(tokio::spawn(async move {
-                    let result=session(socket,token,worker.clone(),state.clone(),matrix.clone(),stopping).await;
-                    *matrix.lock().unwrap()=MatrixState::default();
-                    let mut status=state.lock().unwrap();status.connected=false;status.device=None;
-                    // The worker confirms cleanup asynchronously and retains any release failure.
-                    status.detail="C64 session ended; releasing bridge-owned keys".into();
-                    drop(status);worker.reset();
+                    let result=session(socket,token,worker,state,matrix,stopping).await;
                     if let Err(error)=result{tracing::warn!(%error,"C64 session ended after a network or protocol failure");}
                 }));
             }
@@ -606,7 +783,7 @@ async fn serve_control(
         };
         let response = ControlResponse {
             ok: result.is_ok(),
-            status: status.lock().unwrap().clone(),
+            status: status.lock().unwrap().snapshot(),
             error: result.err().map(|e| e.to_string()),
         };
         let _ = tokio::time::timeout(

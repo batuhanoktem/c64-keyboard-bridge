@@ -116,6 +116,42 @@ pub async fn doctor(config: &Config) -> Report {
             },
             status.status.detail,
         );
+        let diagnostics = status.status.diagnostics;
+        report.add(
+            "Session diagnostics",
+            "retained in memory",
+            format!(
+                "{} attempts; {} authenticated sessions; {} reconnects; phase {}; valid-frame age {}",
+                diagnostics.attempts,
+                diagnostics.authenticated_sessions,
+                diagnostics.reconnects,
+                diagnostics.current.phase.as_str(),
+                frame_age(diagnostics.current.valid_frame_age_ms),
+            ),
+        );
+        report.add(
+            "Session failure counters",
+            "retained in memory",
+            serde_json::to_string(&diagnostics.failures).expect("Fixed counters serialize"),
+        );
+        if let Some(failure) = diagnostics.last_failure {
+            report.add(
+                "Last session/input failure",
+                match failure.cleanup {
+                    crate::session_diagnostics::CleanupOutcome::Pending => "cleanup pending",
+                    crate::session_diagnostics::CleanupOutcome::Succeeded => "keys released",
+                    crate::session_diagnostics::CleanupOutcome::Failed => "cleanup failed",
+                },
+                format!(
+                    "{} during {}; {} ms elapsed; valid-frame age {}; {} validated frames",
+                    failure.reason.as_str(),
+                    failure.phase.as_str(),
+                    failure.elapsed_ms,
+                    frame_age(failure.valid_frame_age_ms),
+                    failure.validated_frames,
+                ),
+            );
+        }
     }
     let evidence = std::fs::read(config.state_dir.join("hardware-evidence.json"))
         .ok()
@@ -137,4 +173,8 @@ pub async fn doctor(config: &Config) -> Report {
         report.add("UCI / Network Target","not verified","REST connectivity and the reported $C9 ID do not prove socket operations. Run device test --allow-reset on the physical C64.");
     }
     report
+}
+fn frame_age(age: Option<u64>) -> String {
+    age.map(|age| format!("{age} ms"))
+        .unwrap_or_else(|| "none".into())
 }

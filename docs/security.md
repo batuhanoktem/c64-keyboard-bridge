@@ -18,4 +18,6 @@ The C64 client suspends forwarding on ambiguous matrix rectangles or controller 
 
 There is no host keyboard capture, keylogger, GUI, or password-bearing CLI argument. Default logs omit key text and authentication tokens. Diagnostic reports contain device and network metadata, so review them before sharing.
 
+The retained session `diagnostics` object contains typed reasons, counters, phases, host timings and cleanup outcomes. It excludes credentials, peer addresses, device-provided text, key identities and matrix bytes. Only one failure record is retained in memory. The surrounding status and doctor reports still include their existing device/network metadata and must be reviewed before sharing. A successful cleanup outcome means bridge-owned native releases succeeded or no keys were owned; it does not prove delivery to a particular application.
+
 `LOG_LEVEL=debug` records physical C64 key identities, worker decisions and accepted Windows native key events, including repeat. These traces can reveal text typed through the bridge. Keep them private and review them before sharing; credentials and Unicode action content are not logged by these traces.
