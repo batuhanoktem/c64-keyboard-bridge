@@ -6,6 +6,8 @@ The C64 TCP connection carries a persistent, random 128-bit pairing token in HEL
 
 This protocol provides no encryption, challenge-response, or replay protection across sessions. A network observer able to capture the token can impersonate a client if it can also satisfy the peer allowlist. REST uses the device's HTTP API with `X-Password`, so that password is also exposed to an observer on the path. Neither service should be forwarded onto the public Internet.
 
+The REST client disables proxies, redirects and automatic request retries. It marks the password header sensitive, limits responses to 64 KiB, and requires both HTTP success and an empty JSON `errors` array. A failed disruptive request still requires device inspection before a deliberate retry.
+
 The local control listener binds loopback on an ephemeral port and authenticates using the same token. Its location and PID are in the private runtime file. Unix state permissions are enforced; Windows relies on the private account directory's ACLs. Do not share `.env`, `pairing.key`, configured PRGs, or unredacted diagnostic output containing private device identifiers and addresses.
 
 Native injection is off at each normal startup. Deployment is also off by default. A deployment request requires `--allow-reset`, including when `AUTO_DEPLOY=true`; both load and run reset the C64 and replace its software. No firmware update, permanent device setting change, or automatic recovery reset is performed. An upload timeout can mean the device already performed the action; inspect it before retrying.

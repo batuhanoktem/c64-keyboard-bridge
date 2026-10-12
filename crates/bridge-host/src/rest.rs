@@ -37,6 +37,7 @@ impl RestClient {
             .default_headers(headers)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(15))
             .build()
