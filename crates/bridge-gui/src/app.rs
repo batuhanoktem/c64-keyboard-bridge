@@ -572,7 +572,14 @@ impl BridgeApp {
                     ("Run networking probe…", Confirm::Probe),
                 ] {
                     if ui
-                        .add_enabled(!snapshot.busy, egui::Button::new(label))
+                        .add_enabled(
+                            !snapshot.busy
+                                && !matches!(
+                                    snapshot.phase,
+                                    GuiPhase::Starting | GuiPhase::Stopping
+                                ),
+                            egui::Button::new(label),
+                        )
                         .clicked()
                     {
                         self.confirm = Some(confirmation);

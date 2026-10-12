@@ -434,3 +434,24 @@ fn locked_saved_credentials_do_not_leak_or_silently_fall_back_to_plaintext() {
     }
     cleanup(actor);
 }
+
+#[tokio::test]
+async fn deployment_cannot_overlap_managed_startup_before_its_runtime_record_exists() {
+    let (mut actor, _events) = actor();
+    actor.start(false, false).await.unwrap();
+    assert!(matches!(
+        *actor.owned.as_ref().unwrap().subscribe().borrow(),
+        RuntimeState::Starting
+    ));
+    assert!(!actor.state_dir.join("runtime.json").exists());
+    let error = actor
+        .action(GuiAction::Deploy {
+            run: true,
+            allow_reset: true,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Wait for startup"));
+    actor.stop_owned().await.unwrap();
+    cleanup(actor);
+}

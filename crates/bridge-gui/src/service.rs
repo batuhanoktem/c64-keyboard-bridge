@@ -872,6 +872,13 @@ impl Actor {
                 self.note("REST information retrieved; this alone does not verify UCI networking");
             }
             GuiAction::Deploy { run, allow_reset } => {
+                if self
+                    .owned
+                    .as_ref()
+                    .is_some_and(|r| matches!(*r.subscribe().borrow(), RuntimeState::Starting))
+                {
+                    bail!("Wait for startup to complete or cancel it before another deployment");
+                }
                 if self.smoke || !allow_reset {
                     bail!("Fresh reset confirmation required");
                 }
