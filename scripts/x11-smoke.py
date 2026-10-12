@@ -146,6 +146,7 @@ def xlib() -> ctypes.CDLL:
         "XLookupString": ([ctypes.POINTER(XKeyEvent), ctypes.c_char_p, integer,
                            ctypes.POINTER(window), pointer], integer),
         "XKeysymToKeycode": ([pointer, window], ctypes.c_ubyte),
+        "XkbSetDetectableAutoRepeat": ([pointer, integer, ctypes.POINTER(integer)], integer),
         "XQueryKeymap": ([pointer, ctypes.c_char_p], integer),
         "XDestroyWindow": ([pointer, window], integer),
         "XCloseDisplay": ([pointer], integer),
@@ -247,6 +248,13 @@ def collect(configuration_path: Path) -> None:
 
 def collect_stall(library: ctypes.CDLL, display, window: int, directory: Path) -> None:
     """Observe the surviving server; never infer release from its disappearance."""
+    # Repeat KeyPress events must not manufacture KeyRelease events that could
+    # falsely satisfy the cleanup-order assertion. This affects this collector
+    # connection only; server and bridge repeat settings remain unchanged.
+    supported = ctypes.c_int()
+    if not library.XkbSetDetectableAutoRepeat(display, 1, ctypes.byref(supported)) \
+            or not supported.value:
+        raise RuntimeError("Private stall collector requires detectable auto-repeat")
     modifier = library.XKeysymToKeycode(display, 0xffe1)  # Shift_L
     ordinary = library.XKeysymToKeycode(display, 0x41)  # A
     if not modifier or not ordinary or modifier == ordinary:
