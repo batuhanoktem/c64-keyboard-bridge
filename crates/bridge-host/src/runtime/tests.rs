@@ -1493,3 +1493,362 @@ async fn fake_probe_authenticates_and_exchanges_binary_ack_idle_observations() {
         "NET"
     );
 }
+
+fn managed_config(state: &std::path::Path) -> Config {
+    #[cfg(unix)]
+    if state.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    Config::from_values(
+        BTreeMap::from([
+            ("C64_HOST".into(), "127.0.0.1".into()),
+            ("BRIDGE_BIND_ADDRESS".into(), "127.0.0.1".into()),
+            ("HOST_ADVERTISE_IP".into(), "127.0.0.1".into()),
+            ("BRIDGE_PORT".into(), port.to_string()),
+            ("BRIDGE_STATE_DIR".into(), state.display().to_string()),
+            ("INPUT_BACKEND".into(), "recording".into()),
+            ("AUTO_CONNECT".into(), "false".into()),
+        ]),
+        BTreeMap::new(),
+        crate::config::Overrides::default(),
+    )
+    .unwrap()
+}
+fn managed_options() -> StartOptions {
+    StartOptions {
+        enable_input: false,
+        deploy: false,
+        allow_reset: false,
+        template: Vec::new(),
+        fake_device: true,
+    }
+}
+
+#[tokio::test]
+async fn managed_cancel_before_startup_creates_no_runtime_or_pairing_state() {
+    let parent = tempfile::tempdir().unwrap();
+    let state = parent.path().join("never-created");
+    let mut config = managed_config(&state);
+    // Without cancellation, startup would fail while trying to resolve this
+    // missing host. No setup work should happen after an already issued stop.
+    config.device_host = None;
+    let mut runtime = ManagedRuntime::spawn(config, managed_options());
+    runtime.request_stop();
+    assert!(runtime.ready().await.is_err());
+    runtime.wait().await.unwrap();
+    assert_eq!(runtime.completion(), Some(Ok(())));
+    assert!(!state.exists());
+}
+
+#[tokio::test]
+async fn managed_ready_remains_compatible_with_authenticated_cli_control() {
+    let parent = tempfile::tempdir().unwrap();
+    let config = managed_config(parent.path());
+    let mut runtime = ManagedRuntime::spawn(config.clone(), managed_options());
+    runtime.ready().await.unwrap();
+    assert_eq!(*runtime.subscribe().borrow(), RuntimeState::Ready);
+    let status = control::send(parent.path(), "status").await.unwrap();
+    assert!(status.ok && status.status.running && !status.status.enabled);
+    let resume = control::send(parent.path(), "resume").await.unwrap();
+    assert!(resume.ok && resume.status.enabled);
+    let pause = control::send(parent.path(), "pause").await.unwrap();
+    assert!(pause.ok && !pause.status.enabled);
+    let stop = control::send(parent.path(), "stop").await.unwrap();
+    assert!(stop.ok && !stop.status.enabled);
+    runtime.wait().await.unwrap();
+    assert!(runtime.is_finished());
+    assert!(!parent.path().join("runtime.json").exists());
+}
+
+#[tokio::test]
+async fn dropping_managed_owner_requests_graceful_completion() {
+    let parent = tempfile::tempdir().unwrap();
+    let mut runtime = ManagedRuntime::spawn(managed_config(parent.path()), managed_options());
+    runtime.ready().await.unwrap();
+    let mut state = runtime.subscribe();
+    drop(runtime);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(*state.borrow(), RuntimeState::Finished(Ok(()))) {
+                break;
+            }
+            state.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!parent.path().join("runtime.json").exists());
+}
+
+#[tokio::test]
+async fn managed_cancellation_during_rest_startup_does_not_report_ready() {
+    let parent = tempfile::tempdir().unwrap();
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = server.local_addr().unwrap().port();
+    let (entered_tx, entered) = oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let (mut socket, _) = server.accept().await.unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        entered_tx.send(()).unwrap();
+        assert_eq!(socket.read(&mut request).await.unwrap(), 0);
+    });
+    let mut config = managed_config(parent.path());
+    config.device_port = port;
+    config.auto_connect = true;
+    let mut options = managed_options();
+    options.fake_device = false;
+    let mut runtime = ManagedRuntime::spawn(config, options);
+    let mut events = runtime.subscribe();
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*events.borrow(), RuntimeState::Starting);
+    runtime.request_stop();
+    tokio::time::timeout(Duration::from_secs(2), runtime.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*events.borrow_and_update(), RuntimeState::Finished(Ok(())));
+    server_task.await.unwrap();
+    assert!(!parent.path().join("runtime.json").exists());
+}
+
+#[tokio::test]
+async fn managed_cancellation_while_deployment_waits_never_retries_upload() {
+    let parent = tempfile::tempdir().unwrap();
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = server.local_addr().unwrap().port();
+    let (uploaded_tx, uploaded) = oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let (mut info, _) = server.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut bytes = [0; 1024];
+        while !request.windows(4).any(|value| value == b"\r\n\r\n") {
+            let count = info.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+        }
+        let body = r#"{"product":"C64 Ultimate","firmware_version":"simulated","fpga_version":"simulated","hostname":"fixture","unique_id":"fake-c64","errors":[]}"#;
+        info.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        info.shutdown().await.unwrap();
+        drop(info);
+        let (mut upload, _) = server.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let count = upload.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+            if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        assert!(request.starts_with(b"POST /v1/runners:run_prg "));
+        uploaded_tx.send(()).unwrap();
+        assert_eq!(upload.read(&mut bytes).await.unwrap(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.accept())
+                .await
+                .is_err()
+        );
+    });
+    let mut config = managed_config(parent.path());
+    config.device_port = port;
+    let mut options = managed_options();
+    options.fake_device = false;
+    options.deploy = true;
+    options.allow_reset = true;
+    options.template = vec![1, 8];
+    options.template.extend(b"KBCFGv1\0");
+    options.template.extend([1, 64]);
+    options.template.resize(66, 0);
+    let mut runtime = ManagedRuntime::spawn(config, options);
+    tokio::time::timeout(Duration::from_secs(2), uploaded)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*runtime.subscribe().borrow(), RuntimeState::Starting);
+    runtime.request_stop();
+    tokio::time::timeout(Duration::from_secs(2), runtime.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    server_task.await.unwrap();
+    assert!(!parent.path().join("runtime.json").exists());
+}
+
+#[tokio::test]
+async fn managed_stop_waits_for_recorded_held_key_cleanup_and_reports_failure() {
+    for fail_cleanup in [false, true] {
+        let parent = tempfile::tempdir().unwrap();
+        let config = managed_config(parent.path());
+        let address = (std::net::Ipv4Addr::LOCALHOST, config.bridge_port);
+        let trace = Arc::new(Trace::default());
+        let output = trace.clone();
+        let mut options = managed_options();
+        options.enable_input = true;
+        let mut runtime =
+            ManagedRuntime::spawn_with_worker(config, options, move |config, status, physical| {
+                spawn_worker_with_factory(config, status, physical, move || {
+                    Ok(Box::new(TestBackend(output.clone())))
+                })
+            });
+        runtime.ready().await.unwrap();
+        let token = crate::pairing::read_token(parent.path()).unwrap();
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let mut sequence = Sequencer::new();
+        write_frame(
+            &mut socket,
+            &mut sequence,
+            Message::Hello {
+                token: token.0,
+                device_id: "recorded".into(),
+                capabilities: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            FrameReader::default()
+                .next(&mut socket)
+                .await
+                .unwrap()
+                .message,
+            Message::HelloAck { enabled: true }
+        ));
+        write_frame(
+            &mut socket,
+            &mut sequence,
+            Message::StateSync(MatrixState::default()),
+        )
+        .await
+        .unwrap();
+        let mut matrix = MatrixState::default();
+        for key in [PhysicalKey::LeftShift, PhysicalKey::A] {
+            matrix.set(key, true);
+            write_frame(
+                &mut socket,
+                &mut sequence,
+                Message::KeyDown {
+                    key,
+                    modifiers: matrix.modifiers(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !trace
+                .events
+                .lock()
+                .unwrap()
+                .contains(&RecordingEvent::Press(NativeKey::A))
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        trace.fail_release.store(fail_cleanup, Ordering::SeqCst);
+        runtime.request_stop();
+        let result = tokio::time::timeout(Duration::from_secs(2), runtime.wait())
+            .await
+            .unwrap();
+        assert_eq!(result.is_err(), fail_cleanup);
+        assert_eq!(runtime.completion().unwrap().is_err(), fail_cleanup);
+        if fail_cleanup {
+            assert!(format!("{:#}", result.unwrap_err()).contains("native keys may remain held"));
+        } else {
+            let events = trace.events.lock().unwrap();
+            assert!(events.ends_with(&[
+                RecordingEvent::Release(NativeKey::A),
+                RecordingEvent::Release(NativeKey::LeftShift)
+            ]));
+        }
+        assert!(!parent.path().join("runtime.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn managed_stop_preserves_failed_cleanup_for_retry_before_destroying_worker() {
+    let parent = tempfile::tempdir().unwrap();
+    let trace = Arc::new(Trace::default());
+    let output = trace.clone();
+    let (worker_tx, worker_rx) = mpsc::channel();
+    let mut options = managed_options();
+    options.enable_input = true;
+    let mut runtime = ManagedRuntime::spawn_with_worker(
+        managed_config(parent.path()),
+        options,
+        move |config, status, physical| {
+            let pair = spawn_worker_with_factory(config, status, physical, move || {
+                Ok(Box::new(TestBackend(output.clone())))
+            })?;
+            worker_tx.send(pair.0.clone()).unwrap();
+            Ok(pair)
+        },
+    );
+    runtime.ready().await.unwrap();
+    let worker = worker_rx.recv().unwrap();
+    for key in [PhysicalKey::LeftShift, PhysicalKey::A] {
+        worker
+            .event(KeyEvent {
+                key,
+                pressed: true,
+                modifiers: bridge_protocol::MOD_SHIFT,
+            })
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !trace
+            .events
+            .lock()
+            .unwrap()
+            .contains(&RecordingEvent::Press(NativeKey::A))
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    trace.fail_release.store(true, Ordering::SeqCst);
+    assert!(runtime.stop().await.is_err());
+    assert!(!runtime.is_finished());
+    assert!(parent.path().join("runtime.json").exists());
+    let paused = control::send(parent.path(), "status").await.unwrap();
+    assert!(!paused.status.enabled);
+    assert_eq!(
+        paused.status.diagnostics.last_failure.unwrap().cleanup,
+        CleanupOutcome::Failed
+    );
+    trace.fail_release.store(false, Ordering::SeqCst);
+    runtime.stop().await.unwrap();
+    assert_eq!(runtime.completion(), Some(Ok(())));
+    assert!(trace.events.lock().unwrap().ends_with(&[
+        RecordingEvent::Release(NativeKey::A),
+        RecordingEvent::Release(NativeKey::LeftShift)
+    ]));
+    assert!(!parent.path().join("runtime.json").exists());
+}

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use bridge_host::{
     backend,
     config::{Config, Overrides},
-    control, diagnostics, pairing, prg,
+    control, diagnostics, operations, pairing,
     rest::RestClient,
     runtime, simulator,
 };
@@ -263,22 +263,11 @@ async fn deploy(config: &Config, template: &[u8], run: bool, allow_reset: bool) 
             "PRG deployment resets the C64 and interrupts its software; add --allow-reset explicitly"
         );
     }
-    let client = RestClient::new(config)?;
-    let info = client.info().await?;
-    let network = config.network().await?;
-    let token = pairing::load_or_create_token(&config.state_dir)?;
-    let patched = prg::patch(
-        template,
-        network.advertise_ip,
-        config.bridge_port,
-        token,
-        &info.unique_id,
-    )?;
     eprintln!(
         "Warning: {} this PRG resets the C64 and interrupts its running software.",
         if run { "Running" } else { "Loading" }
     );
-    client.upload(patched, run, allow_reset).await?;
+    operations::deploy(config, template, run, allow_reset).await?;
     println!(
         "PRG {} successfully; networking and physical input still require observed tests.",
         if run {
@@ -295,51 +284,10 @@ async fn device_test(config: &Config, allow_reset: bool) -> Result<()> {
             "The hardware probe resets and replaces the running C64 program; add --allow-reset explicitly"
         );
     }
-    if config.state_dir.join("runtime.json").exists() {
-        bail!("Stop the active bridge before running the networking probe");
-    }
-    let client = RestClient::new(config)?;
-    let info = client.info().await?;
-    let network = config.network().await?;
-    let listener = tokio::net::TcpListener::bind(network.bind)
-        .await
-        .context("Probe listener port unavailable")?;
-    let token = pairing::load_or_create_token(&config.state_dir)?;
-    let prg = prg::patch(
-        PROBE_PRG,
-        network.advertise_ip,
-        config.bridge_port,
-        token,
-        &info.unique_id,
-    )?;
-    let failure_device = info.clone();
-    let probe =
-        tokio::spawn(
-            async move { runtime::hardware_probe(listener, &network, token, &info).await },
-        );
     eprintln!(
         "Warning: deploying the hardware probe resets the C64. Inspect its display for UCI statuses and peer-close results."
     );
-    if let Err(error) = client.upload(prg, true, true).await {
-        probe.abort();
-        return Err(error);
-    }
-    let mut evidence = match probe.await.context("Hardware probe task failed")? {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            let failure = serde_json::json!({"device":failure_device,"network_acceptance":"failed; not verified","error":format!("{error:#}"),"host_version":env!("CARGO_PKG_VERSION"),"observed_unix_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()});
-            let mut file =
-                pairing::private_file(&config.state_dir.join("hardware-failure.json"), false)?;
-            serde_json::to_writer_pretty(&mut file, &failure)?;
-            return Err(error);
-        }
-    };
-    let build_id = PROBE_PRG.iter().fold(0xcbf29ce484222325u64, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
-    evidence["probe_template_fnv1a64"] = serde_json::json!(format!("{build_id:016x}"));
-    let mut file = pairing::private_file(&config.state_dir.join("hardware-evidence.json"), false)?;
-    serde_json::to_writer_pretty(&mut file, &evidence)?;
+    let evidence = operations::probe(config, PROBE_PRG, allow_reset).await?;
     println!("{}", serde_json::to_string_pretty(&evidence)?);
     println!(
         "Read the C64 display to verify peer closure and clean exit. This test does not verify physical keyboard input."
@@ -347,8 +295,6 @@ async fn device_test(config: &Config, allow_reset: bool) -> Result<()> {
     Ok(())
 }
 async fn test_input(config: &Config, countdown: u64) -> Result<()> {
-    use bridge_core::NativeKey as K;
-    let mut backend = backend::create_backend(&config.backend, runtime::layout(config))?;
     eprintln!(
         "Deliberate input test: focus an empty TextEdit/VS Code/Notepad/terminal buffer. No delivery result is inferred automatically."
     );
@@ -356,26 +302,7 @@ async fn test_input(config: &Config, countdown: u64) -> Result<()> {
         eprintln!("Typing test in {remaining} seconds…");
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    let keys = [
-        K::C,
-        K::Num6,
-        K::Num4,
-        K::Space,
-        K::B,
-        K::R,
-        K::I,
-        K::D,
-        K::G,
-        K::E,
-        K::Enter,
-    ];
-    for key in keys {
-        if let Err(error) = backend.press(key) {
-            let _ = backend.release(key);
-            return Err(error.into());
-        }
-        backend.release(key)?;
-    }
+    operations::test_input(config).await?;
     println!("Input events posted. Verify the phrase c64 bridge in the focused application.");
     Ok(())
 }
@@ -383,6 +310,7 @@ async fn test_input(config: &Config, countdown: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_host::prg;
     #[test]
     fn actual_prg_templates_can_be_patched() {
         for template in [KEYBOARD_PRG, PROBE_PRG] {

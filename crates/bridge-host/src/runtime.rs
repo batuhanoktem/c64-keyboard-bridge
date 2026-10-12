@@ -489,7 +489,8 @@ async fn session_inner(
     let mut incoming = Sequencer::new();
     let mut outgoing = Sequencer::new();
     let hello = tokio::select! {
-        _=stopping.changed()=>return Ok(()),
+        biased;
+        _=cancellation(&mut stopping)=>return Ok(()),
         hello=tokio::time::timeout(Duration::from_secs(5),reader.next(&mut socket))=>{
             hello.map_err(|error|classified_failure(FailureReason::HelloTimeout,anyhow::Error::new(error).context("HELLO timed out")))?.map_err(read_failure)?
         },
@@ -529,7 +530,8 @@ async fn session_inner(
     let enabled = status.lock().unwrap().enabled;
     write_frame(&mut socket, &mut outgoing, Message::HelloAck { enabled }).await?;
     let first = tokio::select! {
-        _=stopping.changed()=>return Ok(()),
+        biased;
+        _=cancellation(&mut stopping)=>return Ok(()),
         first=tokio::time::timeout(SESSION_TIMEOUT,reader.next(&mut socket))=>{
             first.map_err(|error|classified_failure(FailureReason::SyncTimeout,anyhow::Error::new(error).context("Initial state synchronization timed out")))?.map_err(read_failure)?
         },
@@ -554,14 +556,13 @@ async fn session_inner(
     let mut last_received = tokio::time::Instant::now();
     loop {
         tokio::select! {
-            _=tokio::time::sleep_until(last_received+SESSION_TIMEOUT)=>return Err(classified_failure(FailureReason::HeartbeatTimeout,anyhow::anyhow!("C64 heartbeat timed out"))),
-            changed=stopping.changed()=>{
-                if changed.is_err() || *stopping.borrow() {
-                    status.lock().unwrap().diagnostics.phase(SessionPhase::Closing);
-                    let _=write_frame(&mut socket,&mut outgoing,Message::Disconnect {reason:0}).await;
-                    return Ok(());
-                }
+            biased;
+            _=cancellation(&mut stopping)=>{
+                status.lock().unwrap().diagnostics.phase(SessionPhase::Closing);
+                let _=write_frame(&mut socket,&mut outgoing,Message::Disconnect {reason:0}).await;
+                return Ok(());
             }
+            _=tokio::time::sleep_until(last_received+SESSION_TIMEOUT)=>return Err(classified_failure(FailureReason::HeartbeatTimeout,anyhow::anyhow!("C64 heartbeat timed out"))),
             _=heartbeat.tick()=>{
                 if last_received.elapsed()>=SESSION_TIMEOUT {return Err(classified_failure(FailureReason::HeartbeatTimeout,anyhow::anyhow!("C64 heartbeat timed out")));}
                 let enabled=status.lock().unwrap().enabled;
@@ -640,30 +641,179 @@ async fn shutdown_signal() -> Result<()> {
         .context("Cannot listen for interrupt")
 }
 
+/// A process-local observation of managed startup and graceful completion.
+/// Readiness means startup (including any requested deployment) has finished,
+/// not that a C64 is authenticated or that native input is authorized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeState {
+    Starting,
+    Ready,
+    Finished(std::result::Result<(), String>),
+}
+
+/// Owns cancellation of a bridge started by a frontend. Dropping this handle
+/// requests a graceful stop; the detached task still performs owned-key cleanup.
+/// The frontend should wait for completion before exiting its Tokio runtime.
+pub struct ManagedRuntime {
+    stopping: watch::Sender<bool>,
+    state: watch::Receiver<RuntimeState>,
+    state_dir: std::path::PathBuf,
+}
+impl ManagedRuntime {
+    /// Must be called on an active Tokio runtime. Startup performs no native
+    /// injection unless `enable_input` was deliberately requested.
+    pub fn spawn(config: Config, options: StartOptions) -> Self {
+        Self::spawn_with_worker(config, options, spawn_worker)
+    }
+    fn spawn_with_worker(
+        config: Config,
+        options: StartOptions,
+        factory: impl FnOnce(&Config, SharedStatus, SharedMatrix) -> Result<(WorkerHandle, InputThread)>
+        + Send
+        + 'static,
+    ) -> Self {
+        let state_dir = config.state_dir.clone();
+        let (stopping, stop) = watch::channel(false);
+        let (state_tx, state) = watch::channel(RuntimeState::Starting);
+        let task_stop = stopping.clone();
+        tokio::spawn(async move {
+            let result = run_managed(config, options, task_stop, stop, &state_tx, factory)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            state_tx.send_replace(RuntimeState::Finished(result));
+        });
+        Self {
+            stopping,
+            state,
+            state_dir,
+        }
+    }
+    /// Stop an owned session, preserving a live input worker for retry if the
+    /// initial pause cannot release its keys. GUI Quit/restart should use this
+    /// rather than dropping the handle or cancelling a ready runtime directly.
+    pub async fn stop(&mut self) -> Result<()> {
+        let ready = matches!(*self.state.borrow(), RuntimeState::Ready);
+        if ready {
+            let response = control::send(&self.state_dir, "pause").await?;
+            if !response.ok {
+                bail!(
+                    "{}",
+                    response.error.unwrap_or_else(|| {
+                        "Native key cleanup failed; retry Stop after restoring backend access"
+                            .into()
+                    })
+                );
+            }
+        }
+        self.request_stop();
+        self.wait().await
+    }
+    pub fn request_stop(&self) {
+        self.stopping.send_replace(true);
+    }
+    pub fn subscribe(&self) -> watch::Receiver<RuntimeState> {
+        self.state.clone()
+    }
+    pub fn is_finished(&self) -> bool {
+        self.completion().is_some()
+    }
+    pub fn completion(&self) -> Option<std::result::Result<(), String>> {
+        match &*self.state.borrow() {
+            RuntimeState::Finished(result) => Some(result.clone()),
+            _ => None,
+        }
+    }
+    pub async fn ready(&mut self) -> Result<()> {
+        loop {
+            match self.state.borrow().clone() {
+                RuntimeState::Ready => return Ok(()),
+                RuntimeState::Finished(Ok(())) => bail!("Bridge stopped before startup completed"),
+                RuntimeState::Finished(Err(error)) => return Err(anyhow::Error::msg(error)),
+                RuntimeState::Starting => {}
+            }
+            self.state
+                .changed()
+                .await
+                .context("Managed runtime task ended before reporting startup")?;
+        }
+    }
+    pub async fn wait(&mut self) -> Result<()> {
+        loop {
+            if let Some(result) = self.completion() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            self.state
+                .changed()
+                .await
+                .context("Managed runtime task ended before reporting completion")?;
+        }
+    }
+}
+impl Drop for ManagedRuntime {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+async fn cancellation(stopping: &mut watch::Receiver<bool>) {
+    loop {
+        if *stopping.borrow_and_update() {
+            return;
+        }
+        if stopping.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The command-line wrapper alone installs process signal handlers.
+/// GUI frontends use `ManagedRuntime` and cancel their owned session explicitly.
 pub async fn start(config: Config, options: StartOptions) -> Result<()> {
-    let network = config.network().await?;
-    let token = crate::pairing::load_or_create_token(&config.state_dir)?;
-    let listener = TcpListener::bind(network.bind)
-        .await
-        .context("Cannot bind bridge TCP listener")?;
-    let control_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let _guard = RuntimeGuard::create(
-        &config.state_dir,
-        &RuntimeRecord {
-            pid: std::process::id(),
-            port: control_listener.local_addr()?.port(),
-        },
-    )?;
+    let mut runtime = ManagedRuntime::spawn(config, options);
+    let signal = tokio::select! {
+        result=runtime.wait()=>return result,
+        result=shutdown_signal()=>result,
+    };
+    runtime.request_stop();
+    let completion = runtime.wait().await;
+    signal.and(completion)
+}
+
+async fn run_managed(
+    config: Config,
+    options: StartOptions,
+    stopping_tx: watch::Sender<bool>,
+    mut stopping_rx: watch::Receiver<bool>,
+    state: &watch::Sender<RuntimeState>,
+    factory: impl FnOnce(&Config, SharedStatus, SharedMatrix) -> Result<(WorkerHandle, InputThread)>
+    + Send
+    + 'static,
+) -> Result<()> {
+    // Cancel before creating private state, and while DNS or listener setup waits.
+    let setup = async {
+        let network = config.network().await?;
+        let token = crate::pairing::load_or_create_token(&config.state_dir)?;
+        let listener = TcpListener::bind(network.bind)
+            .await
+            .context("Cannot bind bridge TCP listener")?;
+        let control_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let guard = RuntimeGuard::create(
+            &config.state_dir,
+            &RuntimeRecord {
+                pid: std::process::id(),
+                port: control_listener.local_addr()?.port(),
+            },
+        )?;
+        Ok::<_, anyhow::Error>((network, token, listener, control_listener, guard))
+    };
+    let (network, token, listener, control_listener, _guard) = tokio::select! {
+        biased;
+        _=cancellation(&mut stopping_rx)=>return Ok(()),
+        result=setup=>result?,
+    };
     let status = Arc::new(Mutex::new(Status::default()));
     let physical = Arc::new(Mutex::new(MatrixState::default()));
-    let (worker, thread) = spawn_worker(&config, status.clone(), physical.clone())?;
-    if options.enable_input
-        && let Err(error) = worker.enable(true).await
-    {
-        worker.controls.send(WorkerControl::Shutdown)?;
-        return finish_worker(thread, Err(error));
-    }
-    let (stopping_tx, stopping_rx) = watch::channel(false);
+    let (worker, thread) = factory(&config, status.clone(), physical.clone())?;
     let control_task = tokio::spawn(serve_control(
         control_listener,
         token,
@@ -672,6 +822,9 @@ pub async fn start(config: Config, options: StartOptions) -> Result<()> {
         stopping_tx.clone(),
     ));
     let setup = async {
+        if options.enable_input {
+            worker.enable(true).await?;
+        }
         let device = if !options.fake_device
             && (config.auto_connect || options.deploy || config.auto_deploy)
         {
@@ -706,52 +859,48 @@ pub async fn start(config: Config, options: StartOptions) -> Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     };
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
     let mut stop = stopping_rx.clone();
     let setup = tokio::select! {
+        biased;
+        _=cancellation(&mut stop)=>Ok(false),
         result=setup=>result.map(|()|true),
-        _=stop.changed()=>Ok(false),
-        result=&mut shutdown=>result.map(|()|false),
     };
-    if !matches!(setup, Ok(true)) {
-        let _ = stopping_tx.send(true);
-        control_task.abort();
-        let _ = worker.controls.send(WorkerControl::Shutdown);
-        return finish_worker(thread, setup.map(|_| ()));
-    }
-    tracing::info!(address=%listener.local_addr()?,advertise=%network.advertise_ip,input_enabled=options.enable_input,"Bridge ready");
     let mut active: Option<tokio::task::JoinHandle<()>> = None;
-    let result = loop {
-        tokio::select! {
-            signal=&mut shutdown=>{break signal;}
-            _=stop.changed()=>{if *stop.borrow(){break Ok(());}}
-            accepted=listener.accept()=>{
-                let (socket,address)=match accepted {Ok(pair)=>pair,Err(error)=>break Err(error.into())};
-                if !matches!(address.ip(),std::net::IpAddr::V4(ip) if network.allowed_ips.contains(&ip)) {tracing::warn!("Rejected client outside the C64 IP allowlist");continue;}
-                if active.as_ref().is_some_and(|task|!task.is_finished()) {tracing::warn!("Rejected second client while a session is active");continue;}
-                if let Some(task)=active.take(){let _=task.await;}
-                let worker=worker.clone();let state=status.clone();let matrix=physical.clone();let stopping=stopping_rx.clone();
-                active=Some(tokio::spawn(async move {
-                    let result=session(socket,token,worker,state,matrix,stopping).await;
-                    if let Err(error)=result{tracing::warn!(%error,"C64 session ended after a network or protocol failure");}
-                }));
+    let result = if matches!(setup, Ok(true)) {
+        tracing::info!(address=%network.bind,advertise=%network.advertise_ip,input_enabled=options.enable_input,"Bridge ready");
+        state.send_replace(RuntimeState::Ready);
+        loop {
+            tokio::select! {
+                biased;
+                _=cancellation(&mut stop)=>break Ok(()),
+                accepted=listener.accept()=>{
+                    let (socket,address)=match accepted {Ok(pair)=>pair,Err(error)=>break Err(error.into())};
+                    if !matches!(address.ip(),std::net::IpAddr::V4(ip) if network.allowed_ips.contains(&ip)) {tracing::warn!("Rejected client outside the C64 IP allowlist");continue;}
+                    if active.as_ref().is_some_and(|task|!task.is_finished()) {tracing::warn!("Rejected second client while a session is active");continue;}
+                    if let Some(task)=active.take(){let _=task.await;}
+                    let worker=worker.clone();let state=status.clone();let matrix=physical.clone();let stopping=stopping_rx.clone();
+                    active=Some(tokio::spawn(async move {
+                        let result=session(socket,token,worker,state,matrix,stopping).await;
+                        if let Err(error)=result{tracing::warn!(%error,"C64 session ended after a network or protocol failure");}
+                    }));
+                }
             }
         }
+    } else {
+        setup.map(|_| ())
     };
-    let _ = stopping_tx.send(true);
-    if let Some(mut task) = active
-        && tokio::time::timeout(Duration::from_secs(4), &mut task)
-            .await
-            .is_err()
-    {
-        task.abort();
+    stopping_tx.send_replace(true);
+    // Session operations are already bounded. Never abort a task before its
+    // session-reset acknowledgment or the ordered input worker's final cleanup.
+    if let Some(task) = active {
         let _ = task.await;
     }
-    control_task.abort();
+    let _ = control_task.await;
     let _ = worker.controls.send(WorkerControl::Shutdown);
     drop(worker);
-    finish_worker(thread, result)
+    tokio::task::spawn_blocking(move || finish_worker(thread, result))
+        .await
+        .context("Input cleanup task failed")?
 }
 async fn serve_control(
     listener: TcpListener,
@@ -760,8 +909,13 @@ async fn serve_control(
     status: SharedStatus,
     stop: watch::Sender<bool>,
 ) -> Result<()> {
+    let mut stopping = stop.subscribe();
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (mut socket, _) = tokio::select! {
+            biased;
+            _ = cancellation(&mut stopping) => return Ok(()),
+            socket = listener.accept() => socket?,
+        };
         let request = tokio::time::timeout(
             Duration::from_secs(2),
             control::read_json::<ControlRequest>(&mut socket),
