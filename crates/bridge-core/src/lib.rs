@@ -92,6 +92,95 @@ pub enum NativeKey {
     IntlBackslash,
 }
 impl NativeKey {
+    /// Native chord choices accepted by the shared mapping validator.
+    pub const ALL: &'static [Self] = &[
+        Self::A,
+        Self::B,
+        Self::C,
+        Self::D,
+        Self::E,
+        Self::F,
+        Self::G,
+        Self::H,
+        Self::I,
+        Self::J,
+        Self::K,
+        Self::L,
+        Self::M,
+        Self::N,
+        Self::O,
+        Self::P,
+        Self::Q,
+        Self::R,
+        Self::S,
+        Self::T,
+        Self::U,
+        Self::V,
+        Self::W,
+        Self::X,
+        Self::Y,
+        Self::Z,
+        Self::Num0,
+        Self::Num1,
+        Self::Num2,
+        Self::Num3,
+        Self::Num4,
+        Self::Num5,
+        Self::Num6,
+        Self::Num7,
+        Self::Num8,
+        Self::Num9,
+        Self::Space,
+        Self::Enter,
+        Self::Backspace,
+        Self::Delete,
+        Self::Escape,
+        Self::Tab,
+        Self::Home,
+        Self::End,
+        Self::PageUp,
+        Self::PageDown,
+        Self::ArrowLeft,
+        Self::ArrowRight,
+        Self::ArrowUp,
+        Self::ArrowDown,
+        Self::F1,
+        Self::F2,
+        Self::F3,
+        Self::F4,
+        Self::F5,
+        Self::F6,
+        Self::F7,
+        Self::F8,
+        Self::F9,
+        Self::F10,
+        Self::F11,
+        Self::F12,
+        Self::LeftShift,
+        Self::RightShift,
+        Self::Control,
+        Self::Alt,
+        Self::Meta,
+        Self::Minus,
+        Self::Equal,
+        Self::LeftBracket,
+        Self::RightBracket,
+        Self::Backslash,
+        Self::Semicolon,
+        Self::Quote,
+        Self::Comma,
+        Self::Period,
+        Self::Slash,
+        Self::Grave,
+        Self::IntlBackslash,
+    ];
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|key| format!("{key:?}").eq_ignore_ascii_case(name))
+    }
+
     pub const fn is_modifier(self) -> bool {
         matches!(
             self,
@@ -206,7 +295,7 @@ impl KeyboardBackend for RecordingBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShiftPolicy {
     Physical,
@@ -236,33 +325,85 @@ pub struct MappingProfile {
     commodore_modifier: Option<NativeKey>,
     control_modifier: NativeKey,
 }
-#[derive(Deserialize)]
+/// Editable representation of the existing mapping TOML schema. Construction
+/// does not validate a draft; call `validate` before replacing an active profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProfileFile {
-    name: String,
-    profile: String,
-    layout: String,
+pub struct MappingDocument {
+    pub name: String,
+    pub profile: String,
+    pub layout: String,
     #[serde(default)]
-    bindings: Vec<BindingFile>,
-    commodore_modifier: Option<NativeKey>,
-    control_modifier: Option<NativeKey>,
+    pub bindings: Vec<BindingDocument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commodore_modifier: Option<NativeKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_modifier: Option<NativeKey>,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BindingFile {
-    key: PhysicalKey,
+pub struct BindingDocument {
+    pub key: PhysicalKey,
     #[serde(default)]
-    modifiers: Vec<SourceModifier>,
+    pub modifiers: Vec<SourceModifier>,
     #[serde(default)]
-    keys: Vec<NativeKey>,
-    text: Option<String>,
-    shift: Option<ShiftPolicy>,
+    pub keys: Vec<NativeKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shift: Option<ShiftPolicy>,
 }
-#[derive(Deserialize)]
-enum SourceModifier {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceModifier {
     Shift,
     Control,
     Commodore,
+}
+impl SourceModifier {
+    pub const fn mask(self) -> u8 {
+        match self {
+            Self::Shift => MOD_SHIFT,
+            Self::Control => MOD_CONTROL,
+            Self::Commodore => MOD_COMMODORE,
+        }
+    }
+}
+/// Read-only mapping result. A preview never owns or injects native input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolvedAction {
+    Keys {
+        keys: Vec<NativeKey>,
+        shift: ShiftPolicy,
+    },
+    Text(String),
+    Modifier(NativeKey),
+}
+impl MappingDocument {
+    pub fn builtin(profile: &str, layout: &str) -> Result<Self, MappingError> {
+        let parsed = MappingProfile::builtin(profile, layout)?;
+        Ok(Self {
+            name: parsed.name,
+            profile: profile.into(),
+            layout: if parsed.layout == KeyboardLayout::Us {
+                "US"
+            } else {
+                "UK"
+            }
+            .into(),
+            bindings: Vec::new(),
+            commodore_modifier: None,
+            control_modifier: None,
+        })
+    }
+    pub fn from_toml(text: &str) -> Result<Self, MappingError> {
+        toml::from_str(text).map_err(|error| MappingError::Configuration(error.to_string()))
+    }
+    pub fn to_toml(&self) -> Result<String, MappingError> {
+        toml::to_string_pretty(self).map_err(|error| MappingError::Configuration(error.to_string()))
+    }
+    pub fn validate(&self) -> Result<MappingProfile, MappingError> {
+        MappingProfile::from_document(self)
+    }
 }
 impl MappingProfile {
     pub fn builtin(profile: &str, layout: &str) -> Result<Self, MappingError> {
@@ -289,8 +430,10 @@ impl MappingProfile {
         })
     }
     pub fn from_toml(text: &str) -> Result<Self, MappingError> {
-        let file: ProfileFile =
-            toml::from_str(text).map_err(|e| MappingError::Configuration(e.to_string()))?;
+        Self::from_document(&MappingDocument::from_toml(text)?)
+    }
+    pub fn from_document(document: &MappingDocument) -> Result<Self, MappingError> {
+        let file = document.clone();
         let mut result = Self::builtin(&file.profile, &file.layout)?;
         if file.name.is_empty() || file.name.len() > 80 || file.bindings.len() > 256 {
             return Err(MappingError::Configuration(
@@ -393,6 +536,39 @@ impl MappingProfile {
             }
         }
         Ok(result)
+    }
+    pub fn preview(
+        &self,
+        key: PhysicalKey,
+        modifiers: u8,
+        platform: HostPlatform,
+    ) -> Result<ResolvedAction, MappingError> {
+        if modifiers & !bridge_protocol::MODIFIER_MASK != 0 {
+            return Err(MappingError::Configuration(
+                "invalid source modifier mask".into(),
+            ));
+        }
+        if key.is_modifier() {
+            let native = match key {
+                PhysicalKey::LeftShift => NativeKey::LeftShift,
+                PhysicalKey::RightShift => NativeKey::RightShift,
+                PhysicalKey::Control => self.control_modifier,
+                PhysicalKey::Commodore => {
+                    self.commodore_modifier
+                        .unwrap_or(if platform == HostPlatform::MacOS {
+                            NativeKey::Meta
+                        } else {
+                            NativeKey::Control
+                        })
+                }
+                _ => unreachable!("modifier checked above"),
+            };
+            return Ok(ResolvedAction::Modifier(native));
+        }
+        Ok(match self.action(key, modifiers, platform) {
+            Action::Keys { keys, shift } => ResolvedAction::Keys { keys, shift },
+            Action::Text(text) => ResolvedAction::Text(text),
+        })
     }
     fn action(&self, key: PhysicalKey, modifiers: u8, platform: HostPlatform) -> Action {
         if let Some(binding) = self
@@ -1379,6 +1555,92 @@ mod tests {
             include_str!("../../../config/layouts/authentic-c64.toml"),
         ] {
             MappingProfile::from_toml(text).unwrap();
+        }
+    }
+    #[test]
+    fn mapping_documents_round_trip_and_share_validation() {
+        let text = "name='custom'\nprofile='modern'\nlayout='UK'\ncommodore_modifier='Alt'\n[[bindings]]\nkey='A'\nmodifiers=['Shift']\nkeys=['Control','B']\nshift='suppress'\n[[bindings]]\nkey='Pound'\ntext='£'\n";
+        let draft = MappingDocument::from_toml(text).unwrap();
+        let round_trip = MappingDocument::from_toml(&draft.to_toml().unwrap()).unwrap();
+        assert_eq!(draft, round_trip);
+        let profile = draft.validate().unwrap();
+        assert_eq!(
+            profile
+                .preview(PhysicalKey::A, MOD_SHIFT, HostPlatform::Windows)
+                .unwrap(),
+            ResolvedAction::Keys {
+                keys: vec![NativeKey::Control, NativeKey::B],
+                shift: ShiftPolicy::Suppress
+            }
+        );
+        assert_eq!(
+            profile
+                .preview(PhysicalKey::Commodore, 0, HostPlatform::MacOS)
+                .unwrap(),
+            ResolvedAction::Modifier(NativeKey::Alt)
+        );
+        assert_eq!(
+            profile
+                .preview(PhysicalKey::Pound, 0, HostPlatform::Linux)
+                .unwrap(),
+            ResolvedAction::Text("£".into())
+        );
+        assert!(
+            profile
+                .preview(PhysicalKey::A, 128, HostPlatform::Linux)
+                .is_err()
+        );
+    }
+    #[test]
+    fn invalid_document_stays_editable_without_bypassing_cli_validator() {
+        let mut draft = MappingDocument::builtin("modern", "US").unwrap();
+        draft.bindings.push(BindingDocument {
+            key: PhysicalKey::A,
+            modifiers: vec![],
+            keys: vec![NativeKey::LeftShift, NativeKey::A],
+            text: None,
+            shift: Some(ShiftPolicy::Suppress),
+        });
+        let text = draft.to_toml().unwrap();
+        assert_eq!(MappingDocument::from_toml(&text).unwrap(), draft);
+        assert_eq!(
+            draft.validate().unwrap_err().to_string(),
+            MappingProfile::from_toml(&text).unwrap_err().to_string()
+        );
+        assert!(
+            MappingDocument::from_toml("name='x'\nprofile='modern'\nlayout='US'\nunknown=true")
+                .is_err()
+        );
+    }
+    #[test]
+    fn preview_resolves_inherited_shift_and_platform_defaults() {
+        let profile = MappingDocument::builtin("modern", "US")
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(
+            profile
+                .preview(PhysicalKey::CursorRight, MOD_SHIFT, HostPlatform::Linux)
+                .unwrap(),
+            ResolvedAction::Keys {
+                keys: vec![NativeKey::ArrowLeft],
+                shift: ShiftPolicy::Suppress
+            }
+        );
+        assert_eq!(
+            profile
+                .preview(PhysicalKey::Commodore, 0, HostPlatform::MacOS)
+                .unwrap(),
+            ResolvedAction::Modifier(NativeKey::Meta)
+        );
+        assert_eq!(
+            profile
+                .preview(PhysicalKey::Commodore, 0, HostPlatform::Linux)
+                .unwrap(),
+            ResolvedAction::Modifier(NativeKey::Control)
+        );
+        for key in NativeKey::ALL {
+            assert_eq!(NativeKey::from_name(&format!("{key:?}")), Some(*key));
         }
     }
 }
