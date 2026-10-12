@@ -9,7 +9,9 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -143,6 +145,7 @@ def xlib() -> ctypes.CDLL:
         "XNextEvent": ([pointer, ctypes.POINTER(XEvent)], integer),
         "XLookupString": ([ctypes.POINTER(XKeyEvent), ctypes.c_char_p, integer,
                            ctypes.POINTER(window), pointer], integer),
+        "XKeysymToKeycode": ([pointer, window], ctypes.c_ubyte),
         "XQueryKeymap": ([pointer, ctypes.c_char_p], integer),
         "XDestroyWindow": ([pointer, window], integer),
         "XCloseDisplay": ([pointer], integer),
@@ -175,6 +178,9 @@ def collect(configuration_path: Path) -> None:
         library.XGetInputFocus(display, ctypes.byref(focus), ctypes.byref(revert))
         if focus.value != window:
             raise RuntimeError("Private collector did not receive focus")
+        if configuration.get("failure") == "stall":
+            collect_stall(library, display, window, directory)
+            return
         arguments = command(Path(configuration["binary"]), directory,
                             configuration["configured_layout"], "test-input", "--countdown", "3")
         # Inherit the collector's owned group so the supervisor can kill both.
@@ -237,6 +243,206 @@ def collect(configuration_path: Path) -> None:
             process.wait(timeout=1)
         library.XDestroyWindow(display, window)
         library.XCloseDisplay(display)
+
+
+def collect_stall(library: ctypes.CDLL, display, window: int, directory: Path) -> None:
+    """Observe the surviving server; never infer release from its disappearance."""
+    modifier = library.XKeysymToKeycode(display, 0xffe1)  # Shift_L
+    ordinary = library.XKeysymToKeycode(display, 0x41)  # A
+    if not modifier or not ordinary or modifier == ordinary:
+        raise RuntimeError("Private server cannot resolve distinct Shift_L and A keycodes")
+    (directory / "collector-ready").touch(mode=0o600)
+    events, held = [], set()
+
+    def drain() -> None:
+        while library.XPending(display):
+            event = XEvent()
+            library.XNextEvent(display, ctypes.byref(event))
+            if event.type not in (2, 3):
+                continue
+            if event.key.window != window or event.key.send_event:
+                raise RuntimeError("Unexpected event source during private-server stall")
+            events.append((event.type, event.key.keycode))
+            if len(events) > 64:
+                raise RuntimeError("Private stall collector exceeded its event bound")
+            if event.type == 2:
+                held.add(event.key.keycode)
+            else:
+                held.discard(event.key.keycode)
+            if len(held) == 2 and not (directory / "keys-observed").exists():
+                keymap = ctypes.create_string_buffer(32)
+                library.XQueryKeymap(display, keymap)
+                if sum(byte.bit_count() for byte in keymap.raw) != 2:
+                    raise RuntimeError("Private server did not confirm two bridge-owned held keys")
+                (directory / "keys-observed").touch(mode=0o600)
+    deadline = time.monotonic() + 15
+    while not (directory / "cleanup-retried").exists():
+        drain()
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Private stall collector exceeded its 15-second deadline")
+        time.sleep(0.005)
+    # XSync orders the query after the supervisor's acknowledged retry.
+    library.XSync(display, 0)
+    drain()
+    keymap = ctypes.create_string_buffer(32)
+    library.XQueryKeymap(display, keymap)
+    if held or any(keymap.raw):
+        raise RuntimeError("Keys remain held after surviving-server cleanup retry")
+    if len(events) < 4 or events[:2] != [(2, modifier), (2, ordinary)]:
+        raise RuntimeError("Private stall did not observe its modifier/ordinary presses")
+    if any(code not in (modifier, ordinary) for _kind, code in events):
+        raise RuntimeError("Private stall collector received an unexpected key")
+    # Failed requests can be buffered, and cleanup retry can repeat releases.
+    # Require release order without asserting that each key-up appeared only once.
+    try:
+        ordinary_release = events.index((3, ordinary))
+        modifier_release = events.index((3, modifier))
+    except ValueError as error:
+        raise RuntimeError("Private stall did not observe both owned-key releases") from error
+    if ordinary_release >= modifier_release:
+        raise RuntimeError("Private stall released its modifier before its ordinary key")
+    print(json.dumps({"failure": "stall", "held_before_failure": 2,
+                      "held_after_retry": 0, "observed_events": len(events)}))
+
+
+def stalled_server(binary: Path, directory: Path, environment: dict[str, str],
+                   configuration: dict, server: subprocess.Popen) -> None:
+    """Fail closed on a live X11 outage, then verify release on the same server."""
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    environment = environment.copy()
+    environment.update({"C64_ALLOWED_IPS": "127.0.0.1",
+                        "BRIDGE_BIND_ADDRESS": "127.0.0.1",
+                        "HOST_ADVERTISE_IP": "127.0.0.1", "BRIDGE_PORT": str(port)})
+    configuration_path = directory / "stall-collector.json"
+    configuration_path.write_text(json.dumps(configuration | {"failure": "stall"}))
+    configuration_path.chmod(0o600)
+    collector, bridge, peer = None, None, None
+    stopped = False
+    base = command(binary, directory, "US")
+
+    def status() -> dict:
+        return json.loads(run(base + ["status"], environment, 3).stdout)
+
+    def wait_for(predicate, timeout: float, description: str) -> None:
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if collector.poll() is not None or bridge.poll() is not None:
+                raise RuntimeError("Owned stall-test process exited before " + description)
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Private stall test timed out waiting for " + description)
+            time.sleep(0.02)
+
+    sequence = 0
+
+    def frame(kind: int, payload: bytes) -> None:
+        nonlocal sequence
+        peer.sendall(b"KB\x01" + bytes([kind]) + struct.pack("<HH", len(payload), sequence)
+                     + payload)
+        sequence = (sequence + 1) & 0xffff
+
+    with tempfile.TemporaryFile(mode="w+") as bridge_output, \
+            tempfile.TemporaryFile(mode="w+") as collector_output:
+        try:
+            collector = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--collector",
+                 str(configuration_path)], env=environment, stdout=collector_output,
+                stderr=collector_output, start_new_session=True)
+            bridge = subprocess.Popen(base + ["start", "--enable-input"], env=environment,
+                                      stdout=bridge_output, stderr=bridge_output,
+                                      start_new_session=True)
+            wait_for(lambda: (directory / "collector-ready").exists()
+                     and (directory / "state" / "runtime.json").exists(), 5, "ready processes")
+            if not status()["enabled"]:
+                raise RuntimeError("Private X11 bridge did not enable input")
+            peer = socket.create_connection(("127.0.0.1", port), timeout=2)
+            identity = b"PRIVATE-XVFB"
+            token = (directory / "state" / "pairing.key").read_bytes()
+            if len(token) != 16:
+                raise RuntimeError("Private stall test token has an invalid length")
+            frame(1, token + b"\x01\x00" + bytes([len(identity)]) + identity)
+            # Authentication acknowledgment precedes synchronization and transitions.
+            acknowledgment = bytearray()
+            acknowledgment_deadline = time.monotonic() + 2
+            while len(acknowledgment) < 9:
+                remaining = acknowledgment_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Private HELLO acknowledgment exceeded two seconds")
+                peer.settimeout(remaining)
+                chunk = peer.recv(9 - len(acknowledgment))
+                if not chunk:
+                    raise RuntimeError("Private bridge closed before HELLO acknowledgment")
+                acknowledgment.extend(chunk)
+            peer.settimeout(2)
+            if acknowledgment != b"KB\x01\x02\x01\x00\x00\x00\x01":
+                raise RuntimeError("Private bridge returned an unexpected HELLO acknowledgment")
+            frame(5, bytes(8))
+            frame(3, bytes([15, 1]))  # Left Shift, then A with the matching physical mask.
+            frame(3, bytes([10, 1]))
+            wait_for(lambda: (directory / "keys-observed").exists(), 2, "two held keys")
+            baseline = status()["diagnostics"]["failures"]
+            stopped = True
+            os.kill(server.pid, signal.SIGSTOP)
+            started = time.monotonic()
+            frame(4, bytes([10, 1]))
+            frame(4, bytes([15, 0]))
+            deadline = started + 5
+            while True:
+                # Valid device traffic continues; the injected failure is only X11 transport.
+                frame(6, bytes(8))
+                observed = status()
+                observed_at = time.monotonic()
+                if observed_at >= deadline:
+                    raise RuntimeError("Established X11 stall did not disable input within 5 seconds")
+                failure = observed["diagnostics"]["last_failure"]
+                if not observed["enabled"] and failure is not None:
+                    if failure["reason"] != "layout" or failure["cleanup"] != "failed":
+                        raise RuntimeError("Stalled X11 did not retain its layout/cleanup failure")
+                    expected = dict(baseline)
+                    expected["layout"] += 1
+                    expected["cleanup"] += 1
+                    if observed["diagnostics"]["failures"] != expected:
+                        raise RuntimeError("An unrelated session failure obscured the X11 stall: "
+                                           + json.dumps(observed["diagnostics"]["failures"]))
+                    failed_after = observed_at - started
+                    break
+                time.sleep(0.05)
+            os.kill(server.pid, signal.SIGCONT)
+            stopped = False
+            paused = json.loads(run(base + ["pause"], environment, 3).stdout)
+            if paused["enabled"] or paused["diagnostics"]["last_failure"] != failure:
+                raise RuntimeError("Cleanup retry changed the retained failure or enabled input")
+            (directory / "cleanup-retried").touch(mode=0o600)
+            collector.wait(timeout=5)
+            collector_output.seek(0)
+            output = collector_output.read(4096)
+            if collector.returncode:
+                raise RuntimeError("Private stall collector failed: " + output[-2048:])
+            observation = json.loads(output)
+            frame(8, b"\x00")
+            print(f"Established private X11 stall: disabled in {failed_after:.3f} seconds, "
+                  f"cleanup failure retained, {observation['held_after_retry']} held keys after "
+                  "same-server resume and pause retry")
+        finally:
+            try:
+                if stopped:
+                    try:
+                        os.kill(server.pid, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+            finally:
+                try:
+                    if peer is not None:
+                        peer.close()
+                    if bridge is not None and bridge.poll() is None:
+                        try:
+                            run(base + ["stop"], environment, 3, check=False)
+                        finally:
+                            stop_group(bridge)
+                finally:
+                    if collector is not None:
+                        stop_group(collector)
 
 
 def smoke(binary: Path) -> None:
@@ -316,6 +522,11 @@ def smoke(binary: Path) -> None:
                         print(f"Private {configured} XTEST: "
                               + ("mismatch refused without events" if mismatch
                                  else f"{observation['events']} balanced events, phrase/Return, no held keys"))
+                run([shutil.which("setxkbmap"), "-layout", "us", "-variant", "", "-option", ""],
+                    environment, 3)
+                stalled_server(binary, directory, environment,
+                               configuration | {"configured_layout": "US", "mismatch": False},
+                               server)
                 stop_group(server)
                 server = None
                 started = time.monotonic()
