@@ -109,12 +109,20 @@ fn send_one(scan: u16, flags: u32) -> Result<(), BackendError> {
     Ok(())
 }
 
-fn send_key(key: NativeKey, down: bool) -> Result<(), BackendError> {
+fn send_key(key: NativeKey, down: bool, repeating: bool) -> Result<(), BackendError> {
     let (scan, extended) = pc_scancode(key);
     let flags = KEYEVENTF_SCANCODE
         | if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
         | if down { 0 } else { KEYEVENTF_KEYUP };
-    send_one(scan, flags)
+    send_one(scan, flags)?;
+    // Acceptance by SendInput does not verify delivery to a particular app.
+    tracing::debug!(
+        key = ?key,
+        pressed = down,
+        repeat = repeating,
+        "Windows SendInput accepted native key event"
+    );
+    Ok(())
 }
 
 fn release_pending_unicode(
@@ -164,7 +172,7 @@ impl KeyboardBackend for WindowsBackend {
             return Ok(());
         }
         require_layout(self.layout)?;
-        send_key(key, true)?;
+        send_key(key, true, false)?;
         self.held.push(key);
         Ok(())
     }
@@ -173,7 +181,7 @@ impl KeyboardBackend for WindowsBackend {
         if !self.held.contains(&key) {
             return Ok(());
         }
-        send_key(key, false)?;
+        send_key(key, false, false)?;
         self.held.retain(|held| *held != key);
         Ok(())
     }
@@ -185,7 +193,7 @@ impl KeyboardBackend for WindowsBackend {
             ));
         }
         require_layout(self.layout)?;
-        send_key(key, true)
+        send_key(key, true, true)
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), BackendError> {

@@ -243,15 +243,17 @@ fn spawn_worker_with_factory(
                     let output=backend.as_mut().unwrap().as_mut();
                     let result=output.validate_layout().map_err(bridge_core::MappingError::Backend).and_then(|()|mapper.transition(input.event,output));
                     if let Err(error)=result {
+                        tracing::debug!(key=?input.event.key,pressed=input.event.pressed,modifiers=input.event.modifiers,generation=input.generation,"Input worker rejected physical transition");
                         // A mapping rejection must not leave native keys held. Core also guards this.
                         let cleanup=release(&mut mapper,&mut backend);enabled=false;repeat_at=None;
                         let mut state=status.lock().unwrap();state.enabled=false;state.detail=input_failure("mapping/backend failure",error,cleanup);
                     } else {
+                        tracing::debug!(key=?input.event.key,pressed=input.event.pressed,modifiers=input.event.modifiers,generation=input.generation,admitted=mapper.is_key_admitted(input.event.key),blocked=mapper.blocked_combinations()>blocked_before,quarantined=mapper.is_quarantined(),"Input worker processed physical transition");
                         if input.event.pressed && !input.event.key.is_modifier() && mapper.is_key_admitted(input.event.key) {repeat_at=Some(Instant::now()+delay);}
                         if mapper.blocked_combinations()>blocked_before {let mut state=status.lock().unwrap();state.blocked_combinations=mapper.blocked_combinations();state.detail="Incompatible key combination blocked; release that physical key before retrying".into();}
                     }
                 }
-                Ok(_)=>{},
+                Ok(input)=>{tracing::debug!(key=?input.event.key,pressed=input.event.pressed,generation=input.generation,worker_generation=epoch,input_enabled=enabled,"Input worker skipped physical transition");},
                 Err(mpsc::RecvTimeoutError::Disconnected)=>{return release(&mut mapper,&mut backend);},
                 Err(mpsc::RecvTimeoutError::Timeout)=>{},
             }
