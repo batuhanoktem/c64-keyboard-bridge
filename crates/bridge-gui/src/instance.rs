@@ -1,4 +1,4 @@
-use crate::config::{atomic_write, read_regular};
+use crate::config::{atomic_write, read_regular, validate_regular};
 use anyhow::{Context, Result, bail};
 use bridge_host::pairing::Token;
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,8 @@ pub fn acquire(state_dir: &Path) -> Result<Instance> {
     bridge_host::pairing::prepare_directory(state_dir)?;
     let lock_path = state_dir.join("gui.lock");
     if lock_path.exists() {
-        let _ = read_regular(&lock_path, true)?;
+        // Windows range locks prohibit reading the locked bytes; validate metadata only.
+        validate_regular(&lock_path, true)?;
     } else if std::fs::symlink_metadata(&lock_path).is_ok() {
         bail!("GUI lock cannot be a symlink");
     }

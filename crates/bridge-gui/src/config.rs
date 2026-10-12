@@ -23,7 +23,7 @@ pub fn random_id() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-pub fn read_regular(path: &Path, private: bool) -> Result<String> {
+pub fn validate_regular(path: &Path, private: bool) -> Result<fs::Metadata> {
     let metadata = fs::symlink_metadata(path).context("Cannot read configuration file")?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > SETTINGS_LIMIT {
         bail!("Configuration must be a bounded regular file, not a symlink");
@@ -37,6 +37,11 @@ pub fn read_regular(path: &Path, private: bool) -> Result<String> {
     }
     #[cfg(not(unix))]
     let _ = private;
+    Ok(metadata)
+}
+
+pub fn read_regular(path: &Path, private: bool) -> Result<String> {
+    validate_regular(path, private)?;
     let mut bytes = Vec::new();
     fs::File::open(path)?
         .take(SETTINGS_LIMIT + 1)

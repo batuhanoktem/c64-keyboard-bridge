@@ -295,6 +295,14 @@ async fn device_test(config: &Config, allow_reset: bool) -> Result<()> {
     Ok(())
 }
 async fn test_input(config: &Config, countdown: u64) -> Result<()> {
+    // Preserve fail-fast backend/layout checks before beginning the deliberate countdown.
+    let selection = config.backend.clone();
+    let layout = runtime::layout(config);
+    let probe =
+        tokio::task::spawn_blocking(move || backend::probe_backend(&selection, layout)).await?;
+    if !probe.available || !probe.authorized || probe.layout_matches != Some(true) {
+        anyhow::bail!("Input backend preflight failed: {}", probe.detail);
+    }
     eprintln!(
         "Deliberate input test: focus an empty TextEdit/VS Code/Notepad/terminal buffer. No delivery result is inferred automatically."
     );
