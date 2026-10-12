@@ -43,40 +43,46 @@ static uint8_t append(Keyboard *k, uint8_t key, uint8_t down) {
 }
 
 uint8_t kb_sample(Keyboard *k, const uint8_t *raw, uint8_t interference) {
-    uint8_t i, key, old, next, pass, changed = 0, any = 0;
+    uint8_t changes[8], i, bit, mask, key, old, next, pass, changed = 0, any = 0;
     for (i = 0; i < 8; ++i) any |= raw[i];
     if (interference || kb_ambiguous(raw)) {
         if (k->blocked) return 0;
         k->blocked = 1;
         kb_clear_queue(k);
         memset(k->accepted, 0, 8);
-        k->candidate_age = 0;
+        memset(k->candidate, 0, 8);
         return 2;
     }
     if (k->blocked) {
         if (any) return 0;
         k->blocked = 0;
     }
-    if (memcmp(k->candidate, raw, 8)) {
-        memcpy(k->candidate, raw, 8);
-        k->candidate_age = 1;
-        return 0;
+    /* Confirm each physical key across two observations. A changing neighbor
+     * must not postpone a stable press or release elsewhere in the matrix. */
+    any = 0;
+    for (i = 0; i < 8; ++i) {
+        changes[i] = (raw[i] ^ k->accepted[i]) & (uint8_t)~(raw[i] ^ k->candidate[i]);
+        k->candidate[i] = raw[i];
+        any |= changes[i];
     }
-    if (k->candidate_age < 2) ++k->candidate_age;
-    if (k->candidate_age < 2 || !memcmp(k->accepted, raw, 8)) return 0;
+    if (!any) return 0;
     /* Release ordinary keys before modifiers; press modifiers before ordinary keys. */
     for (pass = 0; pass < 4; ++pass) {
-        for (key = 0; key < 64; ++key) {
-            i = key >> 3;
-            old = (k->accepted[i] >> (key & 7)) & 1;
-            next = (raw[i] >> (key & 7)) & 1;
-            if (old == next) continue;
-            if ((pass == 0 && old && !modifier(key)) ||
-                (pass == 1 && old && modifier(key)) ||
-                (pass == 2 && next && modifier(key)) ||
-                (pass == 3 && next && !modifier(key))) {
-                if (!append(k, key, next)) return 3;
-                changed = 1;
+        for (i = 0; i < 8; ++i) {
+            if (!changes[i]) continue;
+            for (bit = 0, mask = 1; bit < 8; ++bit, mask <<= 1) {
+                if (!(changes[i] & mask)) continue;
+                key = (i << 3) | bit;
+                old = k->accepted[i] & mask;
+                next = raw[i] & mask;
+                if ((pass == 0 && old && !modifier(key)) ||
+                    (pass == 1 && old && modifier(key)) ||
+                    (pass == 2 && next && modifier(key)) ||
+                    (pass == 3 && next && !modifier(key))) {
+                    if (!append(k, key, next)) return 3;
+                    changes[i] &= (uint8_t)~mask;
+                    changed = 1;
+                }
             }
         }
     }

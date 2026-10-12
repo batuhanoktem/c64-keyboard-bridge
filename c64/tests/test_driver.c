@@ -170,6 +170,61 @@ static void test_ambiguity_overflow_and_bounce(void) {
     assert(kb_sample(&k, m, 0) == 3 && k.overflow);
 }
 
+static void test_independent_key_debounce(void) {
+    Keyboard k;
+    KeyTransition e;
+    uint8_t m[8], key, neighbor, column, mask, neighbor_column, neighbor_mask;
+    /* A neighboring edge on the second sample must not delay either direction.
+     * Exercise all keys, including same-column neighbors and each modifier. */
+    for (key = 0; key < 64; ++key) {
+        kb_init(&k); memset(m, 0, 8);
+        neighbor = (key + 1) & 63;
+        column = key >> 3; mask = (uint8_t)(1U << (key & 7));
+        neighbor_column = neighbor >> 3; neighbor_mask = (uint8_t)(1U << (neighbor & 7));
+        m[column] = mask;
+        assert(!kb_sample(&k, m, 0));
+        m[neighbor_column] |= neighbor_mask;
+        assert(kb_sample(&k, m, 0) == 1);
+        assert(kb_pop(&k, &e) && e.type == KB_DOWN && e.key == key);
+        assert(!kb_pop(&k, &e));
+        m[neighbor_column] &= (uint8_t)~neighbor_mask;
+        assert(!kb_sample(&k, m, 0)); /* One-sample neighboring press was bounce. */
+        m[column] &= (uint8_t)~mask; m[neighbor_column] |= neighbor_mask;
+        assert(!kb_sample(&k, m, 0));
+        m[neighbor_column] &= (uint8_t)~neighbor_mask;
+        assert(kb_sample(&k, m, 0) == 1);
+        assert(kb_pop(&k, &e) && e.type == KB_UP && e.key == key && e.modifiers == 0);
+        assert(!kb_pop(&k, &e));
+    }
+
+    /* Rolling A then B overlaps for one sample; each key is stable twice even
+     * though no whole pressed matrix repeats. Preserve both complete taps. */
+    kb_init(&k); memset(m, 0, 8); m[1] = 4;
+    assert(!kb_sample(&k, m, 0));
+    m[3] = 16; assert(kb_sample(&k, m, 0) == 1);
+    assert(kb_pop(&k, &e) && e.key == 10 && e.type == KB_DOWN);
+    m[1] = 0; assert(kb_sample(&k, m, 0) == 1);
+    assert(kb_pop(&k, &e) && e.key == 28 && e.type == KB_DOWN);
+    m[3] = 0; assert(kb_sample(&k, m, 0) == 1);
+    assert(kb_pop(&k, &e) && e.key == 10 && e.type == KB_UP);
+    assert(kb_sample(&k, m, 0) == 1);
+    assert(kb_pop(&k, &e) && e.key == 28 && e.type == KB_UP);
+    assert(!kb_pop(&k, &e));
+
+    /* Independently ready modifier and ordinary transitions retain wire order
+     * and masks while an unrelated key starts or stops bouncing. */
+    kb_init(&k); memset(m, 0, 8); m[1] = 128 | 4;
+    assert(!kb_sample(&k, m, 0));
+    m[3] = 16; assert(kb_sample(&k, m, 0) == 1);
+    assert(kb_pop(&k, &e) && e.key == 15 && e.type == KB_DOWN && e.modifiers == 1);
+    assert(kb_pop(&k, &e) && e.key == 10 && e.type == KB_DOWN && e.modifiers == 1);
+    m[1] = m[3] = 0; assert(!kb_sample(&k, m, 0));
+    m[3] = 16; assert(kb_sample(&k, m, 0) == 1);
+    assert(kb_pop(&k, &e) && e.key == 10 && e.type == KB_UP && e.modifiers == 1);
+    assert(kb_pop(&k, &e) && e.key == 15 && e.type == KB_UP && e.modifiers == 0);
+    assert(!kb_pop(&k, &e));
+}
+
 static void test_response_overflow(void) {
     Uci u;
     uint8_t cmd[2] = {3,1}, body[140], i, result = 0;
@@ -202,7 +257,8 @@ static void test_protocol(void) {
 
 int main(void) {
     test_commands_and_fifo(); test_multiblock_and_timeout(); test_status_and_counts();
-    test_scanner_transitions(); test_ambiguity_overflow_and_bounce(); test_protocol();
+    test_scanner_transitions(); test_ambiguity_overflow_and_bounce();
+    test_independent_key_debounce(); test_protocol();
     test_response_overflow();
     puts("C64 portable driver/scanner/protocol tests passed"); return 0;
 }

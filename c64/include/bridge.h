@@ -22,7 +22,7 @@ typedef struct {
 
 typedef struct {
     uint8_t accepted[8], candidate[8];
-    uint8_t candidate_age, blocked;
+    uint8_t blocked;
     KeyTransition queue[KB_QUEUE_SIZE];
     uint8_t head, tail, count, overflow;
 } Keyboard;
