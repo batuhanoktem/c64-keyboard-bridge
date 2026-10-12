@@ -1,5 +1,9 @@
 # C64 Keyboard Bridge
 
+[![Build status](https://github.com/batuhanoktem/c64-keyboard-bridge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/batuhanoktem/c64-keyboard-bridge/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/batuhanoktem/c64-keyboard-bridge)](LICENSE)
+[![Latest commit](https://img.shields.io/github/last-commit/batuhanoktem/c64-keyboard-bridge)](https://github.com/batuhanoktem/c64-keyboard-bridge/commits/main/)
+
 Use the physical Commodore 64 Ultimate keyboard as a keyboard for a modern computer. A real C64 PRG scans CIA1, sends physical key transitions through Ultimate UCI TCP sockets, and a Rust command-line host maps them to native input. No hardware modification or firmware replacement is required by the design.
 
 This is GPL-3.0-only software, with dependency attribution in [third-party notices](THIRD_PARTY_NOTICES.md). There is no GUI. Physical testing passed on C64 Ultimate firmware 1.1.0, FPGA 122, core 1.49 with ARM macOS and US layout: UCI binary networking, TextEdit/VS Code typing and shortcuts, held-key pause/resume, and local exit to BASIC. On 2026-10-12, after fixing per-key debounce and queued-release ordering, user-observed Windows US tests passed in Notepad, VS Code and a WSLg Linux scratch window, including repeat, pause/resume and recovery from a six-second C64 CPU traffic stall. The fixed client returned cleanly to BASIC. Linux XTEST passed on isolated authenticated Xvfb servers on both architectures. Native physical Linux/uinput, broader layouts, rollover, Wi-Fi outages and sustained scan/latency measurements still require the [hardware acceptance tests](docs/hardware-testing.md).
