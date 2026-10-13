@@ -62,14 +62,18 @@ def main():
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--output', type=Path, default=ROOT / 'target/gui-smoke')
     parser.add_argument('--theme', choices=('light', 'dark'), default='light')
+    parser.add_argument('--credential-pending', action='store_true',
+                        help='Render a simulated password-store delay without accessing OS credentials')
     parser.add_argument('--session-child', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     binary = args.binary.resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     if platform.system() == 'Linux' and not args.session_child:
+        credential_flags = ['--credential-pending'] if args.credential_pending else []
         subprocess.run(['dbus-run-session', '--', sys.executable, __file__, '--binary', str(binary),
-                        '--output', str(output), '--theme', args.theme, '--session-child'], check=True, timeout=90)
+                        '--output', str(output), '--theme', args.theme, '--session-child', *credential_flags],
+                       check=True, timeout=90)
         return
     processes = []
     with tempfile.TemporaryDirectory(prefix='c64-keyboard-bridge-gui-smoke-') as temporary:
@@ -113,9 +117,10 @@ def main():
             state_dir = private / 'state'
             with (output / 'gui.log').open('w') as log:
                 tray_flags = ['--smoke-require-tray'] if platform.system() == 'Linux' else []
+                credential_flags = ['--smoke-credential-pending'] if args.credential_pending else []
                 primary = subprocess.Popen([str(binary), '--smoke', '--state-dir', str(state_dir),
                                             '--smoke-report', str(report), '--screenshot', str(screenshot),
-                                            '--smoke-theme', args.theme, *tray_flags],
+                                            '--smoke-theme', args.theme, *tray_flags, *credential_flags],
                                            env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT)
                 processes.append(primary)
                 if platform.system() == 'Linux':
@@ -159,6 +164,8 @@ def main():
                 raise ValueError('GUI smoke did not confirm software-only defaults')
             if evidence.get('native_input') is not False or evidence.get('device_contacted') is not False:
                 raise ValueError('GUI smoke did not confirm isolated recording services')
+            if evidence.get('simulated_credential_pending') is not args.credential_pending:
+                raise ValueError('GUI did not confirm the requested password-store presentation fixture')
             if set(evidence.get('pages_rendered', [])) != {'connection', 'keyboard', 'diagnostics', 'settings'}:
                 raise ValueError('GUI did not render all four companion pages')
             if not screenshot.is_file() or not screenshot.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'):

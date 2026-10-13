@@ -53,12 +53,16 @@ struct Args {
     /// Require the harness-owned Linux tray fixture before smoke completion.
     #[arg(long, requires = "smoke")]
     smoke_require_tray: bool,
+    /// Illustrate a pending password store without accessing OS credentials.
+    #[arg(long, requires = "smoke")]
+    smoke_credential_pending: bool,
 }
 
 #[derive(Default, Serialize)]
 struct SmokeEvidence {
     platform: String,
     theme: String,
+    simulated_credential_pending: bool,
     ok: bool,
     frames: u64,
     pages_rendered: Vec<String>,
@@ -203,6 +207,7 @@ struct NativeApp {
     exiting: bool,
     service_joined: bool,
     smoke: bool,
+    smoke_credential_pending: bool,
     #[cfg(target_os = "linux")]
     smoke_require_tray: bool,
     smoke_hidden: bool,
@@ -237,6 +242,7 @@ impl NativeApp {
             evidence.lock().unwrap().platform = std::env::consts::OS.into();
             evidence.lock().unwrap().theme =
                 args.smoke_theme.clone().unwrap_or_else(|| "system".into());
+            evidence.lock().unwrap().simulated_credential_pending = args.smoke_credential_pending;
         }
         if let Some(theme) = &args.smoke_theme {
             cc.egui_ctx.set_theme(if theme == "dark" {
@@ -306,6 +312,7 @@ impl NativeApp {
             exiting: false,
             service_joined: false,
             smoke: args.smoke,
+            smoke_credential_pending: args.smoke_credential_pending,
             #[cfg(target_os = "linux")]
             smoke_require_tray: args.smoke_require_tray,
             smoke_hidden: false,
@@ -704,7 +711,13 @@ impl eframe::App for NativeApp {
             page = self.app.smoke_page(index);
         }
         egui::CentralPanel::default().show(ui, |ui| {
-            let actions = self.app.render(ui, &self.snapshot);
+            // Documentation-only presentation: leave service state, tray
+            // acknowledgments and graceful shutdown on their real snapshots.
+            let mut snapshot = self.snapshot.clone();
+            if self.smoke && self.smoke_credential_pending {
+                snapshot.credential_pending = true;
+            }
+            let actions = self.app.render(ui, &snapshot);
             let context = ui.ctx().clone();
             for action in actions {
                 self.dispatch(action, &context);
@@ -801,6 +814,7 @@ fn run() -> Result<()> {
         smoke_theme: args.smoke_theme.clone(),
         smoke_height: args.smoke_height,
         smoke_require_tray: args.smoke_require_tray,
+        smoke_credential_pending: args.smoke_credential_pending,
     };
     eframe::run_native(
         "C64 Keyboard Bridge",
@@ -828,6 +842,30 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod smoke_tests {
     use super::*;
+
+    #[test]
+    fn credential_capture_requires_the_complete_isolated_smoke_configuration() {
+        assert!(Args::try_parse_from(["gui", "--smoke-credential-pending"]).is_err());
+        assert!(Args::try_parse_from(["gui", "--smoke", "--smoke-credential-pending"]).is_err());
+        let args = Args::try_parse_from([
+            "gui",
+            "--smoke",
+            "--smoke-credential-pending",
+            "--state-dir",
+            "private-state",
+            "--smoke-report",
+            "report.json",
+            "--screenshot",
+            "capture.png",
+        ])
+        .unwrap();
+        assert!(args.smoke && args.smoke_credential_pending);
+        assert!(
+            !Args::try_parse_from(["gui"])
+                .unwrap()
+                .smoke_credential_pending
+        );
+    }
 
     #[test]
     fn tray_progress_requires_a_fresh_matching_service_acknowledgment() {
