@@ -33,7 +33,7 @@ For the pinned cc65 build, sanitizers, CLI smoke checks, and release archives, u
 
 ![C64 Keyboard Bridge Connection page on macOS, isolated recording fixture](docs/screenshots/macos-connection.png)
 
-The [screenshot gallery](docs/screenshots.md) covers platform-specific GUI pages and genuine C64 PRG screens in VICE. Screenshots use isolated demonstration settings and do not establish physical input acceptance.
+The [screenshot gallery](docs/screenshots.md) includes macOS, Windows and Ubuntu GUI pages captured with isolated recording services, physical C64 Ultimate connected-client and successful-probe screens, and unconfigured C64 PRG startup screens in VICE. Each image records its origin; native input stays disabled during capture.
 
 Install the architecture-specific macOS DMG, Windows per-user installer or Ubuntu 24.04+ DEB, or run `c64-keyboard-bridge-gui` from a portable archive. Hosting and input start disabled. This build uses a new private settings, pairing and credential namespace; re-enter configuration and the password when upgrading from earlier builds. Older data remains untouched without automatic migration. Enter your C64 address on Connection, choose a matching US/UK host layout, then start the host. Deploying either C64 program requires a separate confirmation because it resets the C64 and replaces its current program.
 

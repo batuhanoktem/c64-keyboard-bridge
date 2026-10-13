@@ -262,6 +262,26 @@
       },
       "template_prg": "KEYBRIDGE.PRG",
       "template_prg_sha256": "4e8c278667aa352dc9ccbf7e255b6fa69edf104ba7bfeddb024792963bc92018"
+    },
+    {
+      "file": "c64-probe-success.png",
+      "platform": "C64",
+      "origin": "physical C64 Ultimate, Ethernet video stream",
+      "width": 384,
+      "height": 240,
+      "sha256": "6172b3ca9586f22d846c484090b4a29eea33ec8016b0ee970e1c5792a89b092c",
+      "capture_revision": "88d9cae35a53c7a7603530d36f0e033d1fcbeb65",
+      "hardware_contacted": true,
+      "native_input": false,
+      "video_standard": "NTSC",
+      "firmware": {
+        "product": "C64 Ultimate",
+        "version": "1.1.0",
+        "fpga": "122",
+        "core": "1.49"
+      },
+      "template_prg": "NETWORKTEST.PRG",
+      "template_prg_sha256": "fa69d90a49c47a841262fcd7c7a611b3dfafee0d0583845e2123e1d8a9beaf6e"
     }
   ]
 }

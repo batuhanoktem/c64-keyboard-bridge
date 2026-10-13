@@ -90,6 +90,10 @@ The keyboard client authenticated successfully with input disabled throughout ca
 
 ![Keyboard client on a physical C64 Ultimate, showing CONNECTED: INPUT DISABLED](screenshots/c64-keyboard-connected.png)
 
+The networking probe shows **PASS: TCP/BINARY/ACK/IDLE/CLOSE** on the same physical device, captured through its Ethernet video stream at the original NTSC 384 × 240 dimensions. Host evidence confirmed receipt of 32 binary bytes, a NUL-containing acknowledgment and the idle-read phase; peer closure was observed on the C64 screen. This capture establishes that probe run, without asserting native keyboard input acceptance.
+
+![Networking probe on a physical C64 Ultimate, showing PASS: TCP/BINARY/ACK/IDLE/CLOSE](screenshots/c64-probe-success.png)
+
 ## C64 emulator screenshots
 
 These are the genuine, unconfigured release templates running in VICE 3.10. They display deployment instructions because no pairing token or network destination is embedded. VICE does not emulate Ultimate UCI, so these images do not show or claim successful networking. The original 384 × 272 pixel proportions are preserved.
@@ -98,7 +102,7 @@ These are the genuine, unconfigured release templates running in VICE 3.10. They
 
 ![Genuine C64 networking-probe startup in VICE, showing unconfigured deployment instructions](screenshots/c64-probe-startup.png)
 
-An image of a successful physical networking-probe run remains pending. Loading either PRG requires fresh reset consent.
+Loading either PRG on physical hardware requires fresh reset consent.
 
 ## Reproduce isolated captures
 

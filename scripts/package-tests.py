@@ -64,22 +64,25 @@ class PackagingTests(unittest.TestCase):
 
     def test_hardware_images_require_complete_physical_provenance(self):
         manifest = json.loads((ROOT / 'docs/screenshots/manifest.json').read_text())
-        entry = next(item for item in manifest['screenshots'] if item['file'] == 'c64-keyboard-connected.png')
-        self.assert_screenshot_provenance(entry)
-        invalid = [dict(entry, origin='VICE, simulated connected state'),
-                   dict(entry, hardware_contacted=False),
-                   dict(entry, native_input=True),
-                   dict(entry, template_prg_sha256='unverified'),
-                   dict(entry, capture_revision='unknown'),
-                   dict(entry, height=272)]
-        for candidate in invalid:
-            with self.subTest(candidate=candidate):
-                with self.assertRaises(AssertionError):
-                    self.assert_screenshot_provenance(candidate)
-        incomplete = dict(entry)
-        del incomplete['firmware']
-        with self.assertRaises(KeyError):
-            self.assert_screenshot_provenance(incomplete)
+        entries = [item for item in manifest['screenshots'] if item['hardware_contacted']]
+        self.assertEqual({item['template_prg'] for item in entries}, {'KEYBRIDGE.PRG', 'NETWORKTEST.PRG'})
+        for entry in entries:
+            with self.subTest(file=entry['file']):
+                self.assert_screenshot_provenance(entry)
+                invalid = [dict(entry, origin='VICE, simulated connected state'),
+                           dict(entry, hardware_contacted=False),
+                           dict(entry, native_input=True),
+                           dict(entry, template_prg_sha256='unverified'),
+                           dict(entry, capture_revision='unknown'),
+                           dict(entry, height=272)]
+                for candidate in invalid:
+                    with self.subTest(candidate=candidate):
+                        with self.assertRaises(AssertionError):
+                            self.assert_screenshot_provenance(candidate)
+                incomplete = dict(entry)
+                del incomplete['firmware']
+                with self.assertRaises(KeyError):
+                    self.assert_screenshot_provenance(incomplete)
 
     def test_source_allowlist_contains_gui_build_inputs_and_no_private_state(self):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE["source_files"]()}
