@@ -85,6 +85,7 @@ pub async fn doctor(config: &Config) -> Report {
             None
         }
     };
+    let runtime_status = control::send(&config.state_dir, "status").await.ok();
     match config.network().await {
         Ok(network) => {
             report.add(
@@ -97,16 +98,21 @@ pub async fn doctor(config: &Config) -> Report {
             );
             match tokio::net::TcpListener::bind(network.bind).await {
                 Ok(_) => report.add("Listener port", "available", "Port can be bound"),
+                Err(_) if runtime_status.as_ref().is_some_and(|s| s.status.running) => report.add(
+                    "Listener port",
+                    "occupied; bridge running",
+                    "An active bridge normally occupies its listener port. If connection settings changed, apply them or stop hosting before checking the new port",
+                ),
                 Err(_) => report.add(
                     "Listener port",
                     "in use",
-                    "Check bridge status or choose BRIDGE_PORT",
+                    "Another process occupies this port; stop it or choose another bridge TCP port",
                 ),
             }
         }
         Err(error) => report.add("Network route", "unavailable", format!("{error:#}")),
     }
-    if let Ok(status) = control::send(&config.state_dir, "status").await {
+    if let Some(status) = runtime_status {
         report.add(
             "Runtime",
             if status.status.enabled {

@@ -1,5 +1,223 @@
 use super::*;
 
+async fn rest_fixture(status: &str, body: &str) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut bytes = [0; 1024];
+            let n = socket.read(&mut bytes).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&bytes[..n]);
+            assert!(request.len() < 4096);
+        }
+        socket.write_all(response.as_bytes()).await.unwrap();
+        request
+    });
+    (port, task)
+}
+
+#[tokio::test]
+async fn configured_device_button_uses_current_form_without_saving_or_injecting() {
+    let (mut actor, _events) = actor();
+    actor.smoke = false;
+    let (port, request) = rest_fixture("200 OK", r#"{"product":"C64 Ultimate","firmware_version":"1.1.0","fpga_version":"122","hostname":"fixture","unique_id":"fixture","errors":[]}"#).await;
+    let mut form = actor.settings.clone();
+    form.device_port = port;
+    form.remember_password = true;
+    actor
+        .action(GuiAction::Configured {
+            settings: form,
+            password: "CURRENT_FORM_SECRET".into(),
+            operation: ConnectionOperation::DeviceInfo,
+        })
+        .await
+        .unwrap();
+    let request = String::from_utf8(request.await.unwrap()).unwrap();
+    assert!(request.starts_with("GET /v1/info HTTP/1.1"));
+    assert!(request.contains("CURRENT_FORM_SECRET"));
+    assert_eq!(
+        actor.snapshot.device.as_ref().unwrap().product,
+        "C64 Ultimate"
+    );
+    assert!(actor.owned.is_none());
+    assert!(!actor.state_dir.join("gui-settings.toml").exists());
+    assert!(!actor.settings.remember_password);
+    assert!(
+        !String::from_utf8(diagnostic_export(&actor.snapshot).unwrap())
+            .unwrap()
+            .contains("CURRENT_FORM_SECRET")
+    );
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn invalid_current_form_does_not_fall_through_to_saved_connection() {
+    let (mut actor, _events) = actor();
+    actor.smoke = false;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    actor.settings.device_port = listener.local_addr().unwrap().port();
+    let original = actor.settings.clone();
+    let mut invalid = original.clone();
+    invalid.device_port = 0;
+    assert!(
+        actor
+            .action(GuiAction::Configured {
+                settings: invalid,
+                password: "INVALID_FORM_SECRET".into(),
+                operation: ConnectionOperation::DeviceInfo,
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(actor.settings, original);
+    assert!(actor.password.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn background_service_shows_auth_failure_without_echoing_secret_or_peer_text() {
+    let (actor, _events) = actor();
+    let state_dir = actor.state_dir.clone();
+    let settings = actor.settings.clone();
+    config::save_settings(&state_dir, &settings).unwrap();
+    drop(actor);
+    let (port, request) =
+        rest_fixture("403 Forbidden", r#"{"errors":["PEER_SECRET_SENTINEL"]}"#).await;
+    let mut service =
+        ServiceHandle::spawn(state_dir.clone(), None, false, Arc::new(|| {})).unwrap();
+    let mut form = settings;
+    form.device_port = port;
+    service
+        .send(GuiAction::Configured {
+            settings: form,
+            password: "HEADER_SECRET_SENTINEL".into(),
+            operation: ConnectionOperation::DeviceInfo,
+        })
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(GuiEvent::Error(error)) = service.try_recv() {
+                break error;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(error.contains("Device information failed"));
+    assert!(error.contains("authentication failed"));
+    assert!(!error.contains("SECRET_SENTINEL"));
+    request.await.unwrap();
+    service.shutdown_and_join().unwrap();
+    std::fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[tokio::test]
+async fn startup_bind_failure_is_visible_and_clears_host_ownership() {
+    let (mut actor, _events) = actor();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    actor.settings.bridge_port = listener.local_addr().unwrap().port();
+    actor.start(false, false).await.unwrap();
+    assert!(actor.owned.as_mut().unwrap().ready().await.is_err());
+    actor.refresh_status().await;
+    assert!(actor.snapshot.message.contains("bind"));
+    assert!(actor.snapshot.message.contains("Hosting and input are off"));
+    assert_eq!(actor.snapshot.phase, GuiPhase::Idle);
+    assert!(!actor.snapshot.owned);
+    assert!(!actor.state_dir.join("runtime.json").exists());
+    cleanup(actor);
+}
+
+#[test]
+fn displayed_failures_are_bounded_and_omit_chained_secret_details() {
+    let error = anyhow::anyhow!("CHAINED_SECRET_SENTINEL").context("Cannot reach C64 REST API");
+    assert_eq!(display_error(&error), "Cannot reach C64 REST API");
+    assert_eq!(
+        display_error(&anyhow::anyhow!("é".repeat(1024)))
+            .chars()
+            .count(),
+        512
+    );
+}
+
+#[test]
+fn missing_import_is_visible_and_unchanged_save_does_not_require_host_restart() {
+    let (mut actor, _events) = actor();
+    actor.settings.env_file = actor
+        .state_dir
+        .join("missing.env")
+        .to_string_lossy()
+        .into_owned();
+    actor.configuration_warning();
+    assert!(
+        actor
+            .snapshot
+            .configuration_warning
+            .contains(".env file was not found")
+    );
+    assert!(actor.snapshot.configuration_warning.contains("Finder"));
+    actor.snapshot.status = Some(control::Status::default());
+    actor
+        .save_form(actor.settings.clone(), String::new())
+        .unwrap();
+    assert!(!actor.snapshot.settings_pending);
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn changed_form_pauses_owned_host_and_requires_apply_before_deployment() {
+    let (mut actor, _events) = actor();
+    actor.start(false, false).await.unwrap();
+    actor.owned.as_mut().unwrap().ready().await.unwrap();
+    actor.action(GuiAction::FocusChanged(false)).await.unwrap();
+    assert!(actor.permit.arm(actor.permit.epoch()));
+    assert!(control::send(&actor.state_dir, "resume").await.unwrap().ok);
+    actor.refresh_status().await;
+    assert!(actor.snapshot.status.as_ref().unwrap().enabled);
+    let mut changed = actor.settings.clone();
+    changed.bridge_port = if changed.bridge_port == 65535 {
+        65534
+    } else {
+        changed.bridge_port + 1
+    };
+    let error = actor
+        .action(GuiAction::Configured {
+            settings: changed,
+            password: String::new(),
+            operation: ConnectionOperation::Deploy {
+                run: true,
+                allow_reset: true,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Apply the changed settings"));
+    assert!(actor.snapshot.settings_pending);
+    assert!(
+        !control::send(&actor.state_dir, "status")
+            .await
+            .unwrap()
+            .status
+            .enabled
+    );
+    assert!(actor.action(GuiAction::Enable).await.is_err());
+    actor.stop_owned().await.unwrap();
+    cleanup(actor);
+}
+
 fn actor() -> (Actor, mpsc::Receiver<GuiEvent>) {
     let directory = std::env::temp_dir().join(format!(
         "c64bridge-gui-controller-{}",

@@ -4,7 +4,7 @@ use crate::{
     model::*,
     secrets::{MemorySecretStore, OsSecretStore, SecretStore},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bridge_core::MappingDocument;
 use bridge_host::{
     backend, control, diagnostics, operations, pairing,
@@ -326,6 +326,7 @@ impl Actor {
                 self.settings=settings;
                 self.restore_password();
                 self.event(GuiEvent::SettingsLoaded(self.settings.clone())); self.probe_backend();
+                self.configuration_warning();
                 if !self.settings.mappings_file.is_empty() {
                     let path=PathBuf::from(&self.settings.mappings_file);
                     match config::read_regular(&path,false) {
@@ -335,7 +336,7 @@ impl Actor {
                 }
                 self.note("Desktop opened; hosting and input remain off");
             },
-            Err(_)=>self.error("Configuration could not be loaded; original file preserved. Review settings before starting"),
+            Err(error)=>self.error(&format!("Configuration could not be loaded: {}. Original file preserved; review Settings before starting", display_error(&error))),
         }
         self.publish();
     }
@@ -400,6 +401,15 @@ impl Actor {
         }
         Ok(config)
     }
+    fn configuration_warning(&mut self) {
+        self.snapshot.configuration_warning = if !self.settings.env_file.is_empty()
+            && !Path::new(&self.settings.env_file).is_file()
+        {
+            "The selected .env file was not found. Enter the C64 network password on Connection, or choose an existing .env file in Settings. Finder does not inherit your terminal configuration.".into()
+        } else {
+            String::new()
+        };
+    }
     fn probe_backend(&mut self) {
         if let Ok(config) = self.effective_config() {
             let p = backend::probe_backend(&config.backend, runtime::layout(&config));
@@ -430,16 +440,17 @@ impl Actor {
                 queued=commands.recv()=>{
                     let Some(queued)=queued else {let _=self.quit.send(true);continue;};
                     let next=*safety.borrow_and_update();self.apply_safety(next).await;
-                    if matches!(queued.action,GuiAction::Enable|GuiAction::TestInput) && (queued.cancel_epoch!=next.cancel || queued.auto_pause_epoch!=next.auto_pause){self.note("Obsolete input request cancelled by a newer safety action");self.publish();continue;}
+                    if matches!(queued.action,GuiAction::Enable|GuiAction::TestInput|GuiAction::Configured{operation:ConnectionOperation::TestInput,..}) && (queued.cancel_epoch!=next.cancel || queued.auto_pause_epoch!=next.auto_pause){self.note("Obsolete input request cancelled by a newer safety action");self.publish();continue;}
                     self.command_epoch=Some(queued.gate_epoch);self.snapshot.busy=true;self.publish();
-                    let cancelable=matches!(queued.action,GuiAction::Doctor|GuiAction::DeviceInfo);
+                    let operation=operation_name(&queued.action);
+                    let cancelable=matches!(queued.action,GuiAction::Doctor|GuiAction::DeviceInfo|GuiAction::Configured{operation:ConnectionOperation::Doctor|ConnectionOperation::DeviceInfo,..});
                     let result=if cancelable {
                         tokio::select!{biased;_=quit.changed()=>None,result=self.action(queued.action)=>Some(result)}
                     }else{Some(self.action(queued.action).await)};
                     self.command_epoch=None;
                     if result.is_none(){self.snapshot.busy=false;if self.try_quit().await{break;}continue;}
                     let result=result.unwrap();
-                    if result.is_err() {self.error("Operation failed. Review configuration, permissions and retained diagnostics; no automatic retry was made");}
+                    if let Err(error)=result {self.error(&format!("{operation}: {}. No automatic retry was made",display_error(&error)));}
                     self.snapshot.busy=false;self.publish();
                 },
                 _=ticker.tick()=>{let next=*safety.borrow_and_update();self.apply_safety(next).await;self.tick().await;self.publish();},
@@ -486,7 +497,7 @@ impl Actor {
     async fn refresh_status(&mut self) {
         if self.owned.as_ref().is_some_and(ManagedRuntime::is_finished) {
             let mut runtime = self.owned.take().unwrap();
-            let success = runtime.wait().await.is_ok();
+            let completion = runtime.wait().await;
             self.snapshot.owned = false;
             self.snapshot.phase = GuiPhase::Idle;
             if let Some(status) = self.snapshot.status.as_mut() {
@@ -495,8 +506,11 @@ impl Actor {
                 status.enabled = false;
             }
             self.countdown = None;
-            if !success {
-                self.error("Bridge stopped after a runtime failure; inspect retained diagnostics");
+            if let Err(error) = completion {
+                self.error(&format!(
+                    "Bridge could not continue: {}. Hosting and input are off",
+                    display_error(&error)
+                ));
             }
         }
         if self.state_dir.join("runtime.json").exists() {
@@ -579,7 +593,7 @@ impl Actor {
                         if r.ok {
                             Ok(())
                         } else {
-                            bail!("Input was not enabled")
+                            bail!("{}", r.error.unwrap_or_else(|| "Input was not enabled; inspect the runtime permission and layout checks".into()))
                         }
                     })
             } else {
@@ -594,8 +608,9 @@ impl Actor {
                 } else {
                     "Input enabled after focus countdown"
                 }),
-                Err(_) => self
-                    .error("Input stayed disabled: connection, layout or permission check failed"),
+                Err(error) => {
+                    self.error(&format!("Input stayed disabled: {}", display_error(&error)))
+                }
             }
             self.refresh_status().await;
         }
@@ -609,7 +624,12 @@ impl Actor {
         let response = control::send(&self.state_dir, "pause").await?;
         self.snapshot.status = Some(response.status);
         if !response.ok {
-            bail!("Key cleanup failed; ownership retained for retry");
+            bail!(
+                "{}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Key cleanup failed; ownership retained for retry".into())
+            );
         }
         self.note("Input paused; owned keys released");
         Ok(())
@@ -708,10 +728,15 @@ impl Actor {
         {
             bail!("Stored password deletion failed");
         }
+        let mut previous = self.settings.clone();
+        previous.remember_password = settings.remember_password;
+        let changed = previous != settings || self.password != next_password;
         config::save_settings(&self.state_dir, &settings)?;
         self.settings = settings;
         self.password = next_password;
-        self.snapshot.settings_pending = self.snapshot.status.as_ref().is_some_and(|s| s.running);
+        self.configuration_warning();
+        self.snapshot.settings_pending |= changed
+            && (self.owned.is_some() || self.snapshot.status.as_ref().is_some_and(|s| s.running));
         self.event(GuiEvent::SettingsLoaded(self.settings.clone()));
         self.probe_backend();
         if store_failure {
@@ -722,6 +747,39 @@ impl Actor {
             self.note("Settings saved; passwords are excluded from the settings file");
         }
         Ok(())
+    }
+    /// Buttons act on one validated copy of the current form. This does not
+    /// write settings or touch the credential store; Save/Apply remain explicit.
+    fn use_form(&mut self, mut settings: GuiSettings, password: String) -> Result<bool> {
+        if settings.credential_id.is_empty() {
+            settings.credential_id = self.settings.credential_id.clone();
+        }
+        if settings.credential_id != self.settings.credential_id {
+            bail!("Obsolete settings draft after local data reset");
+        }
+        settings.resolve_paths(&std::env::current_dir()?);
+        let next_password = if password.is_empty() {
+            self.password.clone()
+        } else {
+            Some(password)
+        };
+        settings.to_config(&self.state_dir, next_password.as_deref())?;
+        // Remember describes the actual saved credential, not an unsaved checkbox.
+        let accepted_form = settings.clone();
+        settings.remember_password = self.settings.remember_password;
+        let changed = settings != self.settings || next_password != self.password;
+        self.snapshot.settings_pending |= changed
+            && (self.owned.is_some()
+                || self
+                    .snapshot
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.running));
+        self.settings = settings;
+        self.password = next_password;
+        self.configuration_warning();
+        self.event(GuiEvent::FormAccepted(accepted_form));
+        Ok(changed)
     }
     fn save_profile(&mut self, document: &MappingDocument, path: Option<&Path>) -> Result<PathBuf> {
         document.validate()?;
@@ -736,6 +794,26 @@ impl Actor {
         Ok(path)
     }
     async fn action(&mut self, action: GuiAction) -> Result<()> {
+        let action = match action {
+            GuiAction::Configured {
+                settings,
+                password,
+                operation,
+            } => {
+                let before = self.permit.epoch();
+                if self.use_form(settings, password)? && self.owned.is_some() {
+                    self.pause().await?;
+                    // Account only for this operation's own pause. A newer
+                    // focus/cancel action still invalidates the queued countdown.
+                    let after = before.wrapping_add(1);
+                    if self.command_epoch == Some(before) && self.permit.epoch() == after {
+                        self.command_epoch = Some(after);
+                    }
+                }
+                operation.into_action()
+            }
+            action => action,
+        };
         match action {
             GuiAction::Start {
                 deploy,
@@ -756,6 +834,11 @@ impl Actor {
             GuiAction::Pause => self.pause().await?,
             GuiAction::Enable | GuiAction::TestInput => {
                 let test = matches!(action, GuiAction::TestInput);
+                if !test && self.snapshot.settings_pending {
+                    bail!(
+                        "Apply the changed settings before enabling input; hosting restarts with input disabled"
+                    );
+                }
                 if self.smoke && self.settings.backend != "recording" {
                     bail!("Smoke cannot post native input");
                 }
@@ -862,6 +945,7 @@ impl Actor {
                 if self.smoke {
                     bail!("Smoke cannot contact devices");
                 }
+                self.snapshot.device = None;
                 let info = RestClient::new(&self.effective_config()?)?.info().await?;
                 self.snapshot.device = Some(GuiDeviceInfo {
                     product: info.product,
@@ -872,6 +956,11 @@ impl Actor {
                 self.note("REST information retrieved; this alone does not verify UCI networking");
             }
             GuiAction::Deploy { run, allow_reset } => {
+                if self.snapshot.settings_pending {
+                    bail!(
+                        "Apply the changed settings before deployment so the C64 program matches the running host"
+                    );
+                }
                 if self
                     .owned
                     .as_ref()
@@ -927,9 +1016,24 @@ impl Actor {
                 if self.smoke {
                     bail!("Smoke cannot request native authorization");
                 }
-                backend::request_permission()?;
                 self.probe_backend();
-                self.note("Native authorization requested for the GUI application");
+                if self
+                    .snapshot
+                    .backend
+                    .as_ref()
+                    .is_some_and(|probe| probe.name == "macos")
+                {
+                    let result = backend::request_permission();
+                    self.probe_backend();
+                    result?;
+                    self.note("Native authorization checked for the GUI application");
+                } else {
+                    self.note("GUI backend permission status refreshed; this backend has no macOS permission prompt");
+                }
+            }
+            GuiAction::OpenPermissionSettings => {
+                open_permission_settings()?;
+                self.note("Permission settings opened; enable C64 Keyboard Bridge under Device Control and Data Access (Accessibility on older macOS), then refresh Diagnostics");
             }
             GuiAction::RotatePairing => {
                 if self.owned.is_some() {
@@ -992,9 +1096,86 @@ impl Actor {
             GuiAction::Quit => {
                 let _ = self.quit.send(true);
             }
+            GuiAction::Configured { .. } => {
+                unreachable!("Configured operations are resolved above")
+            }
         }
         Ok(())
     }
+}
+
+/// Show the controlled outer context, never chained transport errors, response
+/// bodies or credential-store diagnostics. The export uses a separate whitelist.
+fn display_error(error: &anyhow::Error) -> String {
+    error.to_string().chars().take(512).collect()
+}
+
+fn operation_name(action: &GuiAction) -> &'static str {
+    match action {
+        GuiAction::Configured { operation, .. } => operation_name(&(*operation).into_action()),
+        GuiAction::Start { .. } => "Start hosting failed",
+        GuiAction::Stop => "Stop failed",
+        GuiAction::Pause => "Pause failed",
+        GuiAction::Enable => "Enable input failed",
+        GuiAction::TestInput => "Input test failed",
+        GuiAction::SaveSettings { .. } | GuiAction::ApplySettings { .. } => {
+            "Settings were not applied"
+        }
+        GuiAction::DeviceInfo => "Device information failed",
+        GuiAction::Deploy { .. } => "Keyboard deployment failed",
+        GuiAction::Probe { .. } => "Networking probe failed",
+        GuiAction::Doctor => "Diagnostics failed",
+        GuiAction::RequestPermission => "Permission request needs attention",
+        GuiAction::OpenPermissionSettings => "Accessibility settings could not be opened",
+        GuiAction::RotatePairing => "Pairing rotation failed",
+        GuiAction::ImportProfile(_) => "Mapping import failed",
+        GuiAction::SaveProfile { .. } | GuiAction::ExportProfile { .. } => "Mapping save failed",
+        GuiAction::ApplyProfile { .. } => "Mapping apply failed",
+        GuiAction::ExportDiagnostics(_) => "Diagnostic export failed",
+        GuiAction::ForgetPassword => "Password could not be forgotten",
+        GuiAction::RemoveLocalData { .. } => "Local data could not be reset",
+        _ => "Operation failed",
+    }
+}
+
+impl ConnectionOperation {
+    fn into_action(self) -> GuiAction {
+        match self {
+            Self::Start {
+                deploy,
+                allow_reset,
+            } => GuiAction::Start {
+                deploy,
+                allow_reset,
+            },
+            Self::DeviceInfo => GuiAction::DeviceInfo,
+            Self::Deploy { run, allow_reset } => GuiAction::Deploy { run, allow_reset },
+            Self::Probe { allow_reset } => GuiAction::Probe { allow_reset },
+            Self::Doctor => GuiAction::Doctor,
+            Self::RequestPermission => GuiAction::RequestPermission,
+            Self::TestInput => GuiAction::TestInput,
+        }
+    }
+}
+
+fn open_permission_settings() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("Open System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS) manually")?;
+        if !status.success() {
+            bail!(
+                "Open System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS) manually"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    bail!("This shortcut is available on macOS only")
 }
 
 pub fn diagnostic_export(snapshot: &GuiSnapshot) -> Result<Vec<u8>> {

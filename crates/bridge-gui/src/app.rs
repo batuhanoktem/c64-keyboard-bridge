@@ -1,11 +1,14 @@
 //! Desktop presentation. All I/O and native input belong to the ordered service.
 use crate::{
     editor::{EditorIntent, MappingEditor},
-    model::{GuiAction, GuiEvent, GuiPhase, GuiSettings, GuiSnapshot},
+    model::{ConnectionOperation, GuiAction, GuiEvent, GuiPhase, GuiSettings, GuiSnapshot},
     presentation,
 };
 use eframe::egui;
-use std::path::PathBuf;
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -109,11 +112,20 @@ impl Confirm {
     }
 }
 
+struct FormSubmission {
+    settings: GuiSettings,
+    password: String,
+    configured: bool,
+}
 pub struct BridgeApp {
     pub settings: GuiSettings,
     pub editor: MappingEditor,
     page: Page,
     password: String,
+    accepted_settings: GuiSettings,
+    accepted_password: String,
+    form_submissions: VecDeque<FormSubmission>,
+    settings_loaded: bool,
     confirm: Option<Confirm>,
     quit_dialog: bool,
     quit_after_save: bool,
@@ -126,9 +138,13 @@ impl BridgeApp {
     pub fn new(settings: GuiSettings) -> Self {
         Self {
             editor: MappingEditor::new(&settings.profile, &settings.layout),
+            accepted_settings: settings.clone(),
             settings,
             page: Page::Connection,
             password: String::new(),
+            accepted_password: String::new(),
+            form_submissions: VecDeque::new(),
+            settings_loaded: false,
             confirm: None,
             quit_dialog: false,
             quit_after_save: false,
@@ -152,16 +168,38 @@ impl BridgeApp {
     }
     pub fn on_event(&mut self, event: &GuiEvent) {
         match event {
-            GuiEvent::SettingsLoaded(settings) => {
+            GuiEvent::SettingsLoaded(settings) | GuiEvent::FormAccepted(settings) => {
+                let configured = matches!(event, GuiEvent::FormAccepted(_));
+                let initial_load = !configured && !self.settings_loaded;
+                if !configured {
+                    self.settings_loaded = true;
+                }
+                let submission = if !initial_load
+                    && self.form_submissions.front().is_some_and(|pending| {
+                        pending.configured == configured
+                            && acknowledgment_matches(&pending.settings, settings)
+                    }) {
+                    self.form_submissions.pop_front()
+                } else {
+                    None
+                };
+                let baseline = submission
+                    .as_ref()
+                    .map_or(&self.accepted_settings, |pending| &pending.settings)
+                    .clone();
+                self.merge_loaded_settings(settings, &baseline);
+                self.accepted_settings = settings.clone();
+                if let Some(submission) = submission {
+                    self.accepted_password = submission.password;
+                }
                 if !self.editor.is_dirty()
                     && self.pending_save.is_none()
-                    && settings.mappings_file.is_empty()
-                    && (self.editor.document.profile != settings.profile
-                        || self.editor.document.layout != settings.layout)
+                    && self.settings.mappings_file.is_empty()
+                    && (self.editor.document.profile != self.settings.profile
+                        || self.editor.document.layout != self.settings.layout)
                 {
-                    self.editor = MappingEditor::new(&settings.profile, &settings.layout);
+                    self.editor = MappingEditor::new(&self.settings.profile, &self.settings.layout);
                 }
-                self.settings = settings.clone();
             }
             GuiEvent::ProfileLoaded { document, path } => {
                 self.editor.load(document.clone(), path.clone())
@@ -171,7 +209,11 @@ impl BridgeApp {
             }
             GuiEvent::LocalDataReset(settings) => {
                 self.settings = settings.clone();
+                self.accepted_settings = settings.clone();
                 self.password.clear();
+                self.accepted_password.clear();
+                self.form_submissions.clear();
+                self.settings_loaded = true;
                 self.editor = MappingEditor::new(&settings.profile, &settings.layout);
                 self.confirm = None;
                 self.quit_dialog = false;
@@ -196,9 +238,40 @@ impl BridgeApp {
                 self.local_error = Some(error.clone());
                 self.quit_after_save = false;
                 self.pending_save = None;
+                self.form_submissions.clear();
             }
             _ => {}
         }
+    }
+    fn merge_loaded_settings(&mut self, incoming: &GuiSettings, baseline: &GuiSettings) {
+        // Apply service normalization only to fields that have not been edited
+        // since the submitted/loaded form. Late acknowledgments keep newer drafts.
+        macro_rules! merge {
+            ($($field:ident),+ $(,)?) => {$(
+                if self.settings.$field == baseline.$field {
+                    self.settings.$field.clone_from(&incoming.$field);
+                }
+            )+};
+        }
+        merge!(
+            schema_version,
+            env_file,
+            device_host,
+            device_port,
+            bind_address,
+            advertise_ip,
+            bridge_port,
+            allowed_ips,
+            layout,
+            profile,
+            backend,
+            mappings_file,
+            repeat_delay_ms,
+            repeat_interval_ms,
+            log_level,
+            remember_password
+        );
+        self.settings.credential_id = incoming.credential_id.clone();
     }
     /// Drain asynchronous decisions during `App::logic`, including while hidden.
     pub fn take_queued_actions(&mut self) -> Vec<GuiAction> {
@@ -230,32 +303,54 @@ impl BridgeApp {
                 let enabled = snapshot
                     .status
                     .as_ref()
-                    .is_some_and(|status| status.enabled);
+                    .is_some_and(|status| status.running && status.enabled)
+                    && snapshot.phase == GuiPhase::Running;
                 let connected = snapshot
                     .status
                     .as_ref()
-                    .is_some_and(|status| status.connected);
+                    .is_some_and(|status| status.running && status.connected)
+                    && snapshot.phase == GuiPhase::Running;
                 presentation::status(
                     ui,
                     if enabled {
                         "Input enabled"
-                    } else {
+                    } else if snapshot.phase == GuiPhase::Running {
                         "Input paused"
+                    } else {
+                        "Input disabled"
                     },
                     enabled,
                 );
                 presentation::status(
                     ui,
-                    if connected {
+                    if connected && snapshot.phase == GuiPhase::Running {
                         "C64 connected"
                     } else {
-                        "No C64 session"
+                        match snapshot.phase {
+                            GuiPhase::Idle => "Host stopped",
+                            GuiPhase::Starting => "Host starting",
+                            GuiPhase::Running => "Waiting for C64",
+                            GuiPhase::Stopping => "Host stopping",
+                        }
                     },
                     connected,
                 );
             });
         });
         ui.separator();
+        if let Some(error) = self.local_error.clone() {
+            presentation::card(ui, |ui| {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+                if ui.small_button("Dismiss error").clicked() {
+                    self.local_error = None;
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if !snapshot.message.is_empty() {
+            ui.label(&snapshot.message);
+            ui.add_space(6.0);
+        }
         if let Some(seconds) = snapshot.countdown {
             presentation::card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -359,17 +454,6 @@ impl BridgeApp {
                             Page::Diagnostics => self.diagnostics(ui, snapshot, &mut actions),
                             Page::Settings => self.settings_page(ui, snapshot, &mut actions),
                         }
-                        if !snapshot.message.is_empty() {
-                            ui.add_space(12.0);
-                            ui.label(&snapshot.message);
-                        }
-                        if let Some(error) = &self.local_error {
-                            ui.add_space(8.0);
-                            ui.colored_label(ui.visuals().error_fg_color, error);
-                            if ui.small_button("Dismiss").clicked() {
-                                self.local_error = None;
-                            }
-                        }
                     });
                 });
         });
@@ -393,7 +477,7 @@ impl BridgeApp {
                         .add_enabled(!snapshot.busy, egui::Button::new("Confirm"))
                         .clicked()
                     {
-                        actions.push(confirmation.action());
+                        actions.push(self.with_form(confirmation.action()));
                         dismiss = true;
                     }
                 });
@@ -424,6 +508,27 @@ impl BridgeApp {
         }
         actions.extend(self.take_queued_actions());
         for action in &actions {
+            if let GuiAction::SaveSettings { settings, password }
+            | GuiAction::ApplySettings { settings, password }
+            | GuiAction::Configured {
+                settings, password, ..
+            } = action
+            {
+                self.form_submissions.push_back(FormSubmission {
+                    settings: settings.clone(),
+                    password: password.clone(),
+                    configured: matches!(action, GuiAction::Configured { .. }),
+                });
+            }
+            if let GuiAction::ForgetPassword = action {
+                let mut settings = self.settings.clone();
+                settings.remember_password = false;
+                self.form_submissions.push_back(FormSubmission {
+                    settings,
+                    password: String::new(),
+                    configured: false,
+                });
+            }
             if let GuiAction::SaveProfile { document, .. } | GuiAction::ApplyProfile { document } =
                 action
             {
@@ -441,11 +546,20 @@ impl BridgeApp {
         presentation::heading(
             ui,
             "Connection",
-            "Host the C64 connection, then deliberately enable input when a scratch application is ready.",
+            "Enter the C64 address and password, check Device information, then start hosting. Enable input only when your target application is ready.",
         );
+        if !snapshot.configuration_warning.is_empty() {
+            ui.colored_label(ui.visuals().warn_fg_color, &snapshot.configuration_warning);
+            ui.add_space(8.0);
+        }
         presentation::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(format!("{:?}", snapshot.phase));
+                ui.heading(match snapshot.phase {
+                    GuiPhase::Idle => "Hosting stopped",
+                    GuiPhase::Starting => "Starting host",
+                    GuiPhase::Running => "Host listening",
+                    GuiPhase::Stopping => "Stopping host",
+                });
                 if snapshot.phase != GuiPhase::Idle {
                     ui.label(if snapshot.owned {
                         "GUI-owned session"
@@ -459,7 +573,11 @@ impl BridgeApp {
             }
             if let Some(status) = &snapshot.status {
                 ui.label(&status.detail);
+                if status.running && !status.connected {
+                    ui.label("Waiting for an authenticated keyboard client. Start host listens for the C64; it does not load or run its program.");
+                }
             }
+            ui.small("Start host uses this form and keeps input disabled. Start + deploy also resets the C64 after a fresh confirmation.");
             ui.horizontal_wrapped(|ui| {
                 let running = snapshot.phase == GuiPhase::Running;
                 if ui
@@ -469,10 +587,10 @@ impl BridgeApp {
                     )
                     .clicked()
                 {
-                    actions.push(GuiAction::Start {
+                    actions.push(self.with_form(GuiAction::Start {
                         deploy: false,
                         allow_reset: false,
-                    });
+                    }));
                 }
                 if ui
                     .add_enabled(
@@ -491,7 +609,7 @@ impl BridgeApp {
                 }
                 if ui
                     .add_enabled(
-                        running && snapshot.countdown.is_none() && !snapshot.busy,
+                        can_enable_input(snapshot) && !self.form_has_changes(),
                         egui::Button::new("Enable input in 5s"),
                     )
                     .clicked()
@@ -508,6 +626,17 @@ impl BridgeApp {
                     actions.push(GuiAction::Stop);
                 }
             });
+            if self.form_has_changes() {
+                ui.small("This form has unapplied changes. Apply settings before enabling input; a running GUI-owned host restarts with input disabled.");
+            }
+            if snapshot.phase == GuiPhase::Running
+                && !snapshot
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.connected)
+            {
+                ui.small("Input can be enabled after the C64 keyboard client authenticates. Device information only checks the REST connection.");
+            }
         });
         ui.add_space(12.0);
         presentation::card(ui, |ui| {
@@ -528,6 +657,7 @@ impl BridgeApp {
                     ui.add(egui::DragValue::new(&mut self.settings.bridge_port).range(1..=65535));
                     ui.end_row();
                 });
+            self.credentials(ui, actions);
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!snapshot.busy, egui::Button::new("Save settings"))
@@ -545,21 +675,25 @@ impl BridgeApp {
                     .add_enabled(!snapshot.busy, egui::Button::new("Device information"))
                     .clicked()
                 {
-                    actions.push(GuiAction::DeviceInfo);
+                    actions.push(self.with_form(GuiAction::DeviceInfo));
                 }
             });
             if snapshot.settings_pending {
-                ui.colored_label(ui.visuals().warn_fg_color, if snapshot.owned {"Settings are saved. Apply them to restart GUI-owned hosting with input disabled."} else {"Settings are pending for the CLI-owned session. Stop it explicitly before restarting with these settings."});
+                ui.colored_label(ui.visuals().warn_fg_color, if snapshot.owned {"Settings have changed. Apply them to restart GUI-owned hosting with input disabled."} else {"Settings are pending for the CLI-owned session. Stop it explicitly before restarting with these settings."});
             }
             ui.small("Connection changes may require redeploying the C64 program. Applying settings never deploys automatically.");
+            ui.small("Device information and Start use the form above immediately. Save settings remembers non-secret settings; Apply also restarts GUI-owned hosting with input disabled.");
             if let Some(device) = &snapshot.device {
                 ui.add_space(8.0);
+                ui.label(egui::RichText::new("Last successful REST device check").strong());
                 ui.label(format!(
                     "{} · firmware {} · FPGA {} · core {}",
                     device.product, device.firmware, device.fpga, device.core
                 ));
             }
         });
+        ui.add_space(12.0);
+        self.permission_controls(ui, snapshot, actions);
         ui.add_space(12.0);
         ui.collapsing("Deployment and networking probe", |ui| {
             ui.label(
@@ -601,6 +735,81 @@ impl BridgeApp {
             }
         }
     }
+    fn with_form(&self, action: GuiAction) -> GuiAction {
+        let operation = match action {
+            GuiAction::Start {
+                deploy,
+                allow_reset,
+            } => ConnectionOperation::Start {
+                deploy,
+                allow_reset,
+            },
+            GuiAction::DeviceInfo => ConnectionOperation::DeviceInfo,
+            GuiAction::Deploy { run, allow_reset } => {
+                ConnectionOperation::Deploy { run, allow_reset }
+            }
+            GuiAction::Probe { allow_reset } => ConnectionOperation::Probe { allow_reset },
+            GuiAction::Doctor => ConnectionOperation::Doctor,
+            GuiAction::RequestPermission => ConnectionOperation::RequestPermission,
+            GuiAction::TestInput => ConnectionOperation::TestInput,
+            other => return other,
+        };
+        GuiAction::Configured {
+            settings: self.settings.clone(),
+            password: self.password.clone(),
+            operation,
+        }
+    }
+    /// Window and tray controls must not enable an older configuration while
+    /// the user has a different connection/password draft on screen.
+    pub fn form_has_changes(&self) -> bool {
+        self.settings != self.accepted_settings || self.password != self.accepted_password
+    }
+    fn credentials(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+        ui.label("Network password");
+        ui.add_sized(
+            [350.0, ui.spacing().interact_size.y],
+            egui::TextEdit::singleline(&mut self.password)
+                .password(true)
+                .hint_text("Empty: use saved credential or imported environment"),
+        );
+        ui.checkbox(
+            &mut self.settings.remember_password,
+            "Remember in the operating system credential store",
+        );
+        ui.small("The password stays in memory unless Remember is selected and settings are explicitly saved or applied. No plaintext fallback.");
+        ui.small("An imported .env path must exist. Finder does not inherit your terminal's environment.");
+        if ui.button("Forget saved password").clicked() {
+            self.password.clear();
+            actions.push(GuiAction::ForgetPassword);
+        }
+    }
+    fn permission_controls(
+        &self,
+        ui: &mut egui::Ui,
+        snapshot: &GuiSnapshot,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !snapshot.busy,
+                    egui::Button::new("Check GUI input permission"),
+                )
+                .clicked()
+            {
+                actions.push(self.with_form(GuiAction::RequestPermission));
+            }
+            #[cfg(target_os = "macos")]
+            if ui.button("Open input permission settings").clicked() {
+                actions.push(GuiAction::OpenPermissionSettings);
+            }
+        });
+        #[cfg(target_os = "macos")]
+        ui.small("For GUI-owned input, allow C64 Keyboard Bridge in System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS). Permission granted to the CLI does not authorize this app. After changing permission, check it again here.");
+        #[cfg(not(target_os = "macos"))]
+        ui.small("This checks the GUI posting process. A separately started CLI session checks its own input permission when resumed.");
+    }
     fn diagnostics(
         &mut self,
         ui: &mut egui::Ui,
@@ -617,16 +826,7 @@ impl BridgeApp {
                 .add_enabled(!snapshot.busy, egui::Button::new("Run doctor"))
                 .clicked()
             {
-                actions.push(GuiAction::Doctor);
-            }
-            if ui
-                .add_enabled(
-                    !snapshot.busy,
-                    egui::Button::new("Check / request permission"),
-                )
-                .clicked()
-            {
-                actions.push(GuiAction::RequestPermission);
+                actions.push(self.with_form(GuiAction::Doctor));
             }
             if ui
                 .add_enabled(!snapshot.busy, egui::Button::new("Native input test…"))
@@ -635,6 +835,7 @@ impl BridgeApp {
                 self.confirm = Some(Confirm::InputTest);
             }
         });
+        self.permission_controls(ui, snapshot, actions);
         if let Some(backend) = &snapshot.backend {
             presentation::card(ui, |ui| {
                 ui.label(format!(
@@ -743,22 +944,8 @@ impl BridgeApp {
         );
         presentation::card(ui, |ui| {
             ui.heading("Credentials");
-            ui.label("Network password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.password)
-                    .password(true)
-                    .hint_text("Leave empty to use the existing environment / saved credential")
-                    .desired_width(350.0),
-            );
-            ui.checkbox(
-                &mut self.settings.remember_password,
-                "Remember in the operating system credential store",
-            );
-            ui.small("macOS Keychain · Windows Credential Manager · Linux Secret Service. No plaintext fallback.");
-            if ui.button("Forget saved password").clicked() {
-                self.password.clear();
-                actions.push(GuiAction::ForgetPassword);
-            }
+            self.credentials(ui, actions);
+            ui.small("macOS Keychain · Windows Credential Manager · Linux Secret Service.");
         });
         ui.add_space(12.0);
         egui::Grid::new("advanced-settings")
@@ -880,6 +1067,42 @@ impl BridgeApp {
         ui.label("Closing hides to the tray when available. Quit releases GUI-owned keys and waits for graceful cleanup.");
         ui.label("Pairing tokens are transmitted in plaintext on the LAN. Use a trusted network.");
     }
+}
+
+fn acknowledgment_matches(submitted: &GuiSettings, incoming: &GuiSettings) -> bool {
+    fn path_matches(submitted: &str, incoming: &str) -> bool {
+        submitted == incoming
+            || (!submitted.is_empty()
+                && Path::new(submitted).is_relative()
+                && Path::new(incoming).is_absolute()
+                && Path::new(incoming).ends_with(submitted))
+    }
+    if !path_matches(&submitted.env_file, &incoming.env_file)
+        || !path_matches(&submitted.mappings_file, &incoming.mappings_file)
+    {
+        return false;
+    }
+    let mut normalized = submitted.clone();
+    normalized.env_file.clone_from(&incoming.env_file);
+    normalized.mappings_file.clone_from(&incoming.mappings_file);
+    // A vault failure can preserve the previous Remember state; it does not
+    // change the accepted in-memory password. Empty references are initialized.
+    normalized.remember_password = incoming.remember_password;
+    if normalized.credential_id.is_empty() {
+        normalized.credential_id.clone_from(&incoming.credential_id);
+    }
+    normalized == *incoming
+}
+
+fn can_enable_input(snapshot: &GuiSnapshot) -> bool {
+    snapshot.phase == GuiPhase::Running
+        && snapshot
+            .status
+            .as_ref()
+            .is_some_and(|status| status.running && status.connected && !status.enabled)
+        && snapshot.countdown.is_none()
+        && !snapshot.busy
+        && !snapshot.settings_pending
 }
 
 #[cfg(test)]
@@ -1029,5 +1252,319 @@ mod tests {
         assert!(app.password.is_empty());
         assert!(!app.editor.is_dirty());
         assert!(app.editor.validated_document().is_ok());
+    }
+    #[test]
+    fn connection_operations_use_the_current_form_without_implicitly_saving() {
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.settings.device_host = "new-device.invalid".into();
+        app.settings.backend = "recording".into();
+        app.password = "IN_MEMORY_SENTINEL".into();
+        let operations = [
+            (
+                GuiAction::Start {
+                    deploy: false,
+                    allow_reset: false,
+                },
+                ConnectionOperation::Start {
+                    deploy: false,
+                    allow_reset: false,
+                },
+            ),
+            (GuiAction::DeviceInfo, ConnectionOperation::DeviceInfo),
+            (GuiAction::Doctor, ConnectionOperation::Doctor),
+            (
+                GuiAction::RequestPermission,
+                ConnectionOperation::RequestPermission,
+            ),
+            (GuiAction::TestInput, ConnectionOperation::TestInput),
+            (
+                Confirm::RunClient.action(),
+                ConnectionOperation::Deploy {
+                    run: true,
+                    allow_reset: true,
+                },
+            ),
+            (
+                Confirm::Probe.action(),
+                ConnectionOperation::Probe { allow_reset: true },
+            ),
+        ];
+        for (action, expected) in operations {
+            let GuiAction::Configured {
+                settings,
+                password,
+                operation,
+            } = app.with_form(action)
+            else {
+                panic!("Operation did not carry the current form")
+            };
+            assert_eq!(settings.device_host, "new-device.invalid");
+            assert_eq!(settings.backend, "recording");
+            assert_eq!(password, "IN_MEMORY_SENTINEL");
+            assert_eq!(operation, expected);
+        }
+        assert!(app.queued.is_empty());
+        assert!(matches!(
+            app.with_form(GuiAction::OpenPermissionSettings),
+            GuiAction::OpenPermissionSettings
+        ));
+    }
+    #[test]
+    fn connection_buttons_dispatch_current_draft_and_fresh_confirmed_reset() {
+        for (label, confirmation, expected) in [
+            (
+                "Start host",
+                None,
+                ConnectionOperation::Start {
+                    deploy: false,
+                    allow_reset: false,
+                },
+            ),
+            ("Device information", None, ConnectionOperation::DeviceInfo),
+            (
+                "Check GUI input permission",
+                None,
+                ConnectionOperation::RequestPermission,
+            ),
+            (
+                "Confirm",
+                Some(Confirm::RunClient),
+                ConnectionOperation::Deploy {
+                    run: true,
+                    allow_reset: true,
+                },
+            ),
+        ] {
+            let context = egui::Context::default();
+            let mut app = BridgeApp::new(GuiSettings::default());
+            app.settings.device_host = "edited-device.invalid".into();
+            app.password = "CURRENT_MEMORY_PASSWORD".into();
+            app.confirm = confirmation;
+            let mut center = None;
+            for _ in 0..3 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 1100.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert!(app.render(ui, &GuiSnapshot::default()).is_empty());
+                    },
+                );
+                center = output.shapes.iter().find_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        (text.galley.job.text == label)
+                            .then(|| text.visual_bounding_rect().center())
+                    } else {
+                        None
+                    }
+                });
+                output.textures_delta.clear();
+            }
+            let pos = center.unwrap_or_else(|| panic!("Button not rendered: {label}"));
+            let mut dispatched = Vec::new();
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 1100.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    dispatched = app.render(ui, &GuiSnapshot::default());
+                },
+            );
+            output.textures_delta.clear();
+            let [
+                GuiAction::Configured {
+                    settings,
+                    password,
+                    operation,
+                },
+            ] = dispatched.as_slice()
+            else {
+                panic!("Expected one configured operation from {label}")
+            };
+            assert_eq!(settings.device_host, "edited-device.invalid");
+            assert_eq!(password, "CURRENT_MEMORY_PASSWORD");
+            assert_eq!(*operation, expected);
+        }
+    }
+    #[test]
+    fn delayed_settings_acknowledgment_preserves_newer_form_edits() {
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.on_event(&GuiEvent::SettingsLoaded(GuiSettings::default()));
+        app.settings.device_host = "submitted.invalid".into();
+        app.form_submissions.push_back(FormSubmission {
+            settings: app.settings.clone(),
+            password: String::new(),
+            configured: false,
+        });
+        let mut submitted = app.settings.clone();
+        submitted.env_file = "/private/project/.env".into();
+        submitted.credential_id = "private-id".into();
+        app.settings.device_host = "newer.invalid".into();
+        app.settings.layout = "UK".into();
+        app.on_event(&GuiEvent::SettingsLoaded(submitted));
+        assert_eq!(app.settings.device_host, "newer.invalid");
+        assert_eq!(app.settings.layout, "UK");
+        assert_eq!(app.settings.env_file, "/private/project/.env");
+        assert_eq!(app.settings.credential_id, "private-id");
+    }
+    #[test]
+    fn ordered_acceptance_keeps_two_quick_submissions_and_newer_drafts_separate() {
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.on_event(&GuiEvent::SettingsLoaded(GuiSettings::default()));
+        let first = GuiSettings {
+            device_host: "first.invalid".into(),
+            ..Default::default()
+        };
+        let second = GuiSettings {
+            device_host: "second.invalid".into(),
+            ..Default::default()
+        };
+        for (settings, password) in [(&first, "FIRST_PASSWORD"), (&second, "SECOND_PASSWORD")] {
+            app.form_submissions.push_back(FormSubmission {
+                settings: settings.clone(),
+                password: password.into(),
+                configured: true,
+            });
+        }
+        app.settings = second.clone();
+        app.password = "SECOND_PASSWORD".into();
+        app.on_event(&GuiEvent::FormAccepted(first));
+        assert_eq!(app.settings.device_host, "second.invalid");
+        assert_eq!(app.accepted_password, "FIRST_PASSWORD");
+        assert!(app.form_has_changes());
+        app.on_event(&GuiEvent::FormAccepted(second));
+        assert_eq!(app.accepted_password, "SECOND_PASSWORD");
+        assert!(!app.form_has_changes());
+        assert!(app.form_submissions.is_empty());
+    }
+    #[test]
+    fn startup_and_failed_settings_cannot_accept_a_queued_password() {
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.password = "PENDING_PASSWORD".into();
+        app.form_submissions.push_back(FormSubmission {
+            settings: app.settings.clone(),
+            password: app.password.clone(),
+            configured: true,
+        });
+        app.on_event(&GuiEvent::SettingsLoaded(GuiSettings::default()));
+        assert!(app.accepted_password.is_empty());
+        assert!(app.form_has_changes());
+        assert_eq!(app.form_submissions.len(), 1);
+        app.on_event(&GuiEvent::Error("Configuration validation failed".into()));
+        assert!(app.accepted_password.is_empty());
+        assert!(app.form_submissions.is_empty());
+        assert!(app.form_has_changes());
+        // An unassociated later acknowledgment fails closed for the password.
+        app.on_event(&GuiEvent::FormAccepted(app.settings.clone()));
+        assert!(app.form_has_changes());
+    }
+    #[test]
+    fn password_only_submissions_are_accepted_in_order() {
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.on_event(&GuiEvent::SettingsLoaded(GuiSettings::default()));
+        for password in ["FIRST_PASSWORD", "SECOND_PASSWORD"] {
+            app.form_submissions.push_back(FormSubmission {
+                settings: app.settings.clone(),
+                password: password.into(),
+                configured: true,
+            });
+        }
+        app.password = "SECOND_PASSWORD".into();
+        app.on_event(&GuiEvent::FormAccepted(app.settings.clone()));
+        assert_eq!(app.accepted_password, "FIRST_PASSWORD");
+        assert!(app.form_has_changes());
+        app.on_event(&GuiEvent::FormAccepted(app.settings.clone()));
+        assert_eq!(app.accepted_password, "SECOND_PASSWORD");
+        assert!(!app.form_has_changes());
+    }
+    #[test]
+    fn enabling_requires_an_authenticated_active_session_and_no_pending_change() {
+        let mut snapshot = GuiSnapshot {
+            phase: GuiPhase::Running,
+            status: Some(bridge_host::control::Status::default()),
+            ..Default::default()
+        };
+        assert!(!can_enable_input(&snapshot));
+        snapshot.status.as_mut().unwrap().connected = true;
+        assert!(can_enable_input(&snapshot));
+        snapshot.settings_pending = true;
+        assert!(!can_enable_input(&snapshot));
+        snapshot.settings_pending = false;
+        snapshot.status.as_mut().unwrap().enabled = true;
+        assert!(!can_enable_input(&snapshot));
+        snapshot.status.as_mut().unwrap().enabled = false;
+        snapshot.countdown = Some(5);
+        assert!(!can_enable_input(&snapshot));
+    }
+    #[test]
+    fn asynchronous_errors_stay_visible_above_the_page_and_password_is_masked() {
+        let context = egui::Context::default();
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.password = "SENTINEL_NEVER_RENDER".into();
+        app.on_event(&GuiEvent::Error(
+            "Device information failed: check the address and password".into(),
+        ));
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                assert!(app.render(ui, &GuiSnapshot::default()).is_empty());
+            },
+        );
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    Some((
+                        text.galley.job.text.as_str(),
+                        text.visual_bounding_rect().center(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let error = texts
+            .iter()
+            .find(|(text, _)| text.starts_with("Device information failed"))
+            .unwrap();
+        assert!(error.1.y < 150.0);
+        assert!(texts.iter().any(|(text, _)| *text == "Host stopped"));
+        assert!(texts.iter().any(|(text, _)| *text == "Input disabled"));
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _)| text.contains("SENTINEL_NEVER_RENDER"))
+        );
+        output.textures_delta.clear();
     }
 }

@@ -121,6 +121,8 @@ struct NativeApp {
     sender: mpsc::Sender<NativeEvent>,
     tray: Option<Tray>,
     #[cfg(target_os = "macos")]
+    mac_main_thread: Option<bridge_host::backend::MacOsMainThreadContext>,
+    #[cfg(target_os = "macos")]
     quit_menu: Option<macos::QuitMenu>,
     #[cfg(target_os = "macos")]
     menu_smoke_stage: u8,
@@ -152,6 +154,8 @@ impl NativeApp {
         evidence: Arc<Mutex<SmokeEvidence>>,
     ) -> Result<Self> {
         let (sender, events) = mpsc::channel();
+        #[cfg(target_os = "macos")]
+        let mac_main_thread = bridge_host::backend::MacOsMainThreadContext::install()?;
         let context = cc.egui_ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || context.request_repaint());
         let service =
@@ -199,6 +203,8 @@ impl NativeApp {
             events,
             sender,
             tray,
+            #[cfg(target_os = "macos")]
+            mac_main_thread: Some(mac_main_thread),
             #[cfg(target_os = "macos")]
             quit_menu: Some(quit_menu),
             #[cfg(target_os = "macos")]
@@ -251,7 +257,17 @@ impl NativeApp {
         match event {
             TrayEvent::Open => self.show(ctx),
             TrayEvent::Pause => self.dispatch(GuiAction::Pause, ctx),
-            TrayEvent::Enable => self.dispatch(GuiAction::Enable, ctx),
+            TrayEvent::Enable => {
+                if self.app.form_has_changes() {
+                    self.dispatch(GuiAction::CancelCountdown, ctx);
+                    self.app.on_event(&GuiEvent::Error(
+                        "Apply settings before enabling input".into(),
+                    ));
+                    self.show(ctx);
+                } else {
+                    self.dispatch(GuiAction::Enable, ctx);
+                }
+            }
             TrayEvent::Stop => self.dispatch(GuiAction::Stop, ctx),
             TrayEvent::Quit => self.quit(ctx),
             TrayEvent::Available(available) => {
@@ -336,6 +352,8 @@ impl NativeApp {
             self.service_joined = true;
         }
         self.activation.take();
+        #[cfg(target_os = "macos")]
+        self.mac_main_thread.take();
         #[cfg(target_os = "macos")]
         if self.quit_menu.take().is_some() && self.smoke {
             let restored = macos::termination_hook_restored();

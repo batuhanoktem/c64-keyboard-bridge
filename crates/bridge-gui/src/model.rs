@@ -95,12 +95,18 @@ pub struct GuiSnapshot {
     pub message: String,
     pub quit_ready: bool,
     pub settings_pending: bool,
+    pub configuration_warning: String,
     pub busy: bool,
     pub tray_available: bool,
 }
 // Password-bearing commands deliberately have no Debug or Serialize implementation.
 #[derive(Clone)]
 pub enum GuiAction {
+    Configured {
+        settings: GuiSettings,
+        password: String,
+        operation: ConnectionOperation,
+    },
     Start {
         deploy: bool,
         allow_reset: bool,
@@ -127,6 +133,7 @@ pub enum GuiAction {
     },
     Doctor,
     RequestPermission,
+    OpenPermissionSettings,
     RotatePairing,
     TestInput,
     ImportProfile(PathBuf),
@@ -150,10 +157,21 @@ pub enum GuiAction {
     TrayAvailable(bool),
     Quit,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionOperation {
+    Start { deploy: bool, allow_reset: bool },
+    DeviceInfo,
+    Deploy { run: bool, allow_reset: bool },
+    Probe { allow_reset: bool },
+    Doctor,
+    RequestPermission,
+    TestInput,
+}
 #[derive(Clone, Debug)]
 pub enum GuiEvent {
     Snapshot(Box<GuiSnapshot>),
     SettingsLoaded(GuiSettings),
+    FormAccepted(GuiSettings),
     ProfileLoaded {
         document: MappingDocument,
         path: PathBuf,
