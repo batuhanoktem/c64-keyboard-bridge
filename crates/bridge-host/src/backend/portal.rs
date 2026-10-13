@@ -79,6 +79,8 @@ enum Failure {
     Consent,
     Unsupported,
     Layout,
+    LayoutMismatch,
+    LayoutMetadata,
     Revoked,
     Transport,
     Protocol,
@@ -96,7 +98,13 @@ impl Failure {
                 "GNOME Wayland RemoteDesktop version 2 with keyboard/EIS support is required"
             }
             Self::Layout => {
-                "Desktop keyboard layout cannot be verified as the configured standard US/UK layout; input remains disabled"
+                "Active desktop keyboard map is not standard US/UK; select the configured standard layout and enable again"
+            }
+            Self::LayoutMismatch => {
+                "Active desktop keyboard layout differs from the configured US/UK layout; select the matching input source and enable again"
+            }
+            Self::LayoutMetadata => {
+                "The compositor did not provide usable keyboard map/group metadata; input remains disabled"
             }
             Self::Revoked => {
                 "Desktop keyboard session paused or revoked; release C64 keys and explicitly enable again"
@@ -110,7 +118,9 @@ impl Failure {
         };
         match self {
             Self::Consent => BackendError::PermissionDenied(text.into()),
-            Self::Layout | Self::Unsupported => BackendError::Unsupported(text.into()),
+            Self::Layout | Self::LayoutMismatch | Self::LayoutMetadata | Self::Unsupported => {
+                BackendError::Unsupported(text.into())
+            }
             _ => BackendError::Unavailable(text.into()),
         }
     }
@@ -210,7 +220,7 @@ struct PortalSession {
 }
 impl PortalSession {
     async fn close(&mut self) -> bool {
-        let session_closed = if let Some(session) = self.session.take() {
+        let session_closed = if let Some(session) = self.session.as_ref() {
             matches!(
                 timeout(OPERATION_TIMEOUT, session.close()).await,
                 Ok(Ok(()))
@@ -222,7 +232,19 @@ impl PortalSession {
             timeout(OPERATION_TIMEOUT, self.bus.clone().close()).await,
             Ok(Ok(()))
         );
+        if session_closed || bus_closed {
+            self.session.take();
+        }
         session_closed || bus_closed
+    }
+}
+
+trait CloseAuthority {
+    async fn close(&mut self) -> bool;
+}
+impl CloseAuthority for PortalSession {
+    async fn close(&mut self) -> bool {
+        PortalSession::close(self).await
     }
 }
 
@@ -331,6 +353,7 @@ pub(super) async fn prepare(
     }
     let (commands, receiver) = mpsc::channel(COMMAND_QUEUE);
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let (abort_output, failure_rx) = watch::channel(None);
     let (ready_tx, ready_rx) = oneshot::channel();
     let health = Arc::new(Mutex::new(Health::default()));
     let actor_health = health.clone();
@@ -344,7 +367,10 @@ pub(super) async fn prepare(
                 Ok(runtime) => runtime.block_on(run_actor(
                     layout,
                     cancellation,
-                    shutdown_rx,
+                    ActorControls {
+                        shutdown: shutdown_rx,
+                        failure: failure_rx,
+                    },
                     receiver,
                     ready_tx,
                     actor_health,
@@ -358,6 +384,7 @@ pub(super) async fn prepare(
     let backend = PortalBackend {
         commands,
         shutdown,
+        abort_output,
         thread: Some(thread),
         health,
         held: Vec::new(),
@@ -372,11 +399,16 @@ pub(super) async fn prepare(
 struct PortalBackend {
     commands: mpsc::Sender<Command>,
     shutdown: watch::Sender<bool>,
+    abort_output: watch::Sender<Option<Failure>>,
     thread: Option<thread::JoinHandle<()>>,
     health: SharedHealth,
     held: Vec<NativeKey>,
 }
 impl PortalBackend {
+    fn fail_output(&self, failure: Failure) {
+        self.health.lock().unwrap().failure.get_or_insert(failure);
+        let _ = self.abort_output.send(Some(failure));
+    }
     fn operation(&self, operation: Operation) -> Result<(), BackendError> {
         let (reply, response) = sync_mpsc::channel();
         self.commands
@@ -386,13 +418,13 @@ impl PortalBackend {
                     mpsc::error::TrySendError::Full(_) => Failure::Overflow,
                     _ => Failure::Transport,
                 };
-                let _ = self.shutdown.send(true);
+                self.fail_output(failure);
                 failure.error()
             })?;
         response
             .recv_timeout(OPERATION_TIMEOUT + Duration::from_millis(100))
             .map_err(|_| {
-                let _ = self.shutdown.send(true);
+                self.fail_output(Failure::Timeout);
                 Failure::Timeout.error()
             })?
             .map_err(Failure::error)
@@ -415,10 +447,10 @@ impl KeyboardBackend for PortalBackend {
         self.operation(Operation::Validate)
     }
     fn press(&mut self, key: NativeKey) -> Result<(), BackendError> {
+        self.validate_layout()?;
         if self.held.contains(&key) {
             return Ok(());
         }
-        self.validate_layout()?;
         // Retain ambiguous write ownership until release or confirmed removal.
         self.held.push(key);
         self.operation(Operation::Press(key))
@@ -427,8 +459,14 @@ impl KeyboardBackend for PortalBackend {
         if !self.held.contains(&key) {
             return Ok(());
         }
-        if !self.health.lock().unwrap().neutralized {
-            self.operation(Operation::Release(key))?;
+        let neutralized = self.health.lock().unwrap().neutralized;
+        if !neutralized && let Err(error) = self.operation(Operation::Release(key)) {
+            // A prior cleanup retry may have confirmed every output and
+            // ended the actor while this release was queued. Its receipt
+            // applies to this backend generation, so that evidence wins.
+            if !self.health.lock().unwrap().neutralized {
+                return Err(error);
+            }
         }
         self.held.retain(|held| *held != key);
         Ok(())
@@ -637,14 +675,17 @@ impl State {
         if !data.resumed {
             return Err(Failure::Revoked);
         }
-        let layouts = data.layouts.as_ref().ok_or(Failure::Layout)?;
+        let layouts = data.layouts.as_ref().ok_or(Failure::LayoutMetadata)?;
         let group = match data.group {
             Some(group) => group as usize,
             None if layouts.len() == 1 => 0,
-            None => return Err(Failure::Layout),
+            None => return Err(Failure::LayoutMetadata),
         };
-        if layouts.get(group) != Some(&Some(self.expected)) {
-            return Err(Failure::Layout);
+        match layouts.get(group) {
+            Some(Some(layout)) if *layout == self.expected => {}
+            Some(Some(_)) => return Err(Failure::LayoutMismatch),
+            Some(None) => return Err(Failure::Layout),
+            None => return Err(Failure::LayoutMetadata),
         }
         Ok(())
     }
@@ -806,10 +847,99 @@ async fn ready_state(
     Ok((state, events))
 }
 
+struct ActorControls {
+    shutdown: watch::Receiver<bool>,
+    failure: watch::Receiver<Option<Failure>>,
+}
+
+async fn cleanup_once(
+    state: &mut State,
+    context: &ei::Context,
+    events: &mut EiEventStream,
+    authority: &mut impl CloseAuthority,
+) -> bool {
+    let released = if state.revoked {
+        true
+    } else {
+        match state.cleanup() {
+            Ok(()) => sync(state, context, events).await.is_ok(),
+            Err(_) => false,
+        }
+    };
+    // A completed roundtrip proves that every preceding release frame was
+    // applied. Publish that evidence before potentially slow session teardown.
+    if released {
+        return true;
+    }
+    authority.close().await
+}
+
+/// Failed output remains release-only while ownership is uncertain. Later
+/// Pause/Stop cleanup can retry the same resources; no new press is admitted.
+async fn recover_cleanup(
+    state: &mut State,
+    context: &ei::Context,
+    events: &mut EiEventStream,
+    authority: &mut impl CloseAuthority,
+    commands: &mut mpsc::Receiver<Command>,
+    shutdown: &mut watch::Receiver<bool>,
+    health: &SharedHealth,
+) -> bool {
+    let mut neutralized = cleanup_once(state, context, events, authority).await;
+    health.lock().unwrap().ready = false;
+    if *shutdown.borrow() {
+        // If disposal happened during the initial attempt, it already served
+        // as the final bounded cleanup before resource destruction.
+        health.lock().unwrap().neutralized = neutralized;
+        return neutralized;
+    }
+    loop {
+        health.lock().unwrap().neutralized = neutralized;
+        if neutralized {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = cancelled(shutdown) => {
+                // Explicit backend disposal gets a final bounded attempt, then
+                // owned socket/bus destructors run. Never claim uncertain keys
+                // were released and never abort the actor runtime.
+                neutralized = cleanup_once(state, context, events, authority).await;
+                health.lock().unwrap().neutralized = neutralized;
+                return neutralized;
+            },
+            command = commands.recv() => {
+                let Some(command) = command else { return false; };
+                let result = match command.operation {
+                    Operation::Release(_) => {
+                        neutralized = cleanup_once(state, context, events, authority).await;
+                        if neutralized { Ok(()) } else { Err(Failure::Transport) }
+                    },
+                    Operation::Validate | Operation::Press(_) => Err(health.lock().unwrap().failure.unwrap_or(Failure::Revoked)),
+                };
+                health.lock().unwrap().neutralized = neutralized;
+                let _ = command.reply.send(result);
+            },
+            event = events.next() => {
+                if let Ok(event) = parse_event(event) {
+                    let _ = state.handle(event);
+                    if state.revoked {
+                        neutralized = true;
+                    }
+                } else {
+                    // An EOF cannot acknowledge release. Avoid a hot loop on
+                    // a dead stream while leaving explicit cleanup retryable.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        }
+    }
+}
+
 async fn run_actor(
     layout: KeyboardLayout,
     mut cancellation: watch::Receiver<bool>,
-    mut shutdown: watch::Receiver<bool>,
+    mut controls: ActorControls,
     mut commands: mpsc::Receiver<Command>,
     ready: oneshot::Sender<Result<(), Failure>>,
     health: SharedHealth,
@@ -817,7 +947,7 @@ async fn run_actor(
     // Merge cancellation sources without dropping an in-flight authorize
     // future: it must close its Session and private bus before returning.
     let (cancel_tx, mut preparation_cancel) = watch::channel(false);
-    let mut shutdown_during_setup = shutdown.clone();
+    let mut shutdown_during_setup = controls.shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
             biased;
@@ -884,7 +1014,8 @@ async fn run_actor(
     let failure = loop {
         tokio::select! {
             biased;
-            _ = cancelled(&mut shutdown) => break None,
+            _ = cancelled(&mut controls.shutdown) => break None,
+            _ = controls.failure.changed() => break Some(controls.failure.borrow().unwrap_or(Failure::Transport)),
             _ = closed.next() => break Some(Failure::Revoked),
             event = events.next() => {
                 let result = parse_event(event).and_then(|event| state.handle(event).map(|_| ()));
@@ -907,24 +1038,28 @@ async fn run_actor(
     };
     drop(closed);
     if let Some(error) = failure {
-        health.lock().unwrap().failure = Some(error);
+        health.lock().unwrap().failure.get_or_insert(error);
     }
-    let cleanup = if state.revoked {
-        true
-    } else {
-        match state.cleanup() {
-            Ok(()) => sync(&mut state, &context, &mut events).await.is_ok(),
-            Err(_) => false,
-        }
-    };
+    let neutralized = recover_cleanup(
+        &mut state,
+        &context,
+        &mut events,
+        &mut owner,
+        &mut commands,
+        &mut controls.shutdown,
+        &health,
+    )
+    .await;
     if state.connection.is_alive() {
         state.connection.disconnect();
         let _ = flush(&context).await;
     }
-    let closed = owner.close().await;
+    // Session disposal must complete before joining, but it cannot delay a
+    // release acknowledgment already established by the EIS roundtrip.
+    let _ = owner.close().await;
     let mut final_health = health.lock().unwrap();
     final_health.ready = false;
-    final_health.neutralized = cleanup || closed;
+    final_health.neutralized = neutralized;
 }
 
 fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<Option<KeyboardLayout>>, Failure> {
@@ -948,6 +1083,12 @@ fn fingerprint_keymap(bytes: &[u8]) -> Result<Vec<Option<KeyboardLayout>>, Failu
         || bytes.len() > MAX_KEYMAP_BYTES
         || bytes[..bytes.len().saturating_sub(1)].contains(&0)
     {
+        return Err(Failure::Protocol);
+    }
+    // EIS implementations may count the C-string terminator in their memfd
+    // size. Compile the same text whether that final NUL is present or absent.
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    if bytes.is_empty() {
         return Err(Failure::Protocol);
     }
     let xkb = xkbcommon_dl::xkbcommon_option().ok_or(Failure::Unsupported)?;
@@ -1123,6 +1264,12 @@ mod tests {
             fingerprint_keymap(&keymap("us,gb", ",")).unwrap(),
             [Some(KeyboardLayout::Us), Some(KeyboardLayout::Uk)]
         );
+        let mut nul_terminated = keymap("us,gb", ",");
+        nul_terminated.push(0);
+        assert_eq!(
+            fingerprint_keymap(&nul_terminated).unwrap(),
+            [Some(KeyboardLayout::Us), Some(KeyboardLayout::Uk)]
+        );
     }
 
     #[test]
@@ -1188,6 +1335,7 @@ mod tests {
         Group(u32),
         Pause,
         Stall,
+        Resume,
         PauseSibling,
         InvalidObject,
     }
@@ -1312,6 +1460,7 @@ mod tests {
                             }
                             Control::Pause => device.as_ref().unwrap().paused(4),
                             Control::Stall => stalled = true,
+                            Control::Resume => stalled = false,
                             Control::PauseSibling => sibling_device.as_ref().unwrap().paused(4),
                             Control::InvalidObject => {
                                 connection.as_ref().unwrap().invalid_object(4, 999)
@@ -1385,7 +1534,7 @@ mod tests {
         let unverified = Fixture::new(keymap("us,gb", ","), None);
         assert!(matches!(
             ready_state(&unverified.context, KeyboardLayout::Us).await,
-            Err(Failure::Layout)
+            Err(Failure::LayoutMetadata)
         ));
         let fixture = Fixture::new(keymap("us,gb", ","), Some(0));
         let (mut state, mut events) = ready_state(&fixture.context, KeyboardLayout::Us)
@@ -1398,7 +1547,7 @@ mod tests {
         fixture.control.send(Control::Group(1)).unwrap();
         assert_eq!(
             state.handle(parse_event(events.next().await).unwrap()),
-            Err(Failure::Layout)
+            Err(Failure::LayoutMismatch)
         );
         // Layout failure does not prevent exact held-code cleanup.
         state.cleanup().unwrap();
@@ -1510,5 +1659,287 @@ mod tests {
         );
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(state.held, [(NativeKey::A, 30)]);
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_retains_release_channel_and_recovers_without_new_presses() {
+        struct NeverCloses;
+        impl CloseAuthority for NeverCloses {
+            async fn close(&mut self) -> bool {
+                false
+            }
+        }
+        async fn response(
+            receiver: sync_mpsc::Receiver<Result<(), Failure>>,
+        ) -> Result<(), Failure> {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    match receiver.try_recv() {
+                        Ok(result) => return result,
+                        Err(sync_mpsc::TryRecvError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await
+                        }
+                        Err(_) => panic!("Cleanup actor reply channel disappeared"),
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let fixture = Fixture::new(keymap("us", ""), Some(0));
+        let (mut state, mut events) = ready_state(&fixture.context, KeyboardLayout::Us)
+            .await
+            .unwrap();
+        state.emit(NativeKey::LeftShift, true).unwrap();
+        state.emit(NativeKey::A, true).unwrap();
+        sync(&mut state, &fixture.context, &mut events)
+            .await
+            .unwrap();
+        fixture.control.send(Control::Stall).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let health = Arc::new(Mutex::new(Health {
+            failure: Some(Failure::Timeout),
+            ready: true,
+            neutralized: false,
+        }));
+        let (commands, mut receiver) = mpsc::channel(COMMAND_QUEUE);
+        let (_stop, mut shutdown) = watch::channel(false);
+        let mut authority = NeverCloses;
+        let repair = recover_cleanup(
+            &mut state,
+            &fixture.context,
+            &mut events,
+            &mut authority,
+            &mut receiver,
+            &mut shutdown,
+            &health,
+        );
+        let retry = async {
+            tokio::time::sleep(OPERATION_TIMEOUT + Duration::from_millis(50)).await;
+            assert!(!health.lock().unwrap().neutralized);
+            let (reply, answered) = sync_mpsc::channel();
+            commands
+                .send(Command {
+                    operation: Operation::Press(NativeKey::B),
+                    reply,
+                })
+                .await
+                .unwrap();
+            assert_eq!(response(answered).await, Err(Failure::Timeout));
+            fixture.control.send(Control::Resume).unwrap();
+            let (reply, answered) = sync_mpsc::channel();
+            commands
+                .send(Command {
+                    operation: Operation::Release(NativeKey::A),
+                    reply,
+                })
+                .await
+                .unwrap();
+            assert_eq!(response(answered).await, Ok(()));
+        };
+        let (neutralized, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(repair, retry)
+        })
+        .await
+        .unwrap();
+        assert!(neutralized && health.lock().unwrap().neutralized);
+        assert_eq!(health.lock().unwrap().failure, Some(Failure::Timeout));
+        let recording = fixture.recording.lock().unwrap();
+        assert!(!recording.contains(&Wire::Key(48, true)));
+        assert!(recording.ends_with(&[
+            Wire::Key(30, false),
+            Wire::Frame,
+            Wire::Key(42, false),
+            Wire::Frame,
+            Wire::Stop
+        ]));
+    }
+
+    #[tokio::test]
+    async fn wrapper_timeout_keeps_cleanup_retryable_and_drop_joins_delayed_actor() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DelayedFailedClose;
+        impl CloseAuthority for DelayedFailedClose {
+            async fn close(&mut self) -> bool {
+                tokio::time::sleep(OPERATION_TIMEOUT + Duration::from_millis(150)).await;
+                false
+            }
+        }
+        let fixture = Fixture::new(keymap("us", ""), Some(0));
+        let context = fixture.context.clone();
+        let control = fixture.control.clone();
+        let health = Arc::new(Mutex::new(Health {
+            failure: Some(Failure::Timeout),
+            ready: true,
+            neutralized: false,
+        }));
+        let actor_health = health.clone();
+        let (commands, mut receiver) = mpsc::channel(COMMAND_QUEUE);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let (abort_output, _abort_rx) = watch::channel(None);
+        let (ready, initialized) = oneshot::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let actor_finished = finished.clone();
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (mut state, mut events) =
+                    ready_state(&context, KeyboardLayout::Us).await.unwrap();
+                state.emit(NativeKey::LeftShift, true).unwrap();
+                state.emit(NativeKey::A, true).unwrap();
+                sync(&mut state, &context, &mut events).await.unwrap();
+                control.send(Control::Stall).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ready.send(()).unwrap();
+                let mut authority = DelayedFailedClose;
+                assert!(
+                    recover_cleanup(
+                        &mut state,
+                        &context,
+                        &mut events,
+                        &mut authority,
+                        &mut receiver,
+                        &mut shutdown_rx,
+                        &actor_health
+                    )
+                    .await
+                );
+                actor_finished.store(true, Ordering::SeqCst);
+            });
+        });
+        let mut backend = PortalBackend {
+            commands,
+            shutdown,
+            abort_output,
+            thread: Some(thread),
+            health: health.clone(),
+            held: vec![NativeKey::LeftShift, NativeKey::A],
+        };
+        initialized.await.unwrap();
+        assert!(backend.press(NativeKey::LeftShift).is_err());
+        assert!(backend.press(NativeKey::B).is_err());
+        assert!(backend.release(NativeKey::A).is_err());
+        assert!(backend.held.contains(&NativeKey::A));
+        assert!(!health.lock().unwrap().neutralized);
+        assert!(!*backend.shutdown.borrow());
+        fixture.control.send(Control::Resume).unwrap();
+        backend.release(NativeKey::A).unwrap();
+        backend.release(NativeKey::LeftShift).unwrap();
+        assert!(backend.held.is_empty() && health.lock().unwrap().neutralized);
+        drop(backend);
+        assert!(finished.load(Ordering::SeqCst));
+        assert_eq!(health.lock().unwrap().failure, Some(Failure::Timeout));
+        assert!(
+            !fixture
+                .recording
+                .lock()
+                .unwrap()
+                .contains(&Wire::Key(48, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_joins_uncertain_cleanup_without_claiming_neutral_ownership() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DelayedFailedClose {
+            attempts: Arc<AtomicUsize>,
+            initial: Option<oneshot::Sender<()>>,
+        }
+        impl CloseAuthority for DelayedFailedClose {
+            async fn close(&mut self) -> bool {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(OPERATION_TIMEOUT + Duration::from_millis(150)).await;
+                if let Some(initial) = self.initial.take() {
+                    let _ = initial.send(());
+                }
+                false
+            }
+        }
+        let fixture = Fixture::new(keymap("us", ""), Some(0));
+        let context = fixture.context.clone();
+        let control = fixture.control.clone();
+        let health = Arc::new(Mutex::new(Health {
+            failure: Some(Failure::Timeout),
+            ready: false,
+            neutralized: false,
+        }));
+        let actor_health = health.clone();
+        let (commands, mut receiver) = mpsc::channel(COMMAND_QUEUE);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let (abort_output, _abort_rx) = watch::channel(None);
+        let (initial, attempted) = oneshot::channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let actor_attempts = attempts.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let actor_finished = finished.clone();
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (mut state, mut events) =
+                    ready_state(&context, KeyboardLayout::Us).await.unwrap();
+                state.emit(NativeKey::LeftShift, true).unwrap();
+                state.emit(NativeKey::A, true).unwrap();
+                sync(&mut state, &context, &mut events).await.unwrap();
+                control.send(Control::Stall).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let mut authority = DelayedFailedClose {
+                    attempts: actor_attempts,
+                    initial: Some(initial),
+                };
+                assert!(
+                    !recover_cleanup(
+                        &mut state,
+                        &context,
+                        &mut events,
+                        &mut authority,
+                        &mut receiver,
+                        &mut shutdown_rx,
+                        &actor_health
+                    )
+                    .await
+                );
+                actor_finished.store(true, Ordering::SeqCst);
+            });
+        });
+        let mut backend = PortalBackend {
+            commands,
+            shutdown,
+            abort_output,
+            thread: Some(thread),
+            health: health.clone(),
+            held: vec![NativeKey::LeftShift, NativeKey::A],
+        };
+        timeout(Duration::from_secs(3), attempted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!health.lock().unwrap().neutralized);
+        // Synchronize with the release-only loop, rather than racing Drop
+        // against the end of its initial failed cleanup attempt.
+        assert!(backend.operation(Operation::Validate).is_err());
+        assert!(backend.press(NativeKey::LeftShift).is_err());
+        assert!(backend.press(NativeKey::B).is_err());
+        let start = Instant::now();
+        drop(backend);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert!(!health.lock().unwrap().neutralized);
+        assert_eq!(health.lock().unwrap().failure, Some(Failure::Timeout));
+        let recording = fixture.recording.lock().unwrap();
+        assert_eq!(
+            recording
+                .iter()
+                .filter(|event| **event == Wire::Key(30, true))
+                .count(),
+            1
+        );
+        assert!(!recording.contains(&Wire::Key(48, true)));
     }
 }
