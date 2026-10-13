@@ -1347,6 +1347,8 @@ async fn probe_read(
     stage: &str,
     timeout: Duration,
 ) -> Result<()> {
+    let began = Instant::now();
+    let mut failure_kind = "transport";
     let read = async {
         let mut received = 0;
         while received < bytes.len() {
@@ -1355,6 +1357,7 @@ async fn probe_read(
                 .await
                 .with_context(|| format!("Probe read failed during {stage}"))?;
             if count == 0 {
+                failure_kind = "closed";
                 bail!(
                     "C64 disconnected during {stage} ({received}/{} bytes)",
                     bytes.len()
@@ -1364,11 +1367,24 @@ async fn probe_read(
         }
         Ok::<_, anyhow::Error>(())
     };
-    tokio::time::timeout(timeout, read)
-        .await
-        .with_context(|| format!("Probe timed out during {stage}"))??;
-    tracing::info!(stage, bytes = bytes.len(), "Probe stage received");
-    Ok(())
+    let result = match tokio::time::timeout(timeout, read).await {
+        Ok(result) => result,
+        Err(error) => {
+            failure_kind = "timeout";
+            Err(anyhow::Error::new(error).context(format!("Probe timed out during {stage}")))
+        }
+    };
+    let stage_elapsed_ms = began.elapsed().as_millis() as u64;
+    match &result {
+        Ok(()) => tracing::info!(stage, stage_elapsed_ms, "Probe stage received"),
+        Err(_) => tracing::warn!(
+            stage,
+            stage_elapsed_ms,
+            failure_kind,
+            "Probe read stage failed"
+        ),
+    }
+    result
 }
 fn probe_observations(bytes: &[u8; 97]) -> Result<serde_json::Value> {
     if &bytes[..3] != b"PB\x01" || bytes[3] != 31 || bytes[9] > 22 {
@@ -1403,106 +1419,161 @@ pub async fn hardware_probe(
     token: Token,
     device: &DeviceInfo,
 ) -> Result<serde_json::Value> {
-    let (mut socket, peer) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
-        .await
-        .context("No probe connection within 30 seconds; inspect the C64 display")??;
-    if !matches!(peer.ip(),std::net::IpAddr::V4(ip) if network.allowed_ips.contains(&ip)) {
-        bail!("Probe peer is outside C64 allowlist");
-    }
-    socket.set_nodelay(true)?;
-    // Read exactly one HELLO so subsequent raw probe bytes remain in the socket.
-    let mut header = [0; 8];
-    probe_read(
-        &mut socket,
-        &mut header,
-        "HELLO header",
-        Duration::from_secs(5),
-    )
-    .await?;
-    let length = u16::from_le_bytes([header[4], header[5]]) as usize;
-    if length > 64 {
-        bail!("Invalid probe HELLO");
-    }
-    let mut bytes = header.to_vec();
-    bytes.resize(8 + length, 0);
-    probe_read(
-        &mut socket,
-        &mut bytes[8..],
-        "HELLO payload",
-        Duration::from_secs(5),
-    )
-    .await?;
-    let frames = Decoder::new().push(&bytes)?;
-    let frame = frames.first().context("Incomplete probe HELLO")?;
-    let Message::Hello {
-        token: offered,
-        capabilities,
-        ..
-    } = &frame.message
-    else {
-        bail!("Probe omitted HELLO");
-    };
-    if frame.sequence != 0 || !token.matches(offered) || capabilities & 2 == 0 {
-        bail!("Probe authentication/capability failed");
-    }
-    write_frame(
-        &mut socket,
-        &mut Sequencer::new(),
-        Message::HelloAck { enabled: false },
-    )
-    .await?;
-    tracing::info!("Probe authenticated; HELLO_ACK sent without enabling input");
-    let mut payload = [0; 32];
-    probe_read(
-        &mut socket,
-        &mut payload,
-        "binary payload",
-        Duration::from_secs(10),
-    )
-    .await?;
-    if &payload != PROBE_BYTES {
-        bail!("Probe binary payload differs from expected bytes");
-    }
-    socket.write_all(b"ACK\0").await?;
-    let mut confirmation = [0; 8];
-    probe_read(
-        &mut socket,
-        &mut confirmation,
-        "ACK confirmation",
-        Duration::from_secs(5),
-    )
-    .await?;
-    if &confirmation != b"READ_OK\n" {
-        bail!("Probe ACK confirmation mismatch");
-    }
-    let idle_confirmed = matches!(
+    let began = Instant::now();
+    let probe = async {
+        let (mut socket, peer) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+            .await
+            .context("No probe connection within 30 seconds; inspect the C64 display")??;
+        tracing::info!(
+            stage = "tcp_accept",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            "Probe milestone reached"
+        );
+        if !matches!(peer.ip(),std::net::IpAddr::V4(ip) if network.allowed_ips.contains(&ip)) {
+            bail!("Probe peer is outside C64 allowlist");
+        }
+        socket.set_nodelay(true)?;
+        // Read exactly one HELLO so subsequent raw probe bytes remain in the socket.
+        let mut header = [0; 8];
         probe_read(
             &mut socket,
-            &mut confirmation,
-            "idle confirmation",
-            Duration::from_secs(5)
-        )
-        .await,
-        Ok(())
-    ) && &confirmation == b"IDLE_OK\n";
-    let observations = if idle_confirmed {
-        let mut bytes = [0; 97];
-        probe_read(
-            &mut socket,
-            &mut bytes,
-            "UCI observations",
+            &mut header,
+            "HELLO header",
             Duration::from_secs(5),
         )
         .await?;
-        Some(probe_observations(&bytes)?)
-    } else {
-        None
+        tracing::info!(
+            stage = "hello_header_complete",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            "Probe milestone reached"
+        );
+        let length = u16::from_le_bytes([header[4], header[5]]) as usize;
+        if length > 64 {
+            bail!("Invalid probe HELLO");
+        }
+        let mut bytes = header.to_vec();
+        bytes.resize(8 + length, 0);
+        probe_read(
+            &mut socket,
+            &mut bytes[8..],
+            "HELLO payload",
+            Duration::from_secs(5),
+        )
+        .await?;
+        tracing::info!(
+            stage = "hello_payload_complete",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            "Probe milestone reached"
+        );
+        let frames = Decoder::new().push(&bytes)?;
+        let frame = frames.first().context("Incomplete probe HELLO")?;
+        let Message::Hello {
+            token: offered,
+            capabilities,
+            ..
+        } = &frame.message
+        else {
+            bail!("Probe omitted HELLO");
+        };
+        if frame.sequence != 0 || !token.matches(offered) || capabilities & 2 == 0 {
+            bail!("Probe authentication/capability failed");
+        }
+        write_frame(
+            &mut socket,
+            &mut Sequencer::new(),
+            Message::HelloAck { enabled: false },
+        )
+        .await?;
+        tracing::info!(
+            stage = "hello_ack_written",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            "Probe authenticated; HELLO_ACK sent without enabling input"
+        );
+        let mut payload = [0; 32];
+        probe_read(
+            &mut socket,
+            &mut payload,
+            "binary payload",
+            Duration::from_secs(10),
+        )
+        .await?;
+        tracing::info!(
+            stage = "binary_payload_complete",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            "Probe milestone reached"
+        );
+        if &payload != PROBE_BYTES {
+            bail!("Probe binary payload differs from expected bytes");
+        }
+        socket.write_all(b"ACK\0").await?;
+        tracing::info!(
+            stage = "binary_ack_written",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            "Probe milestone reached"
+        );
+        let mut confirmation = [0; 8];
+        probe_read(
+            &mut socket,
+            &mut confirmation,
+            "ACK confirmation",
+            Duration::from_secs(5),
+        )
+        .await?;
+        tracing::info!(
+            stage = "ack_confirmation_complete",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            "Probe milestone reached"
+        );
+        if &confirmation != b"READ_OK\n" {
+            bail!("Probe ACK confirmation mismatch");
+        }
+        let idle_confirmed = matches!(
+            probe_read(
+                &mut socket,
+                &mut confirmation,
+                "idle confirmation",
+                Duration::from_secs(5)
+            )
+            .await,
+            Ok(())
+        ) && &confirmation == b"IDLE_OK\n";
+        tracing::info!(
+            stage = "idle_confirmation_finished",
+            probe_elapsed_ms = began.elapsed().as_millis() as u64,
+            idle_confirmed,
+            "Probe milestone reached"
+        );
+        let observations = if idle_confirmed {
+            let mut bytes = [0; 97];
+            probe_read(
+                &mut socket,
+                &mut bytes,
+                "UCI observations",
+                Duration::from_secs(5),
+            )
+            .await?;
+            tracing::info!(
+                stage = "uci_observations_complete",
+                probe_elapsed_ms = began.elapsed().as_millis() as u64,
+                "Probe milestone reached"
+            );
+            Some(probe_observations(&bytes)?)
+        } else {
+            None
+        };
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        socket.shutdown().await?;
+        Ok(
+            serde_json::json!({"device":device,"network_bidirectional":"verified","binary_payload":"verified","idle_read":if idle_confirmed{"verified"}else{"not verified"},"uci_observations":observations,"peer_close":"inspect C64 screen; not host-verified","verified_unix_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"host_version":env!("CARGO_PKG_VERSION")}),
+        )
     };
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    socket.shutdown().await?;
-    Ok(
-        serde_json::json!({"device":device,"network_bidirectional":"verified","binary_payload":"verified","idle_read":if idle_confirmed{"verified"}else{"not verified"},"uci_observations":observations,"peer_close":"inspect C64 screen; not host-verified","verified_unix_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"host_version":env!("CARGO_PKG_VERSION")}),
-    )
+    let result: Result<_> = probe.await;
+    let probe_elapsed_ms = began.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::info!(probe_elapsed_ms, "Probe completed"),
+        Err(_) => tracing::warn!(probe_elapsed_ms, "Probe failed"),
+    }
+    result
 }
 
 #[cfg(test)]
