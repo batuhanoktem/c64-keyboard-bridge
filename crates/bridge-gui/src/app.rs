@@ -136,6 +136,11 @@ pub struct BridgeApp {
 }
 impl BridgeApp {
     pub fn new(settings: GuiSettings) -> Self {
+        Self::new_for_state(settings, &crate::config::default_state_dir())
+    }
+    /// Use the same absolute state directory as the background service, rather
+    /// than the desktop launcher's working directory, for the export default.
+    pub fn new_for_state(settings: GuiSettings, state_dir: &Path) -> Self {
         Self {
             editor: MappingEditor::new(&settings.profile, &settings.layout),
             accepted_settings: settings.clone(),
@@ -150,7 +155,10 @@ impl BridgeApp {
             quit_after_save: false,
             pending_save: None,
             queued: Vec::new(),
-            diagnostics_path: "c64bridge-diagnostics.json".into(),
+            diagnostics_path: state_dir
+                .join("c64bridge-diagnostics.json")
+                .to_string_lossy()
+                .into_owned(),
             local_error: None,
         }
     }
@@ -1110,6 +1118,59 @@ mod tests {
     use super::*;
     use bridge_core::{BindingDocument, NativeKey};
     use bridge_protocol::PhysicalKey;
+    #[test]
+    fn selected_state_directory_sets_the_absolute_diagnostic_export_default() {
+        let state = std::env::temp_dir().join("c64bridge custom state");
+        let app = BridgeApp::new_for_state(GuiSettings::default(), &state);
+        let path = Path::new(&app.diagnostics_path);
+        assert!(path.is_absolute());
+        assert_eq!(path, state.join("c64bridge-diagnostics.json"));
+    }
+    #[test]
+    fn diagnostic_export_default_is_independent_of_desktop_launch_directory() {
+        let fixture = std::env::temp_dir().join(format!(
+            "c64bridge-export-default-{}",
+            crate::config::random_id().unwrap()
+        ));
+        let state = fixture.join("selected-state");
+        std::fs::create_dir_all(&state).unwrap();
+        for name in ["finder-launch", "terminal-launch"] {
+            let cwd = fixture.join(name);
+            std::fs::create_dir(&cwd).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::diagnostic_export_constructor_fixture_child",
+                ])
+                .env("C64BRIDGE_GUI_EXPORT_TEST_STATE", &state)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Constructor fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+    #[test]
+    fn diagnostic_export_constructor_fixture_child() {
+        let Some(state) = std::env::var_os("C64BRIDGE_GUI_EXPORT_TEST_STATE") else {
+            return;
+        };
+        let state = PathBuf::from(state);
+        let app = BridgeApp::new_for_state(GuiSettings::default(), &state);
+        assert!(Path::new(&app.diagnostics_path).is_absolute());
+        assert_eq!(
+            Path::new(&app.diagnostics_path),
+            state.join("c64bridge-diagnostics.json")
+        );
+        assert_ne!(
+            Path::new(&app.diagnostics_path).parent(),
+            Some(std::env::current_dir().unwrap().as_path())
+        );
+    }
     #[test]
     fn quitting_dirty_draft_requires_decision_and_failed_save_does_not_quit() {
         let mut app = BridgeApp::new(GuiSettings::default());

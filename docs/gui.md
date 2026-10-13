@@ -52,6 +52,8 @@ SHIFT LOCK uses the observed Shift matrix state and cannot be mapped independent
 
 **Diagnostics** shows current phase, failure counters, retained session failure and cleanup outcome, plus a bounded activity history. Exported diagnostics omit passwords, pairing/control tokens, addresses, key identities, matrices and peer-supplied text. Permission checks identify whether the companion or CLI is the posting process. On macOS, grant Device Control and Data Access (Accessibility on older versions) to the process actually sending events; authorizing a terminal for CLI use does not authorize the app automatically. Failed asynchronous actions show a persistent error above the current page, with the activity history retaining the operation's result.
 
+The export path defaults to `c64bridge-diagnostics.json` inside the selected private bridge state directory, including when launched from Finder or a desktop shortcut. You can choose another destination before confirming the export; an existing file is replaced only after that confirmation.
+
 ## Signing and acceptance
 
 Public CI builds macOS artifacts without a Developer ID signature and Windows installers without a Windows signing certificate. Local macOS release preparation can sign with **Developer ID Application: Flame Lion Ltd**. Its public certificate identifies the publisher; the private key remains in the local Keychain and is never included in source, application packages or GitHub CI. DMG metadata distinguishes `unsigned`, `signed-only` and successfully `notarized` artifacts. Signed-only does not assert that Apple notarization passed.

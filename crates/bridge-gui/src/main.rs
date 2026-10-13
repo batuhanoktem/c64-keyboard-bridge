@@ -158,6 +158,7 @@ impl NativeApp {
         let mac_main_thread = bridge_host::backend::MacOsMainThreadContext::install()?;
         let context = cc.egui_ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || context.request_repaint());
+        let app = BridgeApp::new_for_state(GuiSettings::default(), &state_dir);
         let service =
             ServiceHandle::spawn(state_dir, args.env_file.clone(), args.smoke, wake.clone())?;
         let show_tx = sender.clone();
@@ -197,7 +198,7 @@ impl NativeApp {
             style.spacing.button_padding = egui::vec2(12.0, 8.0);
         });
         Ok(Self {
-            app: BridgeApp::new(GuiSettings::default()),
+            app,
             service,
             snapshot: GuiSnapshot::default(),
             events,
@@ -587,6 +588,8 @@ fn run() -> Result<()> {
             }
         })
         .unwrap_or_else(config::default_state_dir);
+    let state_dir =
+        std::path::absolute(state_dir).context("Cannot resolve the bridge state directory")?;
     let Instance::Primary(guard) = instance::acquire(&state_dir)? else {
         return Ok(());
     };
