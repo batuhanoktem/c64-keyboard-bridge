@@ -38,6 +38,7 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(info["CFBundleIdentifier"], "com.flameliongames.c64bridge")
             self.assertEqual(info["CFBundleExecutable"], "c64bridge-gui")
             self.assertEqual(info["LSMinimumSystemVersion"], "11.0")
+            self.assertIn("configured C64 Ultimate", info["NSLocalNetworkUsageDescription"])
             for name in ("c64bridge", "c64bridge-gui"):
                 self.assertEqual((app / "Contents/MacOS" / name).read_text(), name)
             self.assertEqual((app / "Contents/Resources/c64/KEYBRIDGE.PRG").read_bytes(), b"unconfigured fixture")

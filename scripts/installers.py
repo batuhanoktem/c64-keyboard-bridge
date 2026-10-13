@@ -43,6 +43,7 @@ def macos_bundle(payload, version, minimum):
         "CFBundleIconFile": "c64bridge.icns", "LSMinimumSystemVersion": minimum,
         "NSPrincipalClass": "NSApplication", "NSHighResolutionCapable": True,
         "NSAccessibilityUsageDescription": "Send keys from your paired C64 keyboard when you explicitly enable input.",
+        "NSLocalNetworkUsageDescription": "Connect to your configured C64 Ultimate on the local network and receive its keyboard data when you explicitly start hosting.",
         "NSHumanReadableCopyright": "GPL-3.0-only; C64 Keyboard Bridge contributors",
     }
     (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info, sort_keys=True))
