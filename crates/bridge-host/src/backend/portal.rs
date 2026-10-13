@@ -1758,10 +1758,13 @@ mod tests {
     #[tokio::test]
     async fn wrapper_timeout_keeps_cleanup_retryable_and_drop_joins_delayed_actor() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        struct DelayedFailedClose;
+        struct DelayedFailedClose(Option<oneshot::Sender<()>>);
         impl CloseAuthority for DelayedFailedClose {
             async fn close(&mut self) -> bool {
                 tokio::time::sleep(OPERATION_TIMEOUT + Duration::from_millis(150)).await;
+                if let Some(completed) = self.0.take() {
+                    let _ = completed.send(());
+                }
                 false
             }
         }
@@ -1778,6 +1781,7 @@ mod tests {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let (abort_output, _abort_rx) = watch::channel(None);
         let (ready, initialized) = oneshot::channel();
+        let (completed, initial_close_completed) = oneshot::channel();
         let finished = Arc::new(AtomicBool::new(false));
         let actor_finished = finished.clone();
         let thread = thread::spawn(move || {
@@ -1794,7 +1798,7 @@ mod tests {
                 control.send(Control::Stall).unwrap();
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 ready.send(()).unwrap();
-                let mut authority = DelayedFailedClose;
+                let mut authority = DelayedFailedClose(Some(completed));
                 assert!(
                     recover_cleanup(
                         &mut state,
@@ -1826,6 +1830,12 @@ mod tests {
         assert!(!health.lock().unwrap().neutralized);
         assert!(!*backend.shutdown.borrow());
         fixture.control.send(Control::Resume).unwrap();
+        // Wait for the deliberately delayed close result rather than making
+        // recovery depend on a narrow timing margin between two 600ms calls.
+        timeout(Duration::from_secs(3), initial_close_completed)
+            .await
+            .unwrap()
+            .unwrap();
         backend.release(NativeKey::A).unwrap();
         backend.release(NativeKey::LeftShift).unwrap();
         assert!(backend.held.is_empty() && health.lock().unwrap().neutralized);
