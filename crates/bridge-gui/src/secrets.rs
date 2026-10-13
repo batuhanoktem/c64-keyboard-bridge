@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 
-const SERVICE: &str = "com.flameliongames.c64bridge";
+// Preserve saved credentials across the public app-ID rename. The OS may
+// separately request access for the newly signed executable.
+const LEGACY_CREDENTIAL_SERVICE: &str = "com.flameliongames.c64bridge";
 
 pub trait SecretStore: Send {
     fn get(&mut self, id: &str) -> Result<Option<String>>;
@@ -10,7 +12,7 @@ pub trait SecretStore: Send {
 pub struct OsSecretStore;
 impl SecretStore for OsSecretStore {
     fn get(&mut self, id: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(SERVICE, id)
+        let entry = keyring::Entry::new(LEGACY_CREDENTIAL_SERVICE, id)
             .map_err(|_| anyhow::anyhow!("OS credential store unavailable"))?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
@@ -19,7 +21,7 @@ impl SecretStore for OsSecretStore {
         }
     }
     fn set(&mut self, id: &str, password: &str) -> Result<()> {
-        keyring::Entry::new(SERVICE, id)
+        keyring::Entry::new(LEGACY_CREDENTIAL_SERVICE, id)
             .map_err(|_| anyhow::anyhow!("OS credential store unavailable"))?
             .set_password(password)
             .map_err(|_| {
@@ -29,7 +31,7 @@ impl SecretStore for OsSecretStore {
             })
     }
     fn delete(&mut self, id: &str) -> Result<()> {
-        let entry = keyring::Entry::new(SERVICE, id)
+        let entry = keyring::Entry::new(LEGACY_CREDENTIAL_SERVICE, id)
             .map_err(|_| anyhow::anyhow!("OS credential store unavailable"))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),

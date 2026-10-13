@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "screenshots": [
+    {
+      "file": "macos-connection.png",
+      "platform": "macOS ARM64",
+      "origin": "actual GUI, isolated recording fixture",
+      "theme": "light",
+      "width": 2400,
+      "height": 1992,
+      "sha256": "14053699580f54a98a0960136f9b8a8cc2d458a44b04f381097ddab29377e721",
+      "capture_revision": "7f9285a",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "macos-mappings.png",
+      "platform": "macOS ARM64",
+      "origin": "actual GUI, isolated recording fixture",
+      "theme": "light",
+      "width": 2400,
+      "height": 1992,
+      "sha256": "8074060b9cf1c16301e595b0d7fb2bd30afab695b5478c2bd256bfcaed39ea73",
+      "capture_revision": "7f9285a",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "macos-diagnostics.png",
+      "platform": "macOS ARM64",
+      "origin": "actual GUI, isolated recording fixture",
+      "theme": "light",
+      "width": 2400,
+      "height": 1992,
+      "sha256": "0c8e68e3d25dcc7dd2bb0c4fe405993af206ce126bdfaddcad7752b4e32f58b8",
+      "capture_revision": "7f9285a",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "macos-settings.png",
+      "platform": "macOS ARM64",
+      "origin": "actual GUI, isolated recording fixture",
+      "theme": "light",
+      "width": 2400,
+      "height": 1992,
+      "sha256": "06f81795d390be23ac3d2633487dbb2ed56b0664fb06867e8fe8eca2cc743a30",
+      "capture_revision": "7f9285a",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "macos-dark.png",
+      "platform": "macOS ARM64",
+      "origin": "actual GUI, isolated recording fixture",
+      "theme": "dark",
+      "width": 2400,
+      "height": 1992,
+      "sha256": "bec5a497e201336d2f86c3c522effc41fa2e81ef3e039a6de2a95417f1e6f471",
+      "capture_revision": "7f9285a",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "c64-keyboard-startup.png",
+      "platform": "C64",
+      "origin": "VICE 3.10, genuine unconfigured PRG startup",
+      "width": 384,
+      "height": 272,
+      "sha256": "472d903d07ee3f459504dbf63cec86d5c8ad79708a7078d3e3b89830e98af6f8",
+      "capture_revision": "d3c042d",
+      "hardware_contacted": false,
+      "uci_emulated": false
+    },
+    {
+      "file": "c64-probe-startup.png",
+      "platform": "C64",
+      "origin": "VICE 3.10, genuine unconfigured PRG startup",
+      "width": 384,
+      "height": 272,
+      "sha256": "7ad00d2fa1f82bd5c5be8f724871394b4bf9fcb23dc31b7a56389f0ef1cc25b5",
+      "capture_revision": "d3c042d",
+      "hardware_contacted": false,
+      "uci_emulated": false
+    }
+  ]
+}

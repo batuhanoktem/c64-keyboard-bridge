@@ -41,6 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--output', type=Path, default=ROOT / 'target/gui-smoke')
+    parser.add_argument('--theme', choices=('light', 'dark'), default='light')
     parser.add_argument('--session-child', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     binary = args.binary.resolve()
@@ -48,7 +49,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if platform.system() == 'Linux' and not args.session_child:
         subprocess.run(['dbus-run-session', '--', sys.executable, __file__, '--binary', str(binary),
-                        '--output', str(output), '--session-child'], check=True, timeout=90)
+                        '--output', str(output), '--theme', args.theme, '--session-child'], check=True, timeout=90)
         return
     processes = []
     with tempfile.TemporaryDirectory(prefix='c64bridge-gui-smoke-') as temporary:
@@ -72,7 +73,7 @@ def main():
                 auth.touch(mode=0o600)
                 subprocess.run(['xauth', '-f', str(auth), 'add', display, '.', secrets.token_hex(16)], check=True)
                 environment.update({'DISPLAY': display, 'XAUTHORITY': str(auth), 'XDG_SESSION_TYPE': 'x11'})
-                xvfb = subprocess.Popen(['Xvfb', display, '-screen', '0', '1280x900x24', '-nolisten', 'tcp', '-auth', str(auth)],
+                xvfb = subprocess.Popen(['Xvfb', display, '-screen', '0', '1280x1200x24', '-nolisten', 'tcp', '-auth', str(auth)],
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment)
                 processes.append(xvfb)
                 wait_for(lambda: Path('/tmp/.X11-unix/X' + display[1:]).exists(), xvfb)
@@ -90,7 +91,8 @@ def main():
             state_dir = private / 'state'
             with (output / 'gui.log').open('w') as log:
                 primary = subprocess.Popen([str(binary), '--smoke', '--state-dir', str(state_dir),
-                                            '--smoke-report', str(report), '--screenshot', str(screenshot)],
+                                            '--smoke-report', str(report), '--screenshot', str(screenshot),
+                                            '--smoke-theme', args.theme],
                                            env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT)
                 processes.append(primary)
                 if platform.system() == 'Linux':

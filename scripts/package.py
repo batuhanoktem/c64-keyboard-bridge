@@ -29,6 +29,7 @@ SOURCE_FOLDERS = {
     "crates": {".rs", ".toml", ".md"},
     "c64": {".c", ".h", ".s", ".md", ".py", ".sh", ".cfg", ".txt"},
     "docs": {".md"},
+    "docs/screenshots": {".png", ".json"},
     "config/layouts": {".toml"},
     "scripts": {".sh", ".py", ".md"},
     ".github": {".yml", ".yaml", ".md"},

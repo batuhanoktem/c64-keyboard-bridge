@@ -4,6 +4,7 @@
 assets/*.png -text
 assets/*.ico -text
 assets/*.icns -text
+docs/screenshots/*.png -text
 installers/nsis-notices/COPYING -text whitespace=-blank-at-eol,-blank-at-eof,cr-at-eol
 third-party/notices/** -text whitespace=-blank-at-eol,-blank-at-eof,cr-at-eol
 third-party/notices/origins.json text eol=lf

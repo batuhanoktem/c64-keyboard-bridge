@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import plistlib
 import runpy
+import re
+import struct
 import tempfile
 import unittest
 
@@ -14,6 +16,29 @@ INSTALLERS = runpy.run_path(str(ROOT / "scripts/installers.py"))
 
 
 class PackagingTests(unittest.TestCase):
+    def test_documentation_images_are_packaged_and_match_their_manifest(self):
+        names = {path.relative_to(ROOT).as_posix() for path in PACKAGE['source_files']()}
+        manifest = json.loads((ROOT / 'docs/screenshots/manifest.json').read_text())
+        seen = set()
+        for entry in manifest['screenshots']:
+            self.assertRegex(entry['file'], r'^[a-z0-9-]+\.png$')
+            self.assertNotIn(entry['file'], seen)
+            seen.add(entry['file'])
+            image = ROOT / 'docs/screenshots' / entry['file']
+            self.assertIn(image.relative_to(ROOT).as_posix(), names)
+            data = image.read_bytes()
+            self.assertEqual(data[:8], b'\x89PNG\r\n\x1a\n')
+            self.assertEqual(struct.unpack('>II', data[16:24]), (entry['width'], entry['height']))
+            self.assertEqual(hashlib.sha256(data).hexdigest(), entry['sha256'])
+            self.assertFalse(entry['hardware_contacted'])
+        self.assertEqual(seen, {path.name for path in (ROOT / 'docs/screenshots').glob('*.png')})
+        self.assertIn('docs/screenshots/manifest.json', names)
+        for document in [ROOT / 'README.md', *list((ROOT / 'docs').glob('*.md'))]:
+            for reference in re.findall(r'!\[[^\]]*\]\(([^)]+)\)', document.read_text()):
+                if not reference.startswith(('https://', 'http://')):
+                    image = (document.parent / reference).resolve()
+                    self.assertIn(image.relative_to(ROOT).as_posix(), names)
+
     def test_source_allowlist_contains_gui_build_inputs_and_no_private_state(self):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE["source_files"]()}
         for name in ["assets/c64bridge.png", "assets/c64bridge.svg", "assets/c64bridge.ico",

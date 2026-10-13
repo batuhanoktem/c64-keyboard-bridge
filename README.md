@@ -27,6 +27,10 @@ For the pinned cc65 build, sanitizers, CLI smoke checks, and release archives, u
 
 ## Desktop companion
 
+![C64 Keyboard Bridge Connection page on macOS, isolated recording fixture](docs/screenshots/macos-connection.png)
+
+The [screenshot gallery](docs/screenshots.md) covers platform-specific GUI pages and genuine C64 PRG screens in VICE. Screenshots use isolated demonstration settings and do not establish physical input acceptance.
+
 Install the architecture-specific macOS DMG, Windows per-user installer or Ubuntu 24.04+ DEB, or run `c64-keyboard-bridge-gui` from a portable archive. Hosting and input start disabled. Enter your C64 address on Connection, choose a matching US/UK host layout, then start the host. Deploying either C64 program requires a separate confirmation because it resets the C64 and replaces its current program.
 
 **Enable input** activates immediately after connection, permission and layout checks pass, even while the companion is focused. C64 keystrokes go to the focused application; changing focus does not pause input. Use **Pause input** in the window or tray to stop it. The deliberate native input test retains its confirmation and five-second countdown to switch to a scratch application. Closing the window keeps it in the tray when a tray is available; Quit releases keys and stops GUI-owned hosting. An existing separately started CLI session is identified and survives GUI Quit. Read [the GUI guide](docs/gui.md) for mappings, credential storage and installer signing status.
@@ -95,3 +99,5 @@ c64-keyboard-bridge stop
 The fake host forces loopback, the recording backend, and no device contact or deployment. Other simulator scenarios are `disconnect-held`, `heartbeat-timeout`, and `malformed`. They exercise transport behavior without native input.
 
 Read [mappings](docs/mappings.md), [protocol](docs/protocol.md), [architecture and firmware evidence](docs/architecture.md), [security](docs/security.md), [troubleshooting](docs/troubleshooting.md), and [hardware acceptance tests](docs/hardware-testing.md) for the practical limits and validation procedure.
+
+See [device compatibility](docs/device-compatibility.md), [secure release preparation](docs/secure-releases.md) and [future store distribution](docs/store-distribution.md).

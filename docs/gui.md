@@ -58,8 +58,14 @@ The export path defaults to `c64bridge-diagnostics.json` inside the selected pri
 
 ## Signing and acceptance
 
-Public CI builds macOS artifacts without a Developer ID signature and Windows installers without a Windows signing certificate. Local macOS release preparation can sign with **Developer ID Application: Flame Lion Ltd**. Its public certificate identifies the publisher; the private key remains in the local Keychain and is never included in source, application packages or GitHub CI. DMG metadata distinguishes `unsigned`, `signed-only` and successfully `notarized` artifacts. Signed-only does not assert that Apple notarization passed.
+Ordinary CI builds unsigned packages. The protected release pipeline signs and notarizes both Mac architectures after the repository owner approves access to its environment secrets. The signing key is temporarily imported into an isolated runner Keychain and removed before artifact promotion completes. Keys are never included in source or application packages. Windows installers remain unsigned until a Windows certificate is supplied. See [secure release preparation](secure-releases.md) for credential provisioning, verification and the draft/publication gate. Local signed-only development packages are labelled separately and do not satisfy the public Mac release gate.
 
 GUI rendering smoke tests use recording services and private graphical fixtures. They do not exercise native input-source APIs. Separate read-only macOS regressions cover service/worker layout queries through the CLI main-queue broker (`bridge-host` example `macos-layout-probe`) and actual GUI service initialization and Doctor (`bridge-gui` example `macos-service-probe`). These native checks request no permission, access no credential store, contact no C64 and post no input, covering the background-service path that recording-only smoke omits.
 
 Existing CLI hardware observations do not establish native GUI input acceptance, permission prompts, real desktop tray behavior or OS credential-vault interaction on every platform. Those checks remain deliberate acceptance work. No automatic login startup, updater or additional Wayland-compositor support is included.
+
+## Identity and documentation
+
+The public app ID is `com.flameliongames.c64keyboardbridge`. Existing state directories and saved credential references remain compatible. macOS may require renewed posting, Local Network or Keychain authorization after replacing an older app; check the current GUI process rather than relying on an earlier CLI grant.
+
+See the [screenshot gallery](screenshots.md), [device compatibility](device-compatibility.md) and [future store distribution](store-distribution.md). Older acceptance records retain the command names and hashes actually tested at the time.
