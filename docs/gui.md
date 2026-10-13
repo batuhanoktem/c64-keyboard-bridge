@@ -15,6 +15,14 @@ Installing a Linux package does not grant `/dev/uinput` access, load modules or 
 
 Uninstall removes program files and shortcuts and preserves private settings, pairing state and OS-vault credentials. Use **Forget saved password** to remove the credential deliberately. **Reset local bridge data** separately confirms removal of saved GUI settings, pairing state, GUI-owned profiles and saved credentials while hosting is stopped. It preserves imported `.env` files and external/exported profiles and requires fresh C64 pairing/deployment afterward.
 
+## macOS setup
+
+Install the app in `/Applications` before granting permission. In the companion's **Diagnostics** page, choose **Check / request permission**, then enable **C64 Keyboard Bridge** in the macOS permission settings opened by the request. You can also add `/Applications/C64 Keyboard Bridge.app` in **System Settings → Privacy & Security → Accessibility**; see [Apple's Accessibility permission guide](https://support.apple.com/guide/mac-help/allow-accessibility-apps-to-access-your-mac-mh43185/mac). Restart the companion after changing its permission and refresh Diagnostics. A grant for Terminal, Codex or the CLI does not grant the installed companion permission to post events. The bridge does not request Input Monitoring or capture host keyboard input.
+
+Finder launches do not inherit the working directory or environment of your project terminal. To use an existing `.env`, enter its **absolute path** in **Settings / About → .env import path**, then save or apply. A missing import file does not supply its password or other values; connection fields in the companion remain explicit overrides. On the first launch, before GUI settings have been saved, you can also initialize the form by launching the app's executable with `--env-file /absolute/path/to/.env`. A saved import path remains absolute on later Finder launches; the companion does not copy, modify or bundle the file.
+
+GUI settings and pairing state use `~/Library/Application Support/net.c64bridge.C64-Keyboard-Bridge` by default, shared with the CLI. The app's public bundle identifier is separate from this existing data-directory name. To share a custom CLI state directory, pass the same `--state-dir` to the companion or set `BRIDGE_STATE_DIR` in its launch environment; selecting an `.env` file does not choose the GUI instance's state directory. **Remember password** is optional. When it is off, enter the password again after quitting and reopening unless a readable imported `.env` or process environment supplies it.
+
 ## Connection and input
 
 1. On **Connection**, enter the C64 Ultimate's current address. On **Settings / About**, enter its network password and choose a matching US/UK layout, then save or apply the settings. A selected `.env` file and process environment remain available; explicit companion settings override them. Saving settings does not rewrite `.env`.
