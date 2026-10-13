@@ -4,7 +4,9 @@ use crate::{
     model::*,
     secrets::{MemorySecretStore, OsSecretStore, SecretStore},
 };
-use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use bridge_core::MappingDocument;
 use bridge_host::{
     backend, control, diagnostics, operations, pairing,
