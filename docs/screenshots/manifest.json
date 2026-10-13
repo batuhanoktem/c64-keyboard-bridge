@@ -242,6 +242,26 @@
       "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
       "hardware_contacted": false,
       "native_input": false
+    },
+    {
+      "file": "c64-keyboard-connected.png",
+      "platform": "C64",
+      "origin": "physical C64 Ultimate, Ethernet video stream",
+      "width": 384,
+      "height": 240,
+      "sha256": "22336648559bd910f7c239075b336ea4b6e727077971a0b53f8f800dd0ca1e7d",
+      "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
+      "hardware_contacted": true,
+      "native_input": false,
+      "video_standard": "NTSC",
+      "firmware": {
+        "product": "C64 Ultimate",
+        "version": "1.1.0",
+        "fpga": "122",
+        "core": "1.49"
+      },
+      "template_prg": "KEYBRIDGE.PRG",
+      "template_prg_sha256": "4e8c278667aa352dc9ccbf7e255b6fa69edf104ba7bfeddb024792963bc92018"
     }
   ]
 }

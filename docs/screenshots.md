@@ -84,7 +84,13 @@ Dark theme, selected only for this capture without changing the system theme:
 
 ![Dark Connection page on Ubuntu, isolated recording fixture](screenshots/ubuntu-dark.png)
 
-## C64 programs in VICE
+## Physical C64 Ultimate
+
+The keyboard client authenticated successfully with input disabled throughout capture. This image comes from a physical C64 Ultimate's Ethernet video stream and preserves its original NTSC 384 × 240 pixel proportions. The device runs firmware 1.1.0, FPGA 122 and core 1.49; the image manifest records the exact client template. Physical probe and native input acceptance are separate checks.
+
+![Keyboard client on a physical C64 Ultimate, showing CONNECTED: INPUT DISABLED](screenshots/c64-keyboard-connected.png)
+
+## C64 emulator screenshots
 
 These are the genuine, unconfigured release templates running in VICE 3.10. They display deployment instructions because no pairing token or network destination is embedded. VICE does not emulate Ultimate UCI, so these images do not show or claim successful networking. The original 384 × 272 pixel proportions are preserved.
 
@@ -92,7 +98,7 @@ These are the genuine, unconfigured release templates running in VICE 3.10. They
 
 ![Genuine C64 networking-probe startup in VICE, showing unconfigured deployment instructions](screenshots/c64-probe-startup.png)
 
-Real connected-client and successful-probe captures remain pending a separately approved hardware session. Capturing an existing video stream may be possible on suitable firmware; loading either PRG still requires fresh reset consent.
+An image of a successful physical networking-probe run remains pending. Loading either PRG requires fresh reset consent.
 
 ## Reproduce isolated captures
 

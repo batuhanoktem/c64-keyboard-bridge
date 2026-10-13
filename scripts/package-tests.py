@@ -19,6 +19,26 @@ RELEASE = runpy.run_path(str(ROOT / "scripts/release_service.py"))
 
 
 class PackagingTests(unittest.TestCase):
+    def assert_screenshot_provenance(self, entry):
+        self.assertIsInstance(entry['hardware_contacted'], bool)
+        if entry['hardware_contacted']:
+            self.assertEqual(entry['platform'], 'C64')
+            self.assertTrue(entry['origin'].startswith('physical C64 Ultimate'))
+            self.assertIs(entry['native_input'], False)
+            self.assertRegex(entry['capture_revision'], r'^[0-9a-f]{40}$')
+            self.assertIn(entry['video_standard'], ('NTSC', 'PAL'))
+            self.assertEqual((entry['width'], entry['height']),
+                             (384, 240) if entry['video_standard'] == 'NTSC' else (384, 272))
+            self.assertEqual(entry['firmware']['product'], 'C64 Ultimate')
+            for field in ('version', 'fpga', 'core'):
+                self.assertRegex(entry['firmware'][field], r'^[0-9]+(?:\.[0-9]+)*$')
+            self.assertIn(entry['template_prg'], ('KEYBRIDGE.PRG', 'NETWORKTEST.PRG'))
+            self.assertRegex(entry['template_prg_sha256'], r'^[0-9a-f]{64}$')
+        else:
+            self.assertFalse(entry['origin'].startswith('physical'))
+            if entry['platform'] != 'C64':
+                self.assertIs(entry['native_input'], False)
+
     def test_documentation_images_are_packaged_and_match_their_manifest(self):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE['source_files']()}
         manifest = json.loads((ROOT / 'docs/screenshots/manifest.json').read_text())
@@ -33,7 +53,7 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(data[:8], b'\x89PNG\r\n\x1a\n')
             self.assertEqual(struct.unpack('>II', data[16:24]), (entry['width'], entry['height']))
             self.assertEqual(hashlib.sha256(data).hexdigest(), entry['sha256'])
-            self.assertFalse(entry['hardware_contacted'])
+            self.assert_screenshot_provenance(entry)
         self.assertEqual(seen, {path.name for path in (ROOT / 'docs/screenshots').glob('*.png')})
         self.assertIn('docs/screenshots/manifest.json', names)
         for document in [ROOT / 'README.md', *list((ROOT / 'docs').glob('*.md'))]:
@@ -41,6 +61,25 @@ class PackagingTests(unittest.TestCase):
                 if not reference.startswith(('https://', 'http://')):
                     image = (document.parent / reference).resolve()
                     self.assertIn(image.relative_to(ROOT).as_posix(), names)
+
+    def test_hardware_images_require_complete_physical_provenance(self):
+        manifest = json.loads((ROOT / 'docs/screenshots/manifest.json').read_text())
+        entry = next(item for item in manifest['screenshots'] if item['file'] == 'c64-keyboard-connected.png')
+        self.assert_screenshot_provenance(entry)
+        invalid = [dict(entry, origin='VICE, simulated connected state'),
+                   dict(entry, hardware_contacted=False),
+                   dict(entry, native_input=True),
+                   dict(entry, template_prg_sha256='unverified'),
+                   dict(entry, capture_revision='unknown'),
+                   dict(entry, height=272)]
+        for candidate in invalid:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(AssertionError):
+                    self.assert_screenshot_provenance(candidate)
+        incomplete = dict(entry)
+        del incomplete['firmware']
+        with self.assertRaises(KeyError):
+            self.assert_screenshot_provenance(incomplete)
 
     def test_source_allowlist_contains_gui_build_inputs_and_no_private_state(self):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE["source_files"]()}

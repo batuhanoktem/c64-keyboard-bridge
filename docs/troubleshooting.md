@@ -42,3 +42,11 @@ For a transport-only reproduction, use the README's loopback recording host and 
 Counters reset on process restart, and the latest record is replaced by a later failure. Capture the relevant status before stopping the process if you need it for a bug report, reviewing the surrounding metadata before sharing. These diagnostics cannot reconstruct the causes of warnings from older builds.
 
 When reporting a bug, include the commit, host OS, selected backend/layout/profile, non-secret error text, firmware/FPGA/core versions, and which acceptance step failed. Review diagnostics for private addresses or identifiers. Never include `.env`, the pairing token, or configured PRGs.
+
+## Direct Ethernet video capture
+
+For a separate direct cable connection, choose unused static IPv4 addresses in the same subnet for the computer and C64 Ethernet interfaces. Keep the computer's Ethernet router field empty so its existing internet connection retains the default route. Use the Ethernet address in the companion's Device address field and check Device information with hosting and input stopped. Numeric addresses do not require DNS.
+
+On the tested C64 Ultimate firmware 1.1.0, REST access worked with a zero Ethernet gateway, but starting a unicast VIC stream failed with `Cannot find MAC of specified host`. Setting the C64's Ethernet gateway to the computer's Ethernet address resolved the stream failure. This matches the [official streamer's gateway-subnet comparison](https://github.com/GideonZ/1541ultimate/blob/05fd68619442837f043093ae757032b8f699ab98/software/io/network/data_streamer.cc); it does not enable routing or internet sharing on the computer.
+
+Start the receiver before the VIC stream and use its listening address and port as the destination. Audio streaming is unnecessary for screenshots. Stop streams after capture and verify traffic is quiet. Follow the [Ultimate streaming documentation](https://1541u-documentation.readthedocs.io/en/latest/data_streams.html); loading a screenshot program still requires fresh reset consent.
