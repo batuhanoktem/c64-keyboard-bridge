@@ -4,6 +4,8 @@ mod codes;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+mod portal;
 #[cfg(target_os = "macos")]
 pub use macos::main_thread::{MacOsMainThreadContext, run_with_main_thread_loop};
 #[cfg(target_os = "windows")]
@@ -54,7 +56,9 @@ fn selected_backend(selection: &str) -> Result<&str, BackendError> {
             }
             #[cfg(target_os = "linux")]
             {
-                Ok(if linux::is_wayland_session() {
+                Ok(if portal::is_gnome_wayland() {
+                    "portal"
+                } else if linux::is_wayland_session() {
                     "uinput"
                 } else {
                     "x11"
@@ -67,15 +71,61 @@ fn selected_backend(selection: &str) -> Result<&str, BackendError> {
                 ))
             }
         }
-        "recording" | "macos" | "windows" | "x11" | "uinput" => Ok(selection),
+        "recording" | "macos" | "windows" | "x11" | "uinput" | "portal" => Ok(selection),
         _ => Err(BackendError::Unsupported(
-            "Unknown backend; choose auto, recording, macos, windows, x11, or uinput".into(),
+            "Unknown backend; choose auto, recording, macos, windows, x11, uinput, or portal"
+                .into(),
         )),
     }
 }
 
 fn wrong_platform() -> BackendError {
     BackendError::Unsupported("The selected backend is unavailable on this operating system".into())
+}
+
+/// Whether this selection needs an asynchronous OS authorization session.
+/// Read-only: this never requests permission or creates a virtual device.
+pub fn requires_authorization(selection: &str) -> Result<bool, BackendError> {
+    Ok(selected_backend(selection)? == "portal")
+}
+
+/// Prepare native output after deliberate authorization. The caller must keep
+/// draining disabled transitions and cancel when a newer Pause/Stop/Quit arrives.
+/// A successful result has verified layout and emits no input during preparation.
+pub async fn prepare_backend(
+    selection: &str,
+    layout: KeyboardLayout,
+    cancellation: tokio::sync::watch::Receiver<bool>,
+) -> Result<Box<dyn KeyboardBackend>, BackendError> {
+    if *cancellation.borrow() {
+        return Err(BackendError::Unavailable(
+            "Input authorization cancelled".into(),
+        ));
+    }
+    if selected_backend(selection)? == "portal" {
+        #[cfg(target_os = "linux")]
+        {
+            return portal::prepare(layout, cancellation).await;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(wrong_platform());
+        }
+    }
+    let selection = selection.to_owned();
+    let result = tokio::task::spawn_blocking(move || create_backend(&selection, layout))
+        .await
+        .map_err(|_| BackendError::Unavailable("Native backend preparation failed".into()))?;
+    // Blocking native setup cannot be aborted safely. Its bounded operation must
+    // finish, and dropping a cancelled result follows its normal cleanup path.
+    if *cancellation.borrow() {
+        drop(result);
+        Err(BackendError::Unavailable(
+            "Input authorization cancelled".into(),
+        ))
+    } else {
+        result
+    }
 }
 
 /// Construct only when injection is explicitly enabled. Construction never
@@ -128,6 +178,10 @@ pub fn create_backend(
                 Err(wrong_platform())
             }
         }
+        "portal" => Err(BackendError::Unsupported(
+            "GNOME desktop permission requires asynchronous preparation in the posting process"
+                .into(),
+        )),
         _ => Err(wrong_platform()),
     }
 }
@@ -173,6 +227,8 @@ pub fn probe_backend(selection: &str, layout: KeyboardLayout) -> BackendProbe {
         "x11" => linux::probe_x11(layout),
         #[cfg(target_os = "linux")]
         "uinput" => linux::probe_uinput(layout),
+        #[cfg(target_os = "linux")]
+        "portal" => portal::probe(layout),
         _ => BackendProbe {
             name: selected.into(),
             available: false,

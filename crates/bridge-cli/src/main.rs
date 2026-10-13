@@ -254,6 +254,19 @@ async fn run() -> Result<()> {
             println!("Pairing token rotated. Redeploy the C64 client before connecting.");
         }
         Command::Permissions { request } => {
+            if request && backend::requires_authorization(&config.backend)? {
+                let response=control::send(&config.state_dir,"authorize").await.context("Start the bridge first; desktop authorization must belong to the running posting process")?;
+                println!("{}", serde_json::to_string_pretty(&response.status)?);
+                if !response.ok {
+                    bail!(
+                        "{}",
+                        response.error.unwrap_or_else(|| {
+                            "Desktop authorization could not be requested".into()
+                        })
+                    );
+                }
+                return Ok(());
+            }
             if request {
                 backend::request_permission()?;
             }
@@ -311,22 +324,47 @@ async fn device_test(config: &Config, allow_reset: bool) -> Result<()> {
     Ok(())
 }
 async fn test_input(config: &Config, countdown: u64) -> Result<()> {
-    // Preserve fail-fast backend/layout checks before beginning the deliberate countdown.
-    let selection = config.backend.clone();
-    let layout = runtime::layout(config);
-    let probe =
-        tokio::task::spawn_blocking(move || backend::probe_backend(&selection, layout)).await?;
-    if !probe.available || !probe.authorized || probe.layout_matches != Some(true) {
-        anyhow::bail!("Input backend preflight failed: {}", probe.detail);
-    }
+    let portal = backend::requires_authorization(&config.backend)?;
+    let prepared = if portal {
+        eprintln!(
+            "Approve desktop keyboard control first. The typing countdown begins only after approval; Ctrl+C cancels."
+        );
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let preparation = operations::prepare_input_test(config, cancel_rx);
+        tokio::pin!(preparation);
+        Some(tokio::select! {
+            result=&mut preparation=>result?,
+            signal=tokio::signal::ctrl_c()=>{
+                signal?;cancel.send_replace(true);
+                drop(preparation.await);
+                return Ok(());
+            }
+        })
+    } else {
+        let selection = config.backend.clone();
+        let layout = runtime::layout(config);
+        let probe =
+            tokio::task::spawn_blocking(move || backend::probe_backend(&selection, layout)).await?;
+        if !probe.available || !probe.authorized || probe.layout_matches != Some(true) {
+            bail!("Input backend preflight failed: {}", probe.detail);
+        }
+        None
+    };
     eprintln!(
         "Deliberate input test: focus an empty TextEdit/VS Code/Notepad/terminal buffer. No delivery result is inferred automatically."
     );
     for remaining in (1..=countdown).rev() {
         eprintln!("Typing test in {remaining} seconds…");
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::select! {
+            _=tokio::time::sleep(Duration::from_secs(1))=>{},
+            signal=tokio::signal::ctrl_c()=>{signal?;drop(prepared);return Ok(());}
+        }
     }
-    operations::test_input(config).await?;
+    if let Some(prepared) = prepared {
+        operations::test_input_prepared(prepared, None, None).await?;
+    } else {
+        operations::test_input(config).await?;
+    }
     println!("Input events posted. Verify the phrase c64 bridge in the focused application.");
     Ok(())
 }

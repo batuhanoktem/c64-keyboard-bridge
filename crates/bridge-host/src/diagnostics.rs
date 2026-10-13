@@ -32,21 +32,28 @@ pub async fn doctor(config: &Config) -> Report {
         "valid",
         "Values parsed and validated; secrets redacted",
     );
+    let runtime_status = control::send(&config.state_dir, "status").await.ok();
     let probe = backend::probe_backend(&config.backend, runtime::layout(config));
+    let runtime_authorized = probe.name == "portal"
+        && probe.available
+        && runtime_status.as_ref().is_some_and(|response| {
+            response.status.authorization.phase == control::AuthorizationPhase::Ready
+        });
     report.add(
         "Input backend",
-        if probe.available && probe.authorized {
+        if probe.available && (probe.authorized || runtime_authorized) {
             "available"
         } else {
             "unavailable"
         },
-        format!("{}: {}", probe.name, probe.detail),
+        if runtime_authorized {"portal: the running posting process has an approved session; layout and permission remain monitored".into()}else{format!("{}: {}", probe.name, probe.detail)},
     );
     report.add(
         "Layout",
         match probe.layout_matches {
             Some(true) => "matches",
             Some(false) => "mismatch",
+            None if runtime_authorized => "verified by running posting process",
             None => "unknown; injection disabled",
         },
         format!(
@@ -85,7 +92,6 @@ pub async fn doctor(config: &Config) -> Report {
             None
         }
     };
-    let runtime_status = control::send(&config.state_dir, "status").await.ok();
     match config.network().await {
         Ok(network) => {
             report.add(
@@ -122,6 +128,15 @@ pub async fn doctor(config: &Config) -> Report {
             },
             status.status.detail,
         );
+        if probe.name == "portal"
+            || status.status.authorization.phase != control::AuthorizationPhase::NotRequested
+        {
+            report.add(
+                "Desktop input authorization",
+                status.status.authorization.phase.as_str(),
+                "Permission belongs to the running posting process; doctor never requests approval",
+            );
+        }
         let diagnostics = status.status.diagnostics;
         report.add(
             "Session diagnostics",

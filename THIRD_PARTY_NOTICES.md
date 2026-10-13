@@ -35,6 +35,7 @@ The expressions preserve upstream metadata, including legacy `MIT/Apache-2.0` sp
 | arboard | 3.6.1 | `MIT OR Apache-2.0` | [upstream](https://github.com/1Password/arboard) |
 | arrayvec | 0.7.8 | `MIT OR Apache-2.0` | [upstream](https://github.com/bluss/arrayvec) |
 | as-raw-xcb-connection | 1.0.1 | `MIT OR Apache-2.0` | [upstream](https://github.com/psychon/as-raw-xcb-connection) |
+| ashpd | 0.13.13 | `MIT` | [upstream](https://github.com/bilelmoussaoui/ashpd) |
 | async-broadcast | 0.7.2 | `MIT OR Apache-2.0` | [upstream](https://github.com/smol-rs/async-broadcast) |
 | async-channel | 2.5.0 | `Apache-2.0 OR MIT` | [upstream](https://github.com/smol-rs/async-channel) |
 | async-executor | 1.14.0 | `Apache-2.0 OR MIT` | [upstream](https://github.com/smol-rs/async-executor) |
@@ -316,6 +317,7 @@ The expressions preserve upstream metadata, including legacy `MIT/Apache-2.0` sp
 | regex | 1.13.1 | `MIT OR Apache-2.0` | [upstream](https://github.com/rust-lang/regex) |
 | regex-automata | 0.4.18 | `MIT OR Apache-2.0` | [upstream](https://github.com/rust-lang/regex) |
 | regex-syntax | 0.8.11 | `MIT OR Apache-2.0` | [upstream](https://github.com/rust-lang/regex) |
+| reis | 0.7.1 | `MIT` | [upstream](https://github.com/ids1024/reis) |
 | renderdoc-sys | 1.1.0 | `MIT OR Apache-2.0` | [upstream](https://github.com/ebkalderon/renderdoc-rs) |
 | reqwest | 0.13.5 | `MIT OR Apache-2.0` | [upstream](https://github.com/seanmonstar/reqwest) |
 | rustc-hash | 1.1.0 | `Apache-2.0/MIT` | [upstream](https://github.com/rust-lang-nursery/rustc-hash) |

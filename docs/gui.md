@@ -11,7 +11,7 @@ The companion and CLI share the keyboard protocol, native input backends, mappin
 | Ubuntu 24.04+ amd64 / arm64 | `.deb` | Install with `sudo apt install ./c64-keyboard-bridge_0.1.0_ARCH.deb`. This installs both commands and a desktop launcher. |
 | Supported native targets | Portable ZIP / tar.gz | Extract to a user-owned folder and run either executable. |
 
-Installing a Linux package does not grant `/dev/uinput` access, load modules or run the network application as root. Arrange explicit device access separately when using a supported Wayland compositor. See [platform support](platforms.md). Windows runtime requirements and elevated-application restrictions continue to apply.
+Installing a Linux package does not grant `/dev/uinput` access, load modules or run the network application as root. GNOME Wayland uses its keyboard-control portal without uinput access. Arrange explicit device access separately for the Sway/Hyprland uinput backend. See [platform support](platforms.md). Windows runtime requirements and elevated-application restrictions continue to apply.
 
 Uninstall removes program files and shortcuts and preserves private settings, pairing state and OS-vault credentials. Use **Forget saved password** to remove the credential deliberately. **Reset local bridge data** separately confirms removal of saved GUI settings, pairing state, GUI-owned profiles and saved credentials while hosting is stopped. It preserves imported `.env` files and external/exported profiles and requires fresh C64 pairing/deployment afterward.
 
@@ -62,7 +62,7 @@ Ordinary CI builds unsigned packages. The protected release pipeline signs and n
 
 GUI rendering smoke tests use recording services and private graphical fixtures. They do not exercise native input-source APIs. Separate read-only macOS regressions cover service/worker layout queries through the CLI main-queue broker (`bridge-host` example `macos-layout-probe`) and actual GUI service initialization and Doctor (`bridge-gui` example `macos-service-probe`). These native checks request no permission, access no credential store, contact no C64 and post no input, covering the background-service path that recording-only smoke omits.
 
-Existing CLI hardware observations do not establish native GUI input acceptance, permission prompts, real desktop tray behavior or OS credential-vault interaction on every platform. Those checks remain deliberate acceptance work. No automatic login startup, updater or additional Wayland-compositor support is included.
+Existing CLI hardware observations do not establish native GUI input acceptance, permission prompts, real desktop tray behavior or OS credential-vault interaction on every platform. Those checks remain deliberate acceptance work. No automatic login startup or updater is included. GNOME Wayland uses the portal backend; additional compositor acceptance remains separate work.
 
 ## Identity and documentation
 

@@ -16,7 +16,7 @@ Configuration comes from CLI overrides, then process environment variables, then
 | `KEYBOARD_LAYOUT` | `US` | `US` or `UK`; must match the profile and supported active host input source. |
 | `KEYBOARD_PROFILE` | `modern` | `modern` or `authentic`. |
 | `MAPPINGS_FILE` | unset | Custom TOML profile, replacing the selected built-in profile. |
-| `INPUT_BACKEND` | `auto` | `auto`, `recording`, `macos`, `windows`, `x11`, or `uinput`. |
+| `INPUT_BACKEND` | `auto` | `auto`, `recording`, `macos`, `windows`, `x11`, `portal`, or `uinput`. |
 | `REPEAT_DELAY_MS` | `500` | Host repeat delay, 100–5000 ms; macOS/Windows/recording only. |
 | `REPEAT_INTERVAL_MS` | `40` | Host repeat interval, 10–1000 ms. Linux uses desktop repeat settings. |
 | `LOG_LEVEL` | `info` | Tracing filter. Default logs omit key text; DEBUG key traces can reveal bridge typing and must remain private. Passwords are not logged. |
@@ -38,7 +38,7 @@ If automatic routing selects the wrong adapter, set both the advertised address 
 
 The host stores `pairing.key`, `runtime.json` while running, and optional `hardware-evidence.json` under its application data directory. On Unix the directory must have mode `0700` and the token mode `0600`; newly created files use `0600`. On Windows the state directory inherits account ACLs, which should restrict access to the current user. A stale runtime record is handled as described in [troubleshooting](troubleshooting.md).
 
-Authenticated `status` responses include a bounded `diagnostics` object alongside the existing connection and input fields. It counts sessions and normalized failures, describes the current session's phase and valid-traffic age, and retains the latest failure through pause and reconnect. The failure record includes elapsed timing, validated-frame counts and cleanup outcome. These values are kept in memory and reset when the host process restarts; they are not written to `runtime.json` or exported automatically. Existing status JSON without this object remains readable.
+Authenticated `status` responses include a bounded `diagnostics` object alongside the existing connection and input fields. It counts sessions and normalized failures, describes the current session's phase and valid-traffic age, and retains the latest failure through pause and reconnect. The failure record includes elapsed timing, validated-frame counts and cleanup outcome. These values are kept in memory and reset when the host process restarts; they are not written to `runtime.json` or exported automatically. Existing status JSON without this object remains readable. A defaulted input-authorization status also distinguishes pending desktop approval from enabled input; a successful Resume acknowledgment can mean approval is still pending.
 
 `diagnostics.attempts` counts allowlisted connections admitted while no other session is active. `authenticated_sessions` counts valid HELLO authentications; `reconnects` counts each successful authentication after the first. `failures` contains fixed counters for timeout, transport, authentication, protocol, queue and input-worker failures. `current` describes the live session, and `last_failure` retains the most recent failure and its asynchronous cleanup result. Counters saturate rather than wrapping.
 

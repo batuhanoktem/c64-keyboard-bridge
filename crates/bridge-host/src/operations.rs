@@ -134,19 +134,56 @@ async fn test_input_with_guard(
             bail!("GUI input guard is closed; input test stayed disabled");
         }
         let backend = backend::create_backend(&selection, layout)?;
-        let mut backend = if let Some(guard) = guard {
-            Box::new(if let Some(focus) = focus_allowed {
-                runtime::GuardedBackend::new_with_focus(backend, guard, focus)
-            } else {
-                runtime::GuardedBackend::new(backend, guard)
-            }) as Box<dyn KeyboardBackend>
-        } else {
-            backend
-        };
-        post_input_test(backend.as_mut())
+        post_prepared_test_blocking(backend, guard, focus_allowed)
     })
     .await
     .context("Input test worker failed")?
+}
+
+/// Authorization precedes the frontend countdown. Preparation never posts input.
+pub async fn prepare_input_test(
+    config: &Config,
+    cancellation: tokio::sync::watch::Receiver<bool>,
+) -> Result<Box<dyn KeyboardBackend>> {
+    backend::prepare_backend(&config.backend, runtime::layout(config), cancellation)
+        .await
+        .map_err(Into::into)
+}
+/// Reuse a backend retained through the countdown; no permission dialog can open
+/// between the countdown finishing and the first deliberate press.
+pub async fn test_input_prepared(
+    backend: Box<dyn KeyboardBackend>,
+    guard: Option<Arc<AtomicBool>>,
+    focus_allowed: Option<Arc<AtomicBool>>,
+) -> Result<InputTestReport> {
+    tokio::task::spawn_blocking(move || post_prepared_test_blocking(backend, guard, focus_allowed))
+        .await
+        .context("Input test worker failed")?
+}
+fn post_prepared_test_blocking(
+    backend: Box<dyn KeyboardBackend>,
+    guard: Option<Arc<AtomicBool>>,
+    focus_allowed: Option<Arc<AtomicBool>>,
+) -> Result<InputTestReport> {
+    if guard
+        .as_ref()
+        .is_some_and(|guard| !guard.load(Ordering::SeqCst))
+        || focus_allowed
+            .as_ref()
+            .is_some_and(|focus| !focus.load(Ordering::SeqCst))
+    {
+        bail!("GUI input guard is closed; input test stayed disabled");
+    }
+    let mut backend = if let Some(guard) = guard {
+        Box::new(if let Some(focus) = focus_allowed {
+            runtime::GuardedBackend::new_with_focus(backend, guard, focus)
+        } else {
+            runtime::GuardedBackend::new(backend, guard)
+        }) as Box<dyn KeyboardBackend>
+    } else {
+        backend
+    };
+    post_input_test(backend.as_mut())
 }
 
 fn post_input_test(backend: &mut dyn KeyboardBackend) -> Result<InputTestReport> {

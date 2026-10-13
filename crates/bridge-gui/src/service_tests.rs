@@ -543,6 +543,7 @@ async fn focused_deadline_and_cancelled_countdown_never_enable_input() {
     actor.start(false, false).await.unwrap();
     actor.owned.as_mut().unwrap().ready().await.unwrap();
     actor.countdown = Some(Countdown {
+        prepared: None,
         end: Instant::now(),
         gate_epoch: actor.permit.epoch(),
         focus_epoch: actor.permit.test_focus_epoch(),
@@ -999,5 +1000,345 @@ async fn deployment_cannot_overlap_managed_startup_before_its_runtime_record_exi
         .unwrap_err();
     assert!(error.to_string().contains("Wait for startup"));
     actor.stop_owned().await.unwrap();
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn desktop_authorization_is_routed_to_the_running_cli_process_and_stays_paused() {
+    let (mut actor, _events) = actor();
+    actor.smoke = false;
+    actor.settings.backend = "portal".into();
+    let token = pairing::load_or_create_token(&actor.state_dir).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config::atomic_write(
+        &actor.state_dir.join("runtime.json"),
+        &serde_json::to_vec(&control::RuntimeRecord {
+            pid: std::process::id(),
+            port: listener.local_addr().unwrap().port(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let fixture = tokio::spawn(async move {
+        for command in ["status", "authorize"] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request: control::ControlRequest = control::read_json(&mut socket).await.unwrap();
+            assert_eq!(request.token, token.hex());
+            assert_eq!(request.command, command);
+            control::write_json(
+                &mut socket,
+                &control::ControlResponse {
+                    ok: true,
+                    status: control::Status {
+                        authorization: control::AuthorizationStatus {
+                            phase: if command == "authorize" {
+                                control::AuthorizationPhase::Pending
+                            } else {
+                                control::AuthorizationPhase::NotRequested
+                            },
+                            enable_requested: false,
+                        },
+                        ..Default::default()
+                    },
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    actor.action(GuiAction::RequestPermission).await.unwrap();
+    fixture.await.unwrap();
+    assert!(actor.owned.is_none());
+    assert!(!actor.snapshot.owned);
+    let status = actor.snapshot.status.as_ref().unwrap();
+    assert_eq!(
+        status.authorization.phase,
+        control::AuthorizationPhase::Pending
+    );
+    assert!(!status.enabled);
+    assert!(
+        actor
+            .snapshot
+            .message
+            .contains("separately running CLI process")
+    );
+    assert!(!actor.permit.allow.load(Ordering::SeqCst));
+    cleanup(actor);
+}
+#[tokio::test]
+async fn desktop_authorization_requires_a_running_posting_process() {
+    let (mut actor, _events) = actor();
+    actor.smoke = false;
+    actor.settings.backend = "portal".into();
+    let error = actor
+        .action(GuiAction::RequestPermission)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Start hosting with input disabled first")
+    );
+    assert!(!actor.state_dir.join("runtime.json").exists());
+    assert!(actor.owned.is_none());
+    cleanup(actor);
+}
+#[test]
+fn tray_acknowledgments_are_typed_monotonic_and_independent_of_error_text() {
+    let (mut actor, _events) = actor();
+    actor.acknowledge_tray_command(TrayCommand::Stop, CommandOutcome::Completed);
+    let stopped = actor.snapshot.tray_command_ack.unwrap();
+    assert_eq!(stopped.sequence, 1);
+    assert_eq!(stopped.command, TrayCommand::Stop);
+    actor.acknowledge_tray_command(TrayCommand::Enable, CommandOutcome::Rejected);
+    let rejected = actor.snapshot.tray_command_ack.unwrap();
+    assert_eq!(rejected.sequence, 2);
+    assert_eq!(rejected.outcome, CommandOutcome::Rejected);
+    actor.error("SENTINEL_ERROR_IS_NOT_A_COMMAND_RESULT");
+    assert_eq!(actor.snapshot.tray_command_ack, Some(rejected));
+    cleanup(actor);
+}
+
+struct RetainedTestBackend {
+    events: Arc<Mutex<Vec<bridge_core::RecordingEvent>>>,
+    drops: Arc<std::sync::atomic::AtomicU64>,
+}
+impl Drop for RetainedTestBackend {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl bridge_core::KeyboardBackend for RetainedTestBackend {
+    fn capabilities(&self) -> bridge_core::BackendCapabilities {
+        bridge_core::BackendCapabilities {
+            key_events: true,
+            text: false,
+            repeat: false,
+        }
+    }
+    fn press(
+        &mut self,
+        key: bridge_core::NativeKey,
+    ) -> std::result::Result<(), bridge_core::BackendError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(bridge_core::RecordingEvent::Press(key));
+        Ok(())
+    }
+    fn release(
+        &mut self,
+        key: bridge_core::NativeKey,
+    ) -> std::result::Result<(), bridge_core::BackendError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(bridge_core::RecordingEvent::Release(key));
+        Ok(())
+    }
+    fn repeat(
+        &mut self,
+        _: bridge_core::NativeKey,
+    ) -> std::result::Result<(), bridge_core::BackendError> {
+        unreachable!()
+    }
+}
+fn pending_test_fixture(
+    actor: &mut Actor,
+    grant: tokio::sync::oneshot::Receiver<()>,
+    complete_on_cancel: bool,
+) -> (
+    Arc<Mutex<Vec<bridge_core::RecordingEvent>>>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let output = events.clone();
+    let releases = drops.clone();
+    let (cancellation, mut cancellation_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        if complete_on_cancel {
+            cancellation_rx.changed().await.unwrap();
+        } else {
+            grant.await.unwrap();
+        }
+        Ok(Box::new(RetainedTestBackend {
+            events: output,
+            drops: releases,
+        }) as Box<dyn bridge_core::KeyboardBackend>)
+    });
+    actor.test_preparation = Some(PendingTestPreparation {
+        cancellation,
+        task,
+        gate_epoch: actor.permit.epoch(),
+    });
+    actor.snapshot.test_authorization_pending = true;
+    (events, drops)
+}
+#[tokio::test]
+async fn deliberate_test_countdown_starts_after_consent_and_reuses_retained_backend() {
+    let (mut actor, _events) = actor();
+    actor.action(GuiAction::FocusChanged(false)).await.unwrap();
+    let (grant, ready) = tokio::sync::oneshot::channel();
+    let (events, drops) = pending_test_fixture(&mut actor, ready, false);
+    actor.poll_test_preparation().await;
+    assert!(actor.countdown.is_none());
+    assert!(actor.snapshot.test_authorization_pending);
+    assert!(events.lock().unwrap().is_empty());
+    grant.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while actor.countdown.is_none() {
+        assert!(Instant::now() < until);
+        tokio::task::yield_now().await;
+        actor.poll_test_preparation().await;
+    }
+    assert!(actor.countdown.as_ref().unwrap().end > Instant::now() + Duration::from_secs(4));
+    assert!(events.lock().unwrap().is_empty());
+    assert!(!actor.snapshot.test_authorization_pending);
+    actor.countdown.as_mut().unwrap().end = Instant::now();
+    actor.tick().await;
+    assert_eq!(events.lock().unwrap().len(), 22);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(actor.countdown.is_none());
+    assert!(!actor.permit.test_allow.load(Ordering::SeqCst));
+    cleanup(actor);
+}
+#[tokio::test]
+async fn late_test_approval_after_quit_is_closed_and_joined_without_countdown_or_input() {
+    let (mut actor, _events) = actor();
+    let (_grant, ready) = tokio::sync::oneshot::channel();
+    let (events, drops) = pending_test_fixture(&mut actor, ready, true);
+    assert!(actor.try_quit().await);
+    assert!(actor.test_preparation.is_none());
+    assert!(actor.cancelled_test_preparations.is_empty());
+    assert!(actor.countdown.is_none());
+    assert!(actor.snapshot.quit_ready);
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    cleanup(actor);
+}
+#[tokio::test]
+async fn consent_dialog_focus_return_starts_fresh_countdown_and_later_gui_focus_cancels() {
+    let (mut actor, _events) = actor();
+    let (grant, ready) = tokio::sync::oneshot::channel();
+    let (events, drops) = pending_test_fixture(&mut actor, ready, false);
+    actor.action(GuiAction::FocusChanged(false)).await.unwrap();
+    actor.action(GuiAction::FocusChanged(true)).await.unwrap();
+    actor.poll_test_preparation().await;
+    assert!(actor.test_preparation.is_some());
+    assert!(actor.countdown.is_none());
+    assert!(events.lock().unwrap().is_empty());
+    grant.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while actor.countdown.is_none() {
+        assert!(Instant::now() < until);
+        tokio::task::yield_now().await;
+        actor.poll_test_preparation().await;
+    }
+    assert_eq!(
+        actor.countdown.as_ref().unwrap().focus_epoch,
+        actor.permit.test_focus_epoch()
+    );
+    assert!(!actor.permit.test_allow.load(Ordering::SeqCst));
+    actor.action(GuiAction::FocusChanged(false)).await.unwrap();
+    assert!(actor.countdown.is_some());
+    actor.action(GuiAction::FocusChanged(true)).await.unwrap();
+    assert!(actor.countdown.is_none());
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    cleanup(actor);
+}
+#[tokio::test]
+async fn prepared_test_closed_guard_never_types_and_always_drops_session() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let output = Box::new(RetainedTestBackend {
+        events: events.clone(),
+        drops: drops.clone(),
+    });
+    let error =
+        operations::test_input_prepared(output, Some(Arc::new(AtomicBool::new(false))), None)
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("guard is closed"));
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stop_then_unauthenticated_enable_emits_ordered_completed_and_rejected_acks() {
+    let (mut actor, _events) = actor();
+    actor.permit.close();
+    let next = SafetyState {
+        stop: 1,
+        cancel: 1,
+        ..Default::default()
+    };
+    actor.apply_safety(next).await;
+    let stopped = actor.snapshot.tray_command_ack.unwrap();
+    assert_eq!(stopped.command, TrayCommand::Stop);
+    assert_eq!(stopped.outcome, CommandOutcome::Completed);
+    let latest = actor.latest.clone();
+    let gate_epoch = actor.permit.epoch();
+    let focus_epoch = actor.permit.test_focus_epoch();
+    let quit = actor.quit.clone();
+    let quit_rx = quit.subscribe();
+    let (_safety, safety_rx) = watch::channel(next);
+    let (commands, receiver) = async_mpsc::channel(4);
+    commands
+        .send(QueuedAction {
+            action: GuiAction::Enable,
+            cancel_epoch: next.cancel,
+            auto_pause_epoch: next.auto_pause,
+            gate_epoch,
+            test_focus_epoch: focus_epoch,
+        })
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move {
+        actor.run(receiver, quit_rx, safety_rx).await;
+        actor
+    });
+    let until = Instant::now() + Duration::from_secs(1);
+    loop {
+        let ack = latest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|snapshot| snapshot.tray_command_ack);
+        if let Some(ack) = ack.filter(|ack| ack.sequence > stopped.sequence) {
+            assert_eq!(ack.command, TrayCommand::Enable);
+            assert_eq!(ack.outcome, CommandOutcome::Rejected);
+            break;
+        }
+        assert!(Instant::now() < until);
+        tokio::task::yield_now().await;
+    }
+    quit.send_replace(true);
+    cleanup(task.await.unwrap());
+}
+
+#[tokio::test]
+async fn settings_change_cancels_pending_test_consent_and_late_grant_cannot_start_countdown() {
+    let (mut actor, _events) = actor();
+    let (_grant, ready) = tokio::sync::oneshot::channel();
+    let (events, drops) = pending_test_fixture(&mut actor, ready, true);
+    let mut settings = actor.settings.clone();
+    settings.device_port = 81;
+    actor
+        .action(GuiAction::SaveSettings {
+            settings,
+            password: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(actor.test_preparation.is_none());
+    assert!(!actor.snapshot.test_authorization_pending);
+    actor.join_cancelled_test_preparations().await;
+    actor.poll_test_preparation().await;
+    assert!(actor.countdown.is_none());
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
     cleanup(actor);
 }

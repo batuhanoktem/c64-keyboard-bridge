@@ -19,6 +19,36 @@ pub struct ControlRequest {
     pub token: String,
     pub command: String,
 }
+/// Bounded permission evidence. No portal/session handles or keymap data escape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationPhase {
+    #[default]
+    NotRequested,
+    Pending,
+    Ready,
+    Denied,
+    Cancelled,
+    Failed,
+}
+impl AuthorizationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Denied => "denied",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthorizationStatus {
+    pub phase: AuthorizationPhase,
+    pub enable_requested: bool,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Status {
     pub running: bool,
@@ -31,6 +61,8 @@ pub struct Status {
     pub detail: String,
     #[serde(default)]
     pub diagnostics: SessionDiagnostics,
+    #[serde(default)]
+    pub authorization: AuthorizationStatus,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -44,6 +76,7 @@ impl Default for Status {
             blocked_combinations: 0,
             detail: "Waiting for authenticated C64 connection".into(),
             diagnostics: SessionDiagnostics::default(),
+            authorization: AuthorizationStatus::default(),
         }
     }
 }
@@ -122,8 +155,10 @@ mod tests {
         let mut status = Status::default();
         let mut legacy = serde_json::to_value(&status).unwrap();
         legacy.as_object_mut().unwrap().remove("diagnostics");
+        legacy.as_object_mut().unwrap().remove("authorization");
         let legacy: Status = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.diagnostics.attempts, 0);
+        assert_eq!(legacy.authorization, AuthorizationStatus::default());
         assert!(legacy.diagnostics.last_failure.is_none());
         status.diagnostics.begin();
         status.diagnostics.valid_frame();

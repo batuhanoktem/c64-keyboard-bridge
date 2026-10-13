@@ -158,9 +158,18 @@ impl Config {
         if !["modern", "authentic"].contains(&c.profile.as_str()) {
             bail!("KEYBOARD_PROFILE must be modern or authentic");
         }
-        if !["auto", "recording", "macos", "windows", "x11", "uinput"].contains(&c.backend.as_str())
+        if ![
+            "auto",
+            "recording",
+            "macos",
+            "windows",
+            "x11",
+            "uinput",
+            "portal",
+        ]
+        .contains(&c.backend.as_str())
         {
-            bail!("INPUT_BACKEND must be auto, recording, macos, windows, x11, or uinput");
+            bail!("INPUT_BACKEND must be auto, recording, macos, windows, x11, uinput, or portal");
         }
         if let Some(h) = &c.device_host
             && (h.is_empty()

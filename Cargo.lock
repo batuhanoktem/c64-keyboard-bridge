@@ -279,6 +279,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
+name = "ashpd"
+version = "0.13.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb8421aaa9644a5faf26735f258b669b15f063313ef8f8e2bdb28912a1a6f111"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_repr",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -599,14 +614,17 @@ name = "bridge-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ashpd",
  "bridge-core",
  "bridge-protocol",
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
  "directories",
  "dotenvy",
+ "futures-util",
  "getrandom 0.4.3",
  "libc",
+ "reis",
  "reqwest",
  "serde",
  "serde_json",
@@ -616,6 +634,8 @@ dependencies = [
  "tracing",
  "windows-sys 0.61.2",
  "x11rb",
+ "xkbcommon-dl",
+ "zbus",
 ]
 
 [[package]]
@@ -3169,6 +3189,19 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reis"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b967ec6489a42067a20724f11987bb96178ea796873cbe1afd25fb93ee6f85f"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "log",
+ "rustix 1.1.5",
+ "tokio",
+]
 
 [[package]]
 name = "renderdoc-sys"

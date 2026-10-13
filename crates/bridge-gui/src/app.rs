@@ -655,6 +655,23 @@ impl BridgeApp {
                     actions.push(GuiAction::Stop);
                 }
             });
+            if let Some(status) = &snapshot.status {
+                match status.authorization.phase {
+                    bridge_host::control::AuthorizationPhase::Pending => {
+                        ui.label("Desktop keyboard approval is pending. Input is disabled; Pause cancels the request.");
+                    }
+                    bridge_host::control::AuthorizationPhase::Denied => {
+                        ui.label("Desktop keyboard approval was denied. Enable input or Authorize desktop keyboard can request it again.");
+                    }
+                    bridge_host::control::AuthorizationPhase::Cancelled => {
+                        ui.label("Desktop keyboard approval was cancelled. Input stays disabled.");
+                    }
+                    bridge_host::control::AuthorizationPhase::Failed => {
+                        ui.label("Desktop keyboard authorization or layout was lost. Input is disabled; inspect Diagnostics before enabling again.");
+                    }
+                    _ => {}
+                }
+            }
             ui.small("Enable input activates immediately. C64 keystrokes go to the focused app, including this window. Use Pause to stop input.");
             if self.form_has_changes() {
                 ui.small("This form has unapplied changes. Apply settings before enabling input; a running GUI-owned host restarts with input disabled.");
@@ -826,11 +843,26 @@ impl BridgeApp {
         snapshot: &GuiSnapshot,
         actions: &mut Vec<GuiAction>,
     ) {
+        let portal = self.platform == GuiPlatform::Linux
+            && (self.settings.backend == "portal"
+                || snapshot
+                    .backend
+                    .as_ref()
+                    .is_some_and(|backend| backend.name == "portal"));
+        let label = if portal {
+            "Authorize desktop keyboard"
+        } else {
+            self.platform.permission_button()
+        };
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
-                    !snapshot.busy,
-                    egui::Button::new(self.platform.permission_button()),
+                    !snapshot.busy
+                        && !snapshot.status.as_ref().is_some_and(|status| {
+                            status.authorization.phase
+                                == bridge_host::control::AuthorizationPhase::Pending
+                        }),
+                    egui::Button::new(label),
                 )
                 .clicked()
             {
@@ -843,6 +875,9 @@ impl BridgeApp {
             }
         });
         ui.small(self.platform.permission_help());
+        if portal {
+            ui.small("Start hosting first. Authorization requests keyboard control only for the running posting process and keeps input paused. Pause cancels a pending request.");
+        }
     }
     fn diagnostics(
         &mut self,
@@ -870,6 +905,12 @@ impl BridgeApp {
             }
         });
         self.permission_controls(ui, snapshot, actions);
+        if snapshot.test_authorization_pending {
+            ui.label("Desktop keyboard test approval pending. The five-second countdown has not started; no input is posted.");
+            if ui.button("Cancel input test authorization").clicked() {
+                actions.push(GuiAction::CancelCountdown);
+            }
+        }
         if let Some(backend) = &snapshot.backend {
             presentation::card(ui, |ui| {
                 ui.label(format!(
@@ -903,6 +944,14 @@ impl BridgeApp {
             presentation::card(ui, |ui| {
                 let diagnostics = &status.diagnostics;
                 ui.heading("Session evidence");
+                if status.authorization.phase
+                    != bridge_host::control::AuthorizationPhase::NotRequested
+                {
+                    ui.label(format!(
+                        "Desktop keyboard authorization: {}",
+                        status.authorization.phase.as_str()
+                    ));
+                }
                 ui.label(format!(
                     "{} attempts · {} authenticated · {} reconnects",
                     diagnostics.attempts,
@@ -1145,11 +1194,14 @@ fn acknowledgment_matches(submitted: &GuiSettings, incoming: &GuiSettings) -> bo
 
 fn can_enable_input(snapshot: &GuiSnapshot) -> bool {
     snapshot.phase == GuiPhase::Running
-        && snapshot
-            .status
-            .as_ref()
-            .is_some_and(|status| status.running && status.connected && !status.enabled)
+        && snapshot.status.as_ref().is_some_and(|status| {
+            status.running
+                && status.connected
+                && !status.enabled
+                && status.authorization.phase != bridge_host::control::AuthorizationPhase::Pending
+        })
         && snapshot.countdown.is_none()
+        && !snapshot.test_authorization_pending
         && !snapshot.busy
         && !snapshot.settings_pending
 }

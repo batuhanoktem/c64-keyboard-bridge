@@ -1,7 +1,10 @@
 use crate::{
     backend,
     config::{Config, NetworkConfig},
-    control::{self, ControlRequest, ControlResponse, RuntimeRecord, Status},
+    control::{
+        self, AuthorizationPhase, AuthorizationStatus, ControlRequest, ControlResponse,
+        RuntimeRecord, Status,
+    },
     pairing::{RuntimeGuard, Token},
     rest::DeviceInfo,
     session_diagnostics::{CleanupOutcome, CurrentSession, FailureReason, SessionPhase},
@@ -10,7 +13,9 @@ use anyhow::{Context, Result, bail};
 use bridge_core::{HostPlatform, KeyboardBackend, KeyboardLayout, Mapper, MappingProfile};
 use bridge_protocol::{Decoder, Frame, KeyEvent, MatrixState, Message, Sequencer};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -109,6 +114,7 @@ struct InputEvent {
 enum WorkerControl {
     Enable {
         enabled: bool,
+        authorize_only: bool,
         generation: u64,
         reply: oneshot::Sender<std::result::Result<(), String>>,
         context: CurrentSession,
@@ -123,6 +129,10 @@ enum WorkerControl {
         matrix: MatrixState,
         context: CurrentSession,
     },
+    Prepared {
+        authorization: u64,
+        result: std::result::Result<Box<dyn KeyboardBackend>, bridge_core::BackendError>,
+    },
     Shutdown,
 }
 #[derive(Clone)]
@@ -135,6 +145,12 @@ struct WorkerHandle {
 }
 impl WorkerHandle {
     async fn enable(&self, enabled: bool) -> Result<()> {
+        self.request_input(enabled, false).await
+    }
+    async fn authorize(&self) -> Result<()> {
+        self.request_input(false, true).await
+    }
+    async fn request_input(&self, enabled: bool, authorize_only: bool) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         {
             let _order = self.control_order.lock().unwrap();
@@ -142,11 +158,12 @@ impl WorkerHandle {
             self.controls
                 .send(WorkerControl::Enable {
                     enabled,
+                    authorize_only,
                     generation,
                     reply: tx,
                     context: self.status.lock().unwrap().diagnostics.current.clone(),
                 })
-                .context("Input worker stopped")?;
+                .map_err(|_| anyhow::anyhow!("Input worker stopped"))?;
         }
         rx.await
             .context("Input worker stopped")?
@@ -202,28 +219,48 @@ fn spawn_worker(
     status: SharedStatus,
     physical: SharedMatrix,
 ) -> Result<(WorkerHandle, InputThread)> {
-    let selection = config.backend.clone();
-    let keyboard_layout = layout(config);
-    spawn_worker_with_factory(config, status, physical, move || {
-        backend::create_backend(&selection, keyboard_layout)
-    })
+    spawn_native_worker(config, status, physical, None)
 }
-
 fn spawn_worker_guarded(
     config: &Config,
     status: SharedStatus,
     physical: SharedMatrix,
     guard: Arc<AtomicBool>,
 ) -> Result<(WorkerHandle, InputThread)> {
-    let selection = config.backend.clone();
-    let keyboard_layout = layout(config);
-    spawn_worker_with_factory_guarded(
+    spawn_native_worker(
         config,
         status,
         physical,
-        move || backend::create_backend(&selection, keyboard_layout),
-        Some(guard),
+        Some(InputGuard {
+            allow: guard,
+            focus_allowed: None,
+        }),
     )
+}
+fn spawn_native_worker(
+    config: &Config,
+    status: SharedStatus,
+    physical: SharedMatrix,
+    guard: Option<InputGuard>,
+) -> Result<(WorkerHandle, InputThread)> {
+    let selection = config.backend.clone();
+    let keyboard_layout = layout(config);
+    let factory = if backend::requires_authorization(&selection)? {
+        BackendFactory::Prepared {
+            runtime: tokio::runtime::Handle::current(),
+            prepare: Arc::new(move |cancellation| {
+                let selection = selection.clone();
+                Box::pin(async move {
+                    backend::prepare_backend(&selection, keyboard_layout, cancellation).await
+                })
+            }),
+        }
+    } else {
+        BackendFactory::Immediate(Box::new(move || {
+            backend::create_backend(&selection, keyboard_layout)
+        }))
+    };
+    spawn_worker_with_backend_factory(config, status, physical, factory, guard)
 }
 
 #[derive(Clone)]
@@ -248,13 +285,10 @@ fn spawn_worker_guarded_with_focus(
     allow: Arc<AtomicBool>,
     focus_allowed: Arc<AtomicBool>,
 ) -> Result<(WorkerHandle, InputThread)> {
-    let selection = config.backend.clone();
-    let keyboard_layout = layout(config);
-    spawn_worker_with_factory_gate(
+    spawn_native_worker(
         config,
         status,
         physical,
-        move || backend::create_backend(&selection, keyboard_layout),
         Some(InputGuard {
             allow,
             focus_allowed: Some(focus_allowed),
@@ -337,6 +371,32 @@ impl KeyboardBackend for GuardedBackend {
     }
 }
 
+type PreparationFuture = Pin<
+    Box<
+        dyn Future<
+                Output = std::result::Result<Box<dyn KeyboardBackend>, bridge_core::BackendError>,
+            > + Send,
+    >,
+>;
+type Preparer = Arc<dyn Fn(watch::Receiver<bool>) -> PreparationFuture + Send + Sync>;
+enum BackendFactory {
+    Immediate(
+        Box<
+            dyn Fn() -> std::result::Result<Box<dyn KeyboardBackend>, bridge_core::BackendError>
+                + Send,
+        >,
+    ),
+    Prepared {
+        runtime: tokio::runtime::Handle,
+        prepare: Preparer,
+    },
+}
+struct PendingPreparation {
+    cancellation: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
 fn spawn_worker_with_factory(
     config: &Config,
     status: SharedStatus,
@@ -348,6 +408,7 @@ fn spawn_worker_with_factory(
     spawn_worker_with_factory_guarded(config, status, physical, factory, None)
 }
 
+#[cfg(test)]
 fn spawn_worker_with_factory_guarded(
     config: &Config,
     status: SharedStatus,
@@ -369,6 +430,7 @@ fn spawn_worker_with_factory_guarded(
     )
 }
 
+#[cfg(test)]
 fn spawn_worker_with_factory_gate(
     config: &Config,
     status: SharedStatus,
@@ -376,6 +438,21 @@ fn spawn_worker_with_factory_gate(
     factory: impl Fn() -> std::result::Result<Box<dyn KeyboardBackend>, bridge_core::BackendError>
     + Send
     + 'static,
+    guard: Option<InputGuard>,
+) -> Result<(WorkerHandle, InputThread)> {
+    spawn_worker_with_backend_factory(
+        config,
+        status,
+        physical,
+        BackendFactory::Immediate(Box::new(factory)),
+        guard,
+    )
+}
+fn spawn_worker_with_backend_factory(
+    config: &Config,
+    status: SharedStatus,
+    physical: SharedMatrix,
+    factory: BackendFactory,
     guard: Option<InputGuard>,
 ) -> Result<(WorkerHandle, InputThread)> {
     let profile = mapping_profile(config)?;
@@ -386,8 +463,15 @@ fn spawn_worker_with_factory_gate(
     let delay = config.repeat_delay;
     let interval = config.repeat_interval;
     let handle_status = status.clone();
+    let prepared_tx = controls_tx.clone();
+    let control_order = Arc::new(Mutex::new(()));
+    let worker_order = control_order.clone();
+    let worker_generation = generation.clone();
     let thread=thread::Builder::new().name("c64bridge-input".into()).spawn(move || {
         let mut mapper=Mapper::new(profile,platform());
+        let mut preparations = BTreeMap::<u64, PendingPreparation>::new();
+        let mut active_preparation: Option<(u64, bool)> = None;
+        let mut authorization_sequence = 0_u64;
         let mut backend:Option<Box<dyn KeyboardBackend>>=None;
         let mut enabled=false;let mut epoch=0;let mut repeat_at:Option<Instant>=None;let mut pending:Option<InputEvent>=None;let mut layout_check_at=Instant::now();let mut worker_context=CurrentSession::default();
         let release=|mapper:&mut Mapper,backend:&mut Option<Box<dyn KeyboardBackend>>| ->std::result::Result<(),String> {
@@ -405,6 +489,13 @@ fn spawn_worker_with_factory_gate(
             while let Ok(control)=controls_rx.try_recv() {
                 match control {
                     WorkerControl::Shutdown=>{
+                        // Cancellation closes portal sessions, then completion is joined.
+                        // No consent task or late grant is detached during shutdown.
+                        for pending in preparations.values() { pending.cancellation.send_replace(true); }
+                        if let BackendFactory::Prepared {runtime,..} = &factory {
+                            for (_, pending) in std::mem::take(&mut preparations) { let _ = runtime.block_on(pending.task); }
+                        }
+                        while let Ok(control) = controls_rx.try_recv() { drop(control); }
                         let cleanup=release(&mut mapper,&mut backend);
                         if let Err(error)=&cleanup {
                             tracing::error!(%error,"Shutdown cleanup failed; native keys may remain held");
@@ -414,6 +505,10 @@ fn spawn_worker_with_factory_gate(
                     },
                     WorkerControl::Reset {generation,failure,context}=>{
                         worker_context=context;epoch=generation;repeat_at=None;
+                        if let Some((id,_)) = active_preparation.take() {
+                            if let Some(pending) = preparations.get(&id) { pending.cancellation.send_replace(true); }
+                            status.lock().unwrap().authorization = AuthorizationStatus {phase:AuthorizationPhase::Cancelled,enable_requested:false};
+                        }
                         let cleanup=release(&mut mapper,&mut backend);
                         let mut state=status.lock().unwrap();
                         if let Some(failure)=failure {state.diagnostics.complete_cleanup(failure,cleanup.is_ok());}else if cleanup.is_err(){state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}
@@ -431,26 +526,114 @@ fn spawn_worker_with_factory_gate(
                         if cleanup_failed {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}else if let Some(cleanup)=failure_cleanup {state.diagnostics.record_worker_failure(FailureReason::Input,cleanup_outcome(&cleanup),&worker_context);}
                         state.detail=if let Err(error)=result{enabled=false;state.enabled=false;format!("Input disabled after synchronization failure: {error}")}else if enabled{"C64 synchronized; input enabled; held ordinary keys require release before typing".into()}else{"C64 synchronized; input disabled; receiving physical transitions".into()};
                     },
-                    WorkerControl::Enable {enabled:requested,generation,reply,context}=>{
+                    WorkerControl::Enable {enabled:requested,authorize_only,generation,reply,context}=>{
                         worker_context=context;epoch=generation;repeat_at=None;
+                        if let Some((id,_)) = active_preparation.take() {
+                            if let Some(pending) = preparations.get(&id) { pending.cancellation.send_replace(true); }
+                            status.lock().unwrap().authorization = AuthorizationStatus {phase:AuthorizationPhase::Cancelled,enable_requested:false};
+                        }
                         let cleanup=release(&mut mapper,&mut backend);
                         let cleanup_failed=cleanup.is_err();
                         enabled=false;status.lock().unwrap().enabled=false;
-                        let mut result=if cleanup_failed{cleanup}else if requested && !allowed() {Err("GUI input guard is closed; input remains disabled".into())}else if requested {
-                            if backend.is_none() {match factory() {Ok(b)=>backend=Some(if let Some(guard)=&guard {Box::new(GuardedBackend {inner:b,guard:guard.clone()})}else{b}),Err(e)=>{let mut state=status.lock().unwrap();state.diagnostics.record_worker_failure(FailureReason::Input,CleanupOutcome::Succeeded,&worker_context);state.detail=e.to_string();drop(state);let _=reply.send(Err(e.to_string()));continue;}}}
+                        if !cleanup_failed && matches!(factory,BackendFactory::Prepared {..}) && status.lock().unwrap().authorization.phase==AuthorizationPhase::Failed {backend=None;}
+                        if !cleanup_failed && (requested || authorize_only) && backend.is_none()
+                            && let BackendFactory::Prepared {runtime,prepare} = &factory
+                        {
+                            if requested && !allowed() {
+                                let _ = reply.send(Err("GUI input guard is closed; input remains disabled".into()));
+                                continue;
+                            }
+                            if preparations.len()>=4 {
+                                let _=reply.send(Err("Previous desktop authorization is still closing; retry after cleanup".into()));
+                                continue;
+                            }
+                            authorization_sequence = authorization_sequence.wrapping_add(1);
+                            let authorization = authorization_sequence;
+                            let (cancel, cancel_rx) = watch::channel(false);
+                            let future = prepare(cancel_rx);
+                            let controls = prepared_tx.clone();
+                            let task = runtime.spawn(async move {
+                                let result = future.await;
+                                let _ = controls.send(WorkerControl::Prepared { authorization, result });
+                            });
+                            preparations.insert(authorization, PendingPreparation { cancellation:cancel, task });
+                            active_preparation=Some((authorization,requested));
+                            let mut state=status.lock().unwrap();
+                            state.authorization=AuthorizationStatus {phase:AuthorizationPhase::Pending,enable_requested:requested};
+                            state.detail="Desktop keyboard authorization pending; input remains disabled. Pause cancels the request".into();
+                            drop(state);
+                            let _=reply.send(Ok(()));
+                            continue;
+                        }
+                        let mut result=if cleanup_failed{cleanup}else if authorize_only && matches!(factory,BackendFactory::Immediate(_)){Err("The running host backend does not use desktop portal authorization; input is paused".into())}else if requested && !allowed() {Err("GUI input guard is closed; input remains disabled".into())}else if requested {
+                            if backend.is_none() {match &factory {BackendFactory::Immediate(factory)=>match factory() {Ok(b)=>backend=Some(if let Some(guard)=&guard {Box::new(GuardedBackend {inner:b,guard:guard.clone()})}else{b}),Err(e)=>{let mut state=status.lock().unwrap();state.diagnostics.record_worker_failure(FailureReason::Input,CleanupOutcome::Succeeded,&worker_context);state.detail=e.to_string();drop(state);let _=reply.send(Err(e.to_string()));continue;}},BackendFactory::Prepared {..}=>unreachable!()}}
                             if !allowed() {Err("GUI input guard closed during authorization; input remains disabled".into())}
-                            else {mapper.synchronize(*physical.lock().unwrap(),backend.as_mut().unwrap().as_mut()).map_err(|e|e.to_string())}
+                            else {let output=backend.as_mut().unwrap().as_mut();output.validate_layout().map_err(|error|error.to_string()).and_then(|()|mapper.synchronize(*physical.lock().unwrap(),output).map_err(|error|error.to_string()))}
                         } else {Ok(())};
                         if requested && result.is_ok() && !allowed() {result=Err("GUI input guard closed before enable acknowledgment; input remains disabled".into());}
                         let failure_cleanup=if result.is_err() && !cleanup_failed {Some(release(&mut mapper,&mut backend))}else{None};
+                        let discard_failed_portal=matches!(factory,BackendFactory::Prepared {..}) && result.is_err() && allowed() && !cleanup_failed && failure_cleanup.as_ref().is_some_and(|cleanup|cleanup.is_ok());
+                        if discard_failed_portal {backend=None;}
                         enabled=requested && result.is_ok();
                         {let mut state=status.lock().unwrap();
+                        state.authorization=AuthorizationStatus {phase:if discard_failed_portal{AuthorizationPhase::Failed}else if backend.is_some() && matches!(factory,BackendFactory::Prepared {..}){AuthorizationPhase::Ready}else{state.authorization.phase},enable_requested:false};
                         if cleanup_failed {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}else if let Some(cleanup)=failure_cleanup {
                             if allowed() {state.diagnostics.record_worker_failure(FailureReason::Input,cleanup_outcome(&cleanup),&worker_context);}
                             else if cleanup.is_err() {state.diagnostics.record_worker_failure(FailureReason::Cleanup,CleanupOutcome::Failed,&worker_context);}
                         }
                         state.enabled=enabled;state.backend=if backend.is_some(){selection.clone()}else{"disabled".into()};state.detail=if let Err(error)=&result{format!("Input disabled; cleanup/authorization failed: {error}")}else if enabled{"Input enabled; held ordinary keys require release before typing".into()}else{"Input paused; all bridge-owned keys released".into()};}
                         let _=reply.send(result);
+                    },
+                    WorkerControl::Prepared {authorization,result}=>{
+                        if let Some(pending)=preparations.remove(&authorization)
+                            && let BackendFactory::Prepared {runtime,..}=&factory
+                        { let _=runtime.block_on(pending.task); }
+                        let Some((active,requested))=active_preparation else { drop(result); continue; };
+                        if authorization!=active { drop(result); continue; }
+                        // A safety/snapshot control may already be queued with a
+                        // newer event generation. Process it first; never lower
+                        // the input epoch after installing a prepared backend.
+                        let order=worker_order.lock().unwrap();
+                        if worker_generation.load(Ordering::SeqCst)!=epoch {
+                            drop(order);
+                            let _=prepared_tx.send(WorkerControl::Prepared {authorization,result});
+                            continue;
+                        }
+                        active_preparation=None;
+                        if requested && !allowed() {
+                            drop(order);drop(result);
+                            let mut state=status.lock().unwrap();
+                            state.authorization=AuthorizationStatus {phase:AuthorizationPhase::Cancelled,enable_requested:false};
+                            state.detail="Desktop authorization cancelled by the GUI safety guard; input remains disabled".into();
+                            continue;
+                        }
+                        let result=match result {
+                            Ok(output)=>{
+                                // Invalidate every event queued before consent, then quarantine
+                                // the latest physical baseline. Held ordinary keys never replay.
+                                epoch=worker_generation.fetch_add(1,Ordering::SeqCst)+1;
+                                backend=Some(if let Some(guard)=&guard {Box::new(GuardedBackend {inner:output,guard:guard.clone()})}else{output});
+                                let output=backend.as_mut().unwrap().as_mut();
+                                output.validate_layout().map_err(|error|error.to_string()).and_then(|()|if requested && allowed(){mapper.synchronize(*physical.lock().unwrap(),output).map_err(|error|error.to_string())}else{Ok(())})
+                            },
+                            Err(error)=>{
+                                let mut state=status.lock().unwrap();
+                                state.authorization=AuthorizationStatus {phase:if matches!(error,bridge_core::BackendError::PermissionDenied(_)){AuthorizationPhase::Denied}else{AuthorizationPhase::Failed},enable_requested:false};
+                                state.diagnostics.record_worker_failure(FailureReason::Input,CleanupOutcome::Succeeded,&worker_context);
+                                state.detail="Desktop keyboard authorization failed or was denied; input remains disabled".into();
+                                continue;
+                            }
+                        };
+                        drop(order);
+                        enabled=requested && result.is_ok() && allowed();
+                        let cleanup=if result.is_err(){Some(release(&mut mapper,&mut backend))}else{None};
+                        if result.is_err() && cleanup.as_ref().is_some_and(|cleanup|cleanup.is_ok()) {backend=None;}
+                        let mut state=status.lock().unwrap();
+                        if let Some(cleanup)=cleanup {state.diagnostics.record_worker_failure(FailureReason::Layout,cleanup_outcome(&cleanup),&worker_context);}
+                        state.enabled=enabled;
+                        state.backend=if backend.is_some(){selection.clone()}else{"disabled".into()};
+                        state.authorization=AuthorizationStatus {phase:if result.is_ok(){AuthorizationPhase::Ready}else{AuthorizationPhase::Failed},enable_requested:false};
+                        state.detail=if result.is_err(){"Desktop keyboard layout validation failed; input remains disabled".into()}else if enabled{"Input enabled after desktop authorization; held ordinary keys require release before typing".into()}else{"Desktop keyboard authorization ready; input remains paused".into()};
                     }
                 }
             }
@@ -482,11 +665,13 @@ fn spawn_worker_with_factory_gate(
                 Err(mpsc::RecvTimeoutError::Disconnected)=>{return release(&mut mapper,&mut backend);},
                 Err(mpsc::RecvTimeoutError::Timeout)=>{},
             }
-            if enabled && Instant::now()>=layout_check_at {
+            let monitor_authorization=matches!(factory,BackendFactory::Prepared {..}) && backend.is_some()
+                && status.lock().unwrap().authorization.phase==AuthorizationPhase::Ready;
+            if (enabled || monitor_authorization) && Instant::now()>=layout_check_at {
                 layout_check_at=Instant::now()+Duration::from_millis(100);
                 if let Err(error)=backend.as_mut().unwrap().validate_layout() {
                     let cleanup=release(&mut mapper,&mut backend);enabled=false;repeat_at=None;
-                    let mut state=status.lock().unwrap();state.enabled=false;state.diagnostics.record_worker_failure(FailureReason::Layout,cleanup_outcome(&cleanup),&worker_context);state.detail=input_failure("host layout change",error,cleanup);
+                    let mut state=status.lock().unwrap();state.enabled=false;if matches!(factory,BackendFactory::Prepared {..}){state.authorization=AuthorizationStatus {phase:AuthorizationPhase::Failed,enable_requested:false};}state.diagnostics.record_worker_failure(FailureReason::Layout,cleanup_outcome(&cleanup),&worker_context);let released=cleanup.is_ok();state.detail=input_failure(if monitor_authorization{"host layout or authorization change"}else{"host layout change"},error,cleanup);drop(state);if monitor_authorization && released {backend=None;}
                 }
             }
             if queue_idle && enabled && repeat_at.is_some_and(|t|Instant::now()>=t) {
@@ -512,7 +697,7 @@ fn spawn_worker_with_factory_gate(
             events: events_tx,
             controls: controls_tx,
             generation,
-            control_order: Arc::new(Mutex::new(())),
+            control_order,
             status: handle_status,
         },
         thread,
@@ -1069,7 +1254,7 @@ async fn run_managed(
     };
     let mut active: Option<tokio::task::JoinHandle<()>> = None;
     let result = if matches!(setup, Ok(true)) {
-        tracing::info!(address=%network.bind,advertise=%network.advertise_ip,input_enabled=options.enable_input,"Bridge ready");
+        tracing::info!(address=%network.bind,advertise=%network.advertise_ip,input_enabled=status.lock().unwrap().enabled,"Bridge ready");
         state.send_replace(RuntimeState::Ready);
         loop {
             tokio::select! {
@@ -1134,6 +1319,7 @@ async fn serve_control(
             "status" => Ok(()),
             "pause" => worker.enable(false).await,
             "resume" => worker.enable(true).await,
+            "authorize" => worker.authorize().await,
             "stop" => worker.enable(false).await,
             _ => Err(anyhow::anyhow!("Unknown control command")),
         };

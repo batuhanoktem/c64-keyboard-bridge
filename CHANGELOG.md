@@ -10,6 +10,7 @@ User-visible changes are collected here. Unreleased changes do not imply that a 
 - Genuine C64 keyboard-client and networking-probe PRGs, authenticated pairing and retained connection diagnostics.
 - Visual keyboard mapping editor, tray controls and optional OS credential storage.
 - Native input backends, conservative held-key recovery and software-only simulators.
+- GNOME Wayland keyboard control through explicit portal permission, without root or uinput access.
 - Native installers, portable packages, matching corresponding source, licensing notices and verified checksums.
 - Protected Mac signing and notarization promotion with explicit approval and draft release preparation.
 

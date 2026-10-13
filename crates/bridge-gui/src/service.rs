@@ -268,9 +268,15 @@ impl Drop for ServiceHandle {
 }
 
 struct Countdown {
+    prepared: Option<Box<dyn bridge_core::KeyboardBackend>>,
     end: Instant,
     gate_epoch: u64,
     focus_epoch: u64,
+}
+struct PendingTestPreparation {
+    cancellation: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<Box<dyn bridge_core::KeyboardBackend>>>,
+    gate_epoch: u64,
 }
 struct Actor {
     state_dir: PathBuf,
@@ -283,6 +289,8 @@ struct Actor {
     snapshot: GuiSnapshot,
     focused: bool,
     countdown: Option<Countdown>,
+    test_preparation: Option<PendingTestPreparation>,
+    cancelled_test_preparations: Vec<PendingTestPreparation>,
     events: mpsc::SyncSender<GuiEvent>,
     latest: Arc<Mutex<Option<GuiSnapshot>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -320,6 +328,8 @@ impl Actor {
             snapshot: GuiSnapshot::default(),
             focused: true,
             countdown: None,
+            test_preparation: None,
+            cancelled_test_preparations: Vec::new(),
             events,
             latest,
             wake,
@@ -397,6 +407,83 @@ impl Actor {
         self.note(message);
         self.event(GuiEvent::Error(message.into()));
     }
+    fn cancel_test_for_configuration_change(&mut self) {
+        if self.test_preparation.is_some() || self.countdown.is_some() {
+            self.permit.close();
+            self.countdown = None;
+            self.cancel_test_preparation();
+        }
+    }
+    fn cancel_test_preparation(&mut self) {
+        if let Some(pending) = self.test_preparation.take() {
+            pending.cancellation.send_replace(true);
+            self.cancelled_test_preparations.push(pending);
+        }
+        self.snapshot.test_authorization_pending = false;
+    }
+    async fn join_cancelled_test_preparations(&mut self) {
+        for pending in std::mem::take(&mut self.cancelled_test_preparations) {
+            drop(pending.task.await);
+        }
+    }
+    async fn poll_test_preparation(&mut self) {
+        let mut index = 0;
+        while index < self.cancelled_test_preparations.len() {
+            if self.cancelled_test_preparations[index].task.is_finished() {
+                let pending = self.cancelled_test_preparations.swap_remove(index);
+                drop(pending.task.await);
+            } else {
+                index += 1;
+            }
+        }
+        if self
+            .test_preparation
+            .as_ref()
+            .is_some_and(|pending| pending.gate_epoch != self.permit.epoch())
+        {
+            self.cancel_test_preparation();
+        }
+        if !self
+            .test_preparation
+            .as_ref()
+            .is_some_and(|pending| pending.task.is_finished())
+        {
+            return;
+        }
+        let pending = self.test_preparation.take().unwrap();
+        self.snapshot.test_authorization_pending = false;
+        match pending.task.await {
+            Ok(Ok(prepared)) if pending.gate_epoch == self.permit.epoch() => {
+                self.countdown = Some(Countdown {
+                    prepared: Some(prepared),
+                    end: Instant::now() + Duration::from_secs(5),
+                    gate_epoch: pending.gate_epoch,
+                    // Consent dialogs may return focus to this window. Posting
+                    // remains impossible until the following guarded countdown.
+                    focus_epoch: self.permit.test_focus_epoch(),
+                });
+                self.note("Desktop keyboard approval ready. Five-second input test countdown: focus a scratch application");
+            }
+            Ok(Ok(prepared)) => {
+                drop(prepared);
+                self.note("Obsolete desktop test approval closed; no input was posted");
+            }
+            _ => self.error(
+                "Desktop keyboard test authorization failed or was denied; no input was posted",
+            ),
+        }
+    }
+    fn acknowledge_tray_command(&mut self, command: TrayCommand, outcome: CommandOutcome) {
+        let sequence = self
+            .snapshot
+            .tray_command_ack
+            .map_or(1, |ack| ack.sequence.saturating_add(1));
+        self.snapshot.tray_command_ack = Some(TrayCommandAck {
+            sequence,
+            command,
+            outcome,
+        });
+    }
     fn publish(&mut self) {
         self.snapshot.history = self.history.iter().cloned().collect();
         self.snapshot.countdown = self.countdown.as_ref().map(|c| {
@@ -438,7 +525,17 @@ impl Actor {
     }
     fn probe_backend(&mut self) {
         if let Ok(config) = self.effective_config() {
-            let p = backend::probe_backend(&config.backend, runtime::layout(&config));
+            let mut p = backend::probe_backend(&config.backend, runtime::layout(&config));
+            if p.name == "portal"
+                && self.owned.is_some()
+                && self.snapshot.status.as_ref().is_some_and(|status| {
+                    status.authorization.phase == control::AuthorizationPhase::Ready
+                })
+            {
+                p.authorized = true;
+                p.layout_matches = Some(true);
+                p.detail="The GUI posting process has an approved keyboard session; layout and permission remain monitored".into();
+            }
             self.snapshot.backend = Some(GuiBackendInfo {
                 name: p.name,
                 available: p.available,
@@ -466,8 +563,9 @@ impl Actor {
                 queued=commands.recv()=>{
                     let Some(queued)=queued else {let _=self.quit.send(true);continue;};
                     let next=*safety.borrow_and_update();self.apply_safety(next).await;
-                    if matches!(queued.action,GuiAction::Enable|GuiAction::TestInput|GuiAction::Configured{operation:ConnectionOperation::TestInput,..}) && (queued.cancel_epoch!=next.cancel || queued.auto_pause_epoch!=next.auto_pause){self.note("Obsolete input request cancelled by a newer safety action");self.publish();continue;}
+                    if matches!(queued.action,GuiAction::Enable|GuiAction::TestInput|GuiAction::Configured{operation:ConnectionOperation::TestInput|ConnectionOperation::RequestPermission,..}) && (queued.cancel_epoch!=next.cancel || queued.auto_pause_epoch!=next.auto_pause){if matches!(queued.action,GuiAction::Enable){self.acknowledge_tray_command(TrayCommand::Enable,CommandOutcome::Cancelled);}self.note("Obsolete input request cancelled by a newer safety action");self.publish();continue;}
                     self.command_epoch=Some(queued.gate_epoch);self.command_test_focus_epoch=Some(queued.test_focus_epoch);self.snapshot.busy=true;self.publish();
+                    let tray_command=match &queued.action {GuiAction::Enable=>Some(TrayCommand::Enable),GuiAction::Stop=>Some(TrayCommand::Stop),_=>None};
                     let operation=operation_name(&queued.action);
                     let cancelable=matches!(queued.action,GuiAction::Doctor|GuiAction::DeviceInfo|GuiAction::Configured{operation:ConnectionOperation::Doctor|ConnectionOperation::DeviceInfo,..});
                     let result=if cancelable {
@@ -477,6 +575,7 @@ impl Actor {
                     self.command_test_focus_epoch=None;
                     if result.is_none(){self.snapshot.busy=false;if self.try_quit().await{break;}continue;}
                     let result=result.unwrap();
+                    if let Some(command)=tray_command {self.acknowledge_tray_command(command,if result.is_ok(){CommandOutcome::Completed}else{CommandOutcome::Rejected});}
                     if let Err(error)=result {self.error(&format!("{operation}: {}. No automatic retry was made",display_error(&error)));}
                     self.snapshot.busy=false;self.publish();
                 },
@@ -486,6 +585,8 @@ impl Actor {
     }
     async fn try_quit(&mut self) -> bool {
         self.permit.close();
+        self.cancel_test_preparation();
+        self.join_cancelled_test_preparations().await;
         if self.stop_owned().await.is_ok() {
             self.snapshot.quit_ready = true;
             self.note("Desktop stopped; external CLI sessions are unchanged");
@@ -506,6 +607,7 @@ impl Actor {
         self.snapshot.tray_available = next.tray;
         if previous.cancel != next.cancel || previous.auto_pause != next.auto_pause {
             self.countdown = None;
+            self.cancel_test_preparation();
         }
         if self
             .countdown
@@ -521,8 +623,19 @@ impl Actor {
         {
             self.error("Input disabled; owned-key cleanup failed and remains retryable");
         }
-        if previous.stop != next.stop && self.action(GuiAction::Stop).await.is_err() {
-            self.error("Stop failed during cleanup; input remains disabled for retry");
+        if previous.stop != next.stop {
+            let result = self.action(GuiAction::Stop).await;
+            self.acknowledge_tray_command(
+                TrayCommand::Stop,
+                if result.is_ok() {
+                    CommandOutcome::Completed
+                } else {
+                    CommandOutcome::Rejected
+                },
+            );
+            if result.is_err() {
+                self.error("Stop failed during cleanup; input remains disabled for retry");
+            }
         }
         if previous.tray_loss != next.tray_loss {
             self.event(GuiEvent::ShowWindow);
@@ -572,6 +685,7 @@ impl Actor {
         }
     }
     async fn tick(&mut self) {
+        self.poll_test_preparation().await;
         if self.overflowed {
             let _ = self.pause().await;
             self.overflowed = false;
@@ -584,11 +698,12 @@ impl Actor {
         {
             let countdown = self.countdown.take().unwrap();
             self.probe_backend();
-            let allowed =
-                !self.focused
-                    && self.snapshot.backend.as_ref().is_some_and(|p| {
-                        p.available && p.authorized && p.layout_matches == Some(true)
-                    });
+            let allowed = !self.focused
+                && self.snapshot.backend.as_ref().is_some_and(|p| {
+                    p.available
+                        && (countdown.prepared.is_some()
+                            || (p.authorized && p.layout_matches == Some(true)))
+                });
             if !allowed {
                 self.error("Input test countdown cancelled: switch away from the GUI and verify layout/permission");
                 return;
@@ -612,16 +727,25 @@ impl Actor {
             // Hosting stays paused during the independent test phrase.
             // Focus changes close only the test gate; explicit safety actions
             // close both gates, including during blocking native checks.
-            let result = match self.effective_config() {
-                Ok(config) => {
-                    operations::test_input_guarded_with_focus(
-                        &config,
-                        self.permit.test_allow.clone(),
-                        self.permit.focus.clone(),
-                    )
-                    .await
+            let result = if let Some(prepared) = countdown.prepared {
+                operations::test_input_prepared(
+                    prepared,
+                    Some(self.permit.test_allow.clone()),
+                    Some(self.permit.focus.clone()),
+                )
+                .await
+            } else {
+                match self.effective_config() {
+                    Ok(config) => {
+                        operations::test_input_guarded_with_focus(
+                            &config,
+                            self.permit.test_allow.clone(),
+                            self.permit.focus.clone(),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
             };
             self.permit.close();
             match result {
@@ -656,12 +780,13 @@ impl Actor {
             if !probe.available {
                 bail!("Input backend is unavailable; inspect Diagnostics");
             }
-            if !probe.authorized {
+            let pending_approval = backend::requires_authorization(&self.settings.backend)?;
+            if !probe.authorized && !pending_approval {
                 bail!(
                     "GUI posting permission is missing; inspect Diagnostics and enable the application in system settings"
                 );
             }
-            if probe.layout_matches != Some(true) {
+            if probe.layout_matches != Some(true) && !pending_approval {
                 bail!(
                     "Active keyboard layout does not match the configured layout; inspect Diagnostics"
                 );
@@ -691,6 +816,10 @@ impl Actor {
             // input before acknowledging the obsolete enable operation.
             self.pause().await?;
             self.note("Input request cancelled by a newer safety action");
+        } else if self.snapshot.status.as_ref().is_some_and(|status| {
+            status.authorization.phase == control::AuthorizationPhase::Pending
+        }) {
+            self.note("Desktop keyboard authorization pending; input remains disabled. Pause cancels approval");
         } else {
             self.note("Input enabled");
         }
@@ -699,6 +828,7 @@ impl Actor {
     async fn pause(&mut self) -> Result<()> {
         self.permit.close();
         self.countdown = None;
+        self.cancel_test_preparation();
         if !self.state_dir.join("runtime.json").exists() {
             return Ok(());
         }
@@ -718,6 +848,8 @@ impl Actor {
     async fn stop_owned(&mut self) -> Result<()> {
         self.permit.close();
         self.countdown = None;
+        self.cancel_test_preparation();
+        self.join_cancelled_test_preparations().await;
         if self
             .owned
             .as_ref()
@@ -814,6 +946,9 @@ impl Actor {
         previous.remember_password = settings.remember_password;
         let changed = previous != settings || self.password != next_password;
         config::save_settings(&self.state_dir, &settings)?;
+        if changed {
+            self.cancel_test_for_configuration_change();
+        }
         self.settings = settings;
         self.password = next_password;
         self.configuration_warning();
@@ -851,6 +986,9 @@ impl Actor {
         let accepted_form = settings.clone();
         settings.remember_password = self.settings.remember_password;
         let changed = settings != self.settings || next_password != self.password;
+        if changed {
+            self.cancel_test_for_configuration_change();
+        }
         self.snapshot.settings_pending |= changed
             && (self.owned.is_some()
                 || self
@@ -903,6 +1041,8 @@ impl Actor {
                 allow_reset,
             } => self.start(deploy, allow_reset).await?,
             GuiAction::Stop => {
+                self.cancel_test_preparation();
+                self.join_cancelled_test_preparations().await;
                 if self.owned.is_some() {
                     self.stop_owned().await?;
                 } else if self.state_dir.join("runtime.json").exists() {
@@ -943,12 +1083,33 @@ impl Actor {
                         self.note("Input test request cancelled by returning to the GUI");
                         return Ok(());
                     }
-                    self.countdown = Some(Countdown {
-                        end: Instant::now() + Duration::from_secs(5),
-                        gate_epoch: expected,
-                        focus_epoch,
-                    });
-                    self.note("Five-second input test countdown: focus a scratch application");
+                    let config = self.effective_config()?;
+                    if backend::requires_authorization(&config.backend)? {
+                        if self.cancelled_test_preparations.len() >= 4 {
+                            bail!(
+                                "Previous desktop test authorization is still closing; retry after cleanup"
+                            );
+                        }
+                        let (cancellation, cancel_rx) = watch::channel(false);
+                        let task = tokio::spawn(async move {
+                            operations::prepare_input_test(&config, cancel_rx).await
+                        });
+                        self.test_preparation = Some(PendingTestPreparation {
+                            cancellation,
+                            task,
+                            gate_epoch: expected,
+                        });
+                        self.snapshot.test_authorization_pending = true;
+                        self.note("Approve desktop keyboard control for the GUI first; the input test countdown starts after approval. Pause or Cancel closes the request");
+                    } else {
+                        self.countdown = Some(Countdown {
+                            prepared: None,
+                            end: Instant::now() + Duration::from_secs(5),
+                            gate_epoch: expected,
+                            focus_epoch,
+                        });
+                        self.note("Five-second input test countdown: focus a scratch application");
+                    }
                 } else {
                     self.enable_input(expected).await?;
                 }
@@ -956,6 +1117,7 @@ impl Actor {
             GuiAction::CancelCountdown => {
                 self.permit.close();
                 self.countdown = None;
+                self.cancel_test_preparation();
                 self.note("Input countdown cancelled");
             }
             GuiAction::FocusChanged(focused) => {
@@ -1012,6 +1174,7 @@ impl Actor {
             }
             GuiAction::ApplyProfile { document } => {
                 let path = self.save_profile(&document, None)?;
+                self.cancel_test_for_configuration_change();
                 let restart = self.owned.is_some();
                 self.settings.layout = document.layout.clone();
                 self.settings.profile = document.profile.clone();
@@ -1111,7 +1274,31 @@ impl Actor {
                     bail!("Smoke cannot request native authorization");
                 }
                 self.probe_backend();
-                if self
+                let config = self.effective_config()?;
+                if backend::requires_authorization(&config.backend)? {
+                    self.refresh_status().await;
+                    if !self
+                        .snapshot
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.running)
+                    {
+                        bail!(
+                            "Start hosting with input disabled first; desktop authorization must belong to the running posting process"
+                        );
+                    }
+                    let response = control::send(&self.state_dir, "authorize").await?;
+                    self.snapshot.status = Some(response.status);
+                    if !response.ok {
+                        bail!(
+                            "{}",
+                            response.error.unwrap_or_else(|| {
+                                "Desktop authorization could not be requested".into()
+                            })
+                        );
+                    }
+                    self.note(if self.snapshot.owned {"Desktop keyboard approval requested for the GUI posting process; input stays paused"}else{"Desktop keyboard approval requested for the separately running CLI process; input stays paused"});
+                } else if self
                     .snapshot
                     .backend
                     .as_ref()
@@ -1333,7 +1520,7 @@ pub fn diagnostic_export(snapshot: &GuiSnapshot) -> Result<Vec<u8>> {
         "application":"C64 Keyboard Bridge","version":env!("CARGO_PKG_VERSION"),"phase":snapshot.phase,
         "gui_owned":snapshot.owned,
         "backend":snapshot.backend.as_ref().map(|b|serde_json::json!({"available":b.available,"authorized":b.authorized,"layout_matches":b.layout_matches,"capabilities":b.capabilities})),
-        "runtime":snapshot.status.as_ref().map(|s|serde_json::json!({"running":s.running,"connected":s.connected,"enabled":s.enabled,"events":s.events,"blocked_combinations":s.blocked_combinations,"diagnostics":s.diagnostics})),
+        "runtime":snapshot.status.as_ref().map(|s|serde_json::json!({"running":s.running,"connected":s.connected,"enabled":s.enabled,"events":s.events,"blocked_combinations":s.blocked_combinations,"diagnostics":s.diagnostics,"authorization":s.authorization})),
     }))?)
 }
 

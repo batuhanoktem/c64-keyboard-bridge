@@ -24,7 +24,7 @@ impl GuiPlatform {
         match self {
             Self::MacOs => &["auto", "macos", "recording"],
             Self::Windows => &["auto", "windows", "recording"],
-            Self::Linux => &["auto", "x11", "uinput", "recording"],
+            Self::Linux => &["auto", "x11", "portal", "uinput", "recording"],
         }
     }
     pub fn supports_backend(self, backend: &str) -> bool {
@@ -53,7 +53,7 @@ impl GuiPlatform {
                 "Windows SendInput cannot post into applications running at a higher integrity level, such as an elevated editor. Use a normal user application. This checks the GUI posting process; a separate CLI session checks its own access."
             }
             Self::Linux => {
-                "X11 uses the existing desktop keyboard map through XTEST. Wayland requires explicitly granted /dev/uinput access. Never run the network application as root. This checks the GUI posting process; a separate CLI session checks its own access."
+                "GNOME Wayland uses desktop-approved keyboard control through the portal. X11 uses XTEST. Sway/Hyprland uinput requires explicitly granted /dev/uinput access. Never run the network application as root. Approval belongs to the running posting process."
             }
         }
     }
@@ -165,6 +165,25 @@ pub struct Activity {
     pub elapsed_ms: u64,
     pub summary: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayCommand {
+    Stop,
+    Enable,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutcome {
+    Completed,
+    Rejected,
+    Cancelled,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TrayCommandAck {
+    pub sequence: u64,
+    pub command: TrayCommand,
+    pub outcome: CommandOutcome,
+}
 #[derive(Clone, Debug, Default)]
 pub struct GuiSnapshot {
     pub phase: GuiPhase,
@@ -181,6 +200,8 @@ pub struct GuiSnapshot {
     pub configuration_warning: String,
     pub busy: bool,
     pub tray_available: bool,
+    pub tray_command_ack: Option<TrayCommandAck>,
+    pub test_authorization_pending: bool,
 }
 // Password-bearing commands deliberately have no Debug or Serialize implementation.
 #[derive(Clone)]

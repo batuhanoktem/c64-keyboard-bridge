@@ -19,7 +19,8 @@ Start with `c64-keyboard-bridge doctor` or `c64-keyboard-bridge doctor --json`, 
 | Host layout rejected or changed | Select a supported standard US/UK source matching configuration and profile, then deliberately resume. IMEs and unknown variants are rejected. |
 | XTEST refuses `DISPLAY` | Use the intended local AF_UNIX display, such as `:0` or `unix:0`, in that desktop session. Remote/TCP and SSH-forwarded displays such as `localhost:10.0` are unsupported. |
 | X11 operation exceeds 500 ms | Inspect the local X server and its authorization/session state. Connection/setup and request/reply waits use nonblocking I/O and finite polling; input disables on failure. Restore the connection before deliberately retrying cleanup/resume. |
-| Wayland uinput has unverified layout | Use supported Sway/Hyprland and its query tool; configure the actual bridge device to standard US/UK. Other compositors are currently unsupported. |
+| GNOME desktop approval is pending or denied | Use the portal backend and approve keyboard control for the running posting process. Pause/Stop cancels a pending request. Doctor never opens the permission dialog. |
+| Wayland uinput has unverified layout | Use supported Sway/Hyprland and its query tool; configure the actual bridge device to standard US/UK. GNOME uses the separate portal backend; other compositor acceptance is unverified. |
 | Wrong `@`, quotes, or symbols | Match US/UK input sources; macOS British differs from PC British. Authentic mapping has documented gaps. |
 | Some simultaneous keys stop forwarding | Release every ordinary key. Check consumed-Shift conflicts, ghost rectangles, and controller interference. |
 | Unicode action is blocked on Linux | Linux text support is absent; use physical-key mappings or a supported platform. Check the blocked-combination counter. |

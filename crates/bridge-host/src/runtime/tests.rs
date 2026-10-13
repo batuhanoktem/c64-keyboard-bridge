@@ -2113,3 +2113,446 @@ async fn independent_focus_guard_prevents_stale_arming_during_factory_and_output
     assert!(backend.type_text("do not post").is_err());
     assert!(trace.events.lock().unwrap().is_empty());
 }
+
+struct PreparedRequest {
+    grant: oneshot::Sender<std::result::Result<(), BackendError>>,
+    cancelled: watch::Receiver<bool>,
+}
+struct PreparedBackend {
+    trace: Arc<Trace>,
+    drops: Arc<AtomicU64>,
+}
+impl Drop for PreparedBackend {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl KeyboardBackend for PreparedBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        TestBackend(self.trace.clone()).capabilities()
+    }
+    fn validate_layout(&mut self) -> std::result::Result<(), BackendError> {
+        TestBackend(self.trace.clone()).validate_layout()
+    }
+    fn press(&mut self, key: NativeKey) -> std::result::Result<(), BackendError> {
+        TestBackend(self.trace.clone()).press(key)
+    }
+    fn release(&mut self, key: NativeKey) -> std::result::Result<(), BackendError> {
+        TestBackend(self.trace.clone()).release(key)
+    }
+    fn repeat(&mut self, key: NativeKey) -> std::result::Result<(), BackendError> {
+        TestBackend(self.trace.clone()).repeat(key)
+    }
+}
+struct AuthorizationHarness {
+    inner: Harness,
+    requests: tokio::sync::mpsc::UnboundedReceiver<PreparedRequest>,
+    drops: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+}
+impl AuthorizationHarness {
+    fn new(cooperative_cancel: bool) -> Self {
+        Self::with_guard(cooperative_cancel, None)
+    }
+    fn with_guard(cooperative_cancel: bool, guard: Option<Arc<AtomicBool>>) -> Self {
+        let config = Config::from_values(
+            BTreeMap::from([("INPUT_BACKEND".into(), "recording".into())]),
+            BTreeMap::new(),
+            crate::config::Overrides::default(),
+        )
+        .unwrap();
+        let status = Arc::new(Mutex::new(Status::default()));
+        let physical = Arc::new(Mutex::new(MatrixState::default()));
+        let trace = Arc::new(Trace::default());
+        let drops = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicU64::new(0));
+        let (requests_tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        let output = trace.clone();
+        let backend_drops = drops.clone();
+        let tasks_completed = completed.clone();
+        let prepare: Preparer = Arc::new(move |mut cancellation| {
+            let (grant, mut receiver) = oneshot::channel();
+            requests_tx
+                .send(PreparedRequest {
+                    grant,
+                    cancelled: cancellation.clone(),
+                })
+                .unwrap();
+            let output = output.clone();
+            let drops = backend_drops.clone();
+            let completed = tasks_completed.clone();
+            Box::pin(async move {
+                let result = if cooperative_cancel {
+                    tokio::select! {biased;_=super::cancellation(&mut cancellation)=>Err(BackendError::Unavailable("cancelled private fixture".into())),result=&mut receiver=>result.unwrap_or_else(|_|Err(BackendError::Unavailable("fixture closed".into())))}
+                } else {
+                    receiver
+                        .await
+                        .unwrap_or_else(|_| Err(BackendError::Unavailable("fixture closed".into())))
+                };
+                completed.fetch_add(1, Ordering::SeqCst);
+                result?;
+                Ok(Box::new(PreparedBackend {
+                    trace: output,
+                    drops,
+                }) as Box<dyn KeyboardBackend>)
+            })
+        });
+        let (worker, thread) = spawn_worker_with_backend_factory(
+            &config,
+            status.clone(),
+            physical.clone(),
+            BackendFactory::Prepared {
+                runtime: tokio::runtime::Handle::current(),
+                prepare,
+            },
+            guard.map(|allow| InputGuard {
+                allow,
+                focus_allowed: None,
+            }),
+        )
+        .unwrap();
+        Self {
+            inner: Harness {
+                worker,
+                thread: Some(thread),
+                status,
+                physical,
+                trace,
+            },
+            requests,
+            drops,
+            completed,
+        }
+    }
+    async fn next(&mut self) -> PreparedRequest {
+        tokio::time::timeout(Duration::from_secs(1), self.requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+    async fn phase(&self, phase: AuthorizationPhase) {
+        self.inner
+            .wait_for(|| self.inner.status.lock().unwrap().authorization.phase == phase)
+            .await;
+    }
+    async fn shutdown(mut self) {
+        self.inner
+            .worker
+            .controls
+            .send(WorkerControl::Shutdown)
+            .unwrap();
+        let thread = self.inner.thread.take().unwrap();
+        tokio::task::spawn_blocking(move || thread.join().unwrap().unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn consent_pending_responds_quickly_drains_disabled_events_and_pause_cancels() {
+    let mut h = AuthorizationHarness::new(true);
+    tokio::time::timeout(Duration::from_millis(250), h.inner.worker.enable(true))
+        .await
+        .unwrap()
+        .unwrap();
+    h.phase(AuthorizationPhase::Pending).await;
+    let mut request = h.next().await;
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    for _ in 0..150 {
+        h.inner.event(PhysicalKey::A, true);
+        h.inner.event(PhysicalKey::A, false);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(h.inner.events().is_empty());
+    tokio::time::timeout(Duration::from_millis(250), h.inner.worker.enable(false))
+        .await
+        .unwrap()
+        .unwrap();
+    request.cancelled.changed().await.unwrap();
+    assert!(*request.cancelled.borrow());
+    h.phase(AuthorizationPhase::Cancelled).await;
+    h.inner
+        .wait_for(|| h.completed.load(Ordering::SeqCst) == 1)
+        .await;
+    assert!(h.inner.events().is_empty());
+    h.shutdown().await;
+}
+#[tokio::test]
+async fn late_consent_after_pause_is_closed_without_overwriting_newer_authorization() {
+    let mut h = AuthorizationHarness::new(false);
+    h.inner.worker.enable(true).await.unwrap();
+    let stale = h.next().await;
+    h.inner.worker.enable(false).await.unwrap();
+    h.inner.worker.authorize().await.unwrap();
+    let current = h.next().await;
+    current.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Ready).await;
+    stale.grant.send(Ok(())).unwrap();
+    h.inner
+        .wait_for(|| h.drops.load(Ordering::SeqCst) == 1)
+        .await;
+    assert_eq!(
+        h.inner.status.lock().unwrap().authorization.phase,
+        AuthorizationPhase::Ready
+    );
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    assert!(h.inner.events().is_empty());
+    let drops = h.drops.clone();
+    h.shutdown().await;
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+}
+#[tokio::test]
+async fn successful_consent_quarantines_held_ordinary_keys_and_retains_session_on_pause() {
+    let mut h = AuthorizationHarness::new(true);
+    h.inner.worker.enable(true).await.unwrap();
+    let request = h.next().await;
+    h.inner.event(PhysicalKey::LeftShift, true);
+    h.inner.event(PhysicalKey::A, true);
+    request.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Ready).await;
+    assert!(h.inner.status.lock().unwrap().enabled);
+    assert!(h.inner.events().is_empty());
+    h.inner.event(PhysicalKey::LeftShift, false);
+    h.inner.event(PhysicalKey::A, false);
+    h.inner.event(PhysicalKey::A, true);
+    h.inner.event(PhysicalKey::A, false);
+    h.inner
+        .wait_for(|| {
+            h.inner
+                .events()
+                .iter()
+                .any(|event| matches!(event, RecordingEvent::Release(NativeKey::A)))
+        })
+        .await;
+    assert_eq!(
+        h.inner.events(),
+        vec![
+            RecordingEvent::Press(NativeKey::A),
+            RecordingEvent::Release(NativeKey::A)
+        ]
+    );
+    h.inner.worker.enable(false).await.unwrap();
+    h.inner.worker.enable(true).await.unwrap();
+    assert!(h.requests.try_recv().is_err());
+    assert_eq!(h.completed.load(Ordering::SeqCst), 1);
+    h.shutdown().await;
+}
+#[tokio::test]
+async fn authorize_only_never_posts_even_held_modifiers_and_shutdown_joins_pending_cleanup() {
+    let mut h = AuthorizationHarness::new(true);
+    h.inner.event(PhysicalKey::LeftShift, true);
+    h.inner.worker.authorize().await.unwrap();
+    let request = h.next().await;
+    request.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Ready).await;
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    assert!(h.inner.events().is_empty());
+    h.shutdown().await;
+    let mut h = AuthorizationHarness::new(true);
+    h.inner.worker.authorize().await.unwrap();
+    let mut request = h.next().await;
+    let completed = h.completed.clone();
+    h.shutdown().await;
+    assert!(*request.cancelled.borrow_and_update());
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn denied_authorization_is_typed_and_does_not_copy_backend_supplied_secrets() {
+    let mut h = AuthorizationHarness::new(true);
+    h.inner.worker.enable(true).await.unwrap();
+    let request = h.next().await;
+    request
+        .grant
+        .send(Err(BackendError::PermissionDenied(
+            "PORTAL_SECRET_TOKEN_KEYMAP_SENTINEL".into(),
+        )))
+        .unwrap();
+    h.phase(AuthorizationPhase::Denied).await;
+    let status = h.inner.status.lock().unwrap().snapshot();
+    assert!(!status.enabled);
+    assert!(!serde_json::to_string(&status).unwrap().contains("SENTINEL"));
+    h.shutdown().await;
+}
+
+// Deliberately hold the worker's ordering barrier while its independent consent
+// future runs, to force the queued-control/result race without wall-clock sleeps.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn queued_pause_precedes_prepared_generation_and_fresh_resume_keeps_processing_events() {
+    let mut h = AuthorizationHarness::new(false);
+    h.inner.worker.enable(true).await.unwrap();
+    let request = h.next().await;
+    let order = h.inner.worker.control_order.lock().unwrap();
+    request.grant.send(Ok(())).unwrap();
+    // The preparation task completes without awaits between this marker and its
+    // ordered result send. Holding control_order blocks result installation.
+    while h.completed.load(Ordering::SeqCst) != 1 {
+        tokio::task::yield_now().await;
+    }
+    let generation = h.inner.worker.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let (reply, response) = oneshot::channel();
+    h.inner
+        .worker
+        .controls
+        .send(WorkerControl::Enable {
+            enabled: false,
+            authorize_only: false,
+            generation,
+            reply,
+            context: CurrentSession::default(),
+        })
+        .unwrap();
+    drop(order);
+    response.await.unwrap().unwrap();
+    h.inner
+        .wait_for(|| h.drops.load(Ordering::SeqCst) == 1)
+        .await;
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    h.inner.worker.enable(true).await.unwrap();
+    let fresh = h.next().await;
+    fresh.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Ready).await;
+    h.inner.event(PhysicalKey::A, true);
+    h.inner.event(PhysicalKey::A, false);
+    h.inner.wait_for(|| h.inner.events().len() == 2).await;
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn paused_authorization_revocation_disables_and_closes_session_then_can_prepare_again() {
+    let mut h = AuthorizationHarness::new(true);
+    h.inner.worker.authorize().await.unwrap();
+    let request = h.next().await;
+    request.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Ready).await;
+    h.inner.trace.fail_layout.store(true, Ordering::SeqCst);
+    h.phase(AuthorizationPhase::Failed).await;
+    h.inner
+        .wait_for(|| h.drops.load(Ordering::SeqCst) == 1)
+        .await;
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    assert!(h.inner.events().is_empty());
+    h.inner.trace.fail_layout.store(false, Ordering::SeqCst);
+    h.inner.worker.enable(true).await.unwrap();
+    let request = h.next().await;
+    request.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Ready).await;
+    assert!(h.inner.status.lock().unwrap().enabled);
+    h.shutdown().await;
+}
+#[tokio::test]
+async fn foreground_enable_pending_consent_keeps_control_ready_and_runtime_cancel_joins_cleanup() {
+    let parent = tempfile::tempdir().unwrap();
+    let config = managed_config(parent.path());
+    let mut options = managed_options();
+    options.enable_input = true;
+    let completed = Arc::new(AtomicBool::new(false));
+    let finished = completed.clone();
+    let prepare: Preparer = Arc::new(move |mut cancel| {
+        let completed = finished.clone();
+        Box::pin(async move {
+            super::cancellation(&mut cancel).await;
+            completed.store(true, Ordering::SeqCst);
+            Err(BackendError::Unavailable(
+                "cancelled private fixture".into(),
+            ))
+        })
+    });
+    let mut runtime =
+        ManagedRuntime::spawn_with_worker(config, options, move |config, status, physical| {
+            spawn_worker_with_backend_factory(
+                config,
+                status,
+                physical,
+                BackendFactory::Prepared {
+                    runtime: tokio::runtime::Handle::current(),
+                    prepare,
+                },
+                None,
+            )
+        });
+    runtime.ready().await.unwrap();
+    let response = control::send(parent.path(), "status").await.unwrap();
+    assert!(response.ok);
+    assert_eq!(
+        response.status.authorization.phase,
+        AuthorizationPhase::Pending
+    );
+    assert!(!response.status.enabled);
+    runtime.request_stop();
+    tokio::time::timeout(Duration::from_secs(2), runtime.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completed.load(Ordering::SeqCst));
+    assert!(!parent.path().join("runtime.json").exists());
+}
+
+#[tokio::test]
+async fn gui_safety_guard_closing_before_consent_result_closes_stale_grant() {
+    let guard = Arc::new(AtomicBool::new(true));
+    let mut h = AuthorizationHarness::with_guard(false, Some(guard.clone()));
+    h.inner.worker.enable(true).await.unwrap();
+    let request = h.next().await;
+    guard.store(false, Ordering::SeqCst);
+    request.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Cancelled).await;
+    h.inner
+        .wait_for(|| h.drops.load(Ordering::SeqCst) == 1)
+        .await;
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    assert!(h.inner.events().is_empty());
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_prepared_backend_is_closed_after_cleanup_and_retry_requires_fresh_consent() {
+    let mut h = AuthorizationHarness::new(true);
+    h.inner.trace.fail_layout.store(true, Ordering::SeqCst);
+    h.inner.worker.enable(true).await.unwrap();
+    let request = h.next().await;
+    request.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Failed).await;
+    h.inner
+        .wait_for(|| h.drops.load(Ordering::SeqCst) == 1)
+        .await;
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    assert!(h.inner.events().is_empty());
+    h.inner.trace.fail_layout.store(false, Ordering::SeqCst);
+    h.inner.worker.enable(true).await.unwrap();
+    assert_eq!(
+        h.inner.status.lock().unwrap().authorization.phase,
+        AuthorizationPhase::Pending
+    );
+    assert!(!h.inner.status.lock().unwrap().enabled);
+    let fresh = h.next().await;
+    fresh.grant.send(Ok(())).unwrap();
+    h.phase(AuthorizationPhase::Ready).await;
+    assert!(h.inner.status.lock().unwrap().enabled);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn wrong_backend_authorization_request_cannot_discard_a_held_keys_release() {
+    let h = Harness::new();
+    h.worker.enable(true).await.unwrap();
+    h.event(PhysicalKey::A, true);
+    h.wait_for(|| h.events().len() == 1).await;
+    assert!(
+        h.worker
+            .authorize()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not use desktop portal")
+    );
+    assert!(!h.status.lock().unwrap().enabled);
+    assert_eq!(
+        h.events(),
+        vec![
+            RecordingEvent::Press(NativeKey::A),
+            RecordingEvent::Release(NativeKey::A)
+        ]
+    );
+    h.event(PhysicalKey::A, false);
+}
