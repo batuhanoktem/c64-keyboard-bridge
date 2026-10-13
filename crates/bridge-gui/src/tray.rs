@@ -36,7 +36,7 @@ impl Tray {
             for (id, label) in [
                 ("open", "Open C64 Keyboard Bridge"),
                 ("pause", "Pause input"),
-                ("enable", "Enable input…"),
+                ("enable", "Enable input"),
                 ("stop", "Stop bridge"),
                 ("quit", "Quit"),
             ] {
@@ -219,7 +219,7 @@ impl ksni::Tray for LinuxTray {
         [
             ("Open C64 Keyboard Bridge", TrayEvent::Open),
             ("Pause input", TrayEvent::Pause),
-            ("Enable input…", TrayEvent::Enable),
+            ("Enable input", TrayEvent::Enable),
             ("Stop bridge", TrayEvent::Stop),
             ("Quit", TrayEvent::Quit),
         ]

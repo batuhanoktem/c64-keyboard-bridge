@@ -364,7 +364,7 @@ impl BridgeApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Switch to your scratch application · {seconds}s"
+                            "Native input test · switch to your scratch application · {seconds}s"
                         ))
                         .strong(),
                     );
@@ -372,7 +372,7 @@ impl BridgeApp {
                         actions.push(GuiAction::CancelCountdown);
                     }
                 });
-                ui.small("Input remains disabled if this window is focused or the connection/layout checks fail.");
+                ui.small("The input test is cancelled if this window is focused or permission/layout checks fail.");
             });
         }
         ui.horizontal_top(|ui| {
@@ -554,7 +554,7 @@ impl BridgeApp {
         presentation::heading(
             ui,
             "Connection",
-            "Enter the C64 address and password, check Device information, then start hosting. Enable input only when your target application is ready.",
+            "Enter the C64 address and password, check Device information, then start hosting. Enable input when the keyboard client is connected.",
         );
         if !snapshot.configuration_warning.is_empty() {
             ui.colored_label(ui.visuals().warn_fg_color, &snapshot.configuration_warning);
@@ -618,7 +618,7 @@ impl BridgeApp {
                 if ui
                     .add_enabled(
                         can_enable_input(snapshot) && !self.form_has_changes(),
-                        egui::Button::new("Enable input in 5s"),
+                        egui::Button::new("Enable input"),
                     )
                     .clicked()
                 {
@@ -634,6 +634,7 @@ impl BridgeApp {
                     actions.push(GuiAction::Stop);
                 }
             });
+            ui.small("Enable input activates immediately. C64 keystrokes go to the focused app, including this window. Use Pause to stop input.");
             if self.form_has_changes() {
                 ui.small("This form has unapplied changes. Apply settings before enabling input; a running GUI-owned host restarts with input disabled.");
             }

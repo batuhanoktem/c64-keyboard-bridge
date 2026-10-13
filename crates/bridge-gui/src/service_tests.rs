@@ -247,6 +247,58 @@ fn cleanup(actor: Actor) {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+async fn authenticated_client(actor: &mut Actor) -> tokio::net::TcpStream {
+    use bridge_protocol::{Frame, MatrixState, Message};
+    use tokio::io::AsyncWriteExt;
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", actor.settings.bridge_port))
+        .await
+        .unwrap();
+    for (sequence, message) in [
+        Message::Hello {
+            token: pairing::read_token(&actor.state_dir).unwrap().0,
+            capabilities: 1,
+            device_id: "isolated-gui-test".into(),
+        },
+        Message::StateSync(MatrixState::default()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client
+            .write_all(
+                &Frame {
+                    sequence: sequence as u16,
+                    message,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            actor.refresh_status().await;
+            if actor
+                .snapshot
+                .status
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .current
+                .phase
+                == bridge_host::session_diagnostics::SessionPhase::Active
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    client
+}
+
 #[tokio::test]
 async fn gui_quit_leaves_external_cli_running_until_explicit_stop() {
     let (mut actor, _events) = actor();
@@ -265,9 +317,24 @@ async fn gui_quit_leaves_external_cli_running_until_explicit_stop() {
     actor.refresh_status().await;
     assert!(!actor.snapshot.owned);
     assert!(actor.snapshot.status.as_ref().unwrap().running);
+    let _client = authenticated_client(&mut actor).await;
+    // The CLI is the posting process: an unavailable GUI backend must not
+    // prevent explicit control of its recording runtime.
+    actor.snapshot.backend = None;
+    actor.action(GuiAction::Enable).await.unwrap();
+    assert!(actor.focused);
+    assert!(actor.countdown.is_none());
+    assert!(actor.snapshot.status.as_ref().unwrap().enabled);
     actor.stop_owned().await.unwrap();
     assert!(!external.is_finished());
     assert!(actor.state_dir.join("runtime.json").exists());
+    assert!(
+        control::send(&actor.state_dir, "status")
+            .await
+            .unwrap()
+            .status
+            .enabled
+    );
     actor.action(GuiAction::Stop).await.unwrap();
     external.wait().await.unwrap();
     assert!(!actor.state_dir.join("runtime.json").exists());
@@ -302,24 +369,26 @@ async fn mapping_apply_restarts_owned_host_without_reset_or_input_enable() {
 }
 
 #[tokio::test]
-async fn returning_gui_focus_and_losing_tray_pause_owned_input() {
+async fn focused_enable_is_immediate_focus_changes_keep_input_on_and_tray_loss_pauses() {
     let (mut actor, events) = actor();
     actor.start(false, false).await.unwrap();
     actor.owned.as_mut().unwrap().ready().await.unwrap();
+    let _client = authenticated_client(&mut actor).await;
+    assert!(actor.focused);
+    actor.action(GuiAction::Enable).await.unwrap();
+    assert!(actor.countdown.is_none());
+    assert!(actor.snapshot.status.as_ref().unwrap().enabled);
     actor.action(GuiAction::FocusChanged(false)).await.unwrap();
-    assert!(actor.permit.arm(actor.permit.epoch()));
-    control::send(&actor.state_dir, "resume").await.unwrap();
     actor.action(GuiAction::FocusChanged(true)).await.unwrap();
     assert!(
-        !control::send(&actor.state_dir, "status")
+        control::send(&actor.state_dir, "status")
             .await
             .unwrap()
             .status
             .enabled
     );
+    assert!(actor.permit.allow.load(Ordering::Acquire));
     actor.action(GuiAction::FocusChanged(false)).await.unwrap();
-    assert!(actor.permit.arm(actor.permit.epoch()));
-    control::send(&actor.state_dir, "resume").await.unwrap();
     actor.action(GuiAction::TrayAvailable(true)).await.unwrap();
     actor.action(GuiAction::TrayAvailable(false)).await.unwrap();
     assert!(
@@ -341,8 +410,8 @@ async fn focused_deadline_and_cancelled_countdown_never_enable_input() {
     actor.owned.as_mut().unwrap().ready().await.unwrap();
     actor.countdown = Some(Countdown {
         end: Instant::now(),
-        test: true,
         gate_epoch: actor.permit.epoch(),
+        focus_epoch: actor.permit.test_focus_epoch(),
     });
     actor.tick().await;
     assert!(actor.countdown.is_none());
@@ -354,10 +423,90 @@ async fn focused_deadline_and_cancelled_countdown_never_enable_input() {
             .status
             .enabled
     );
-    actor.action(GuiAction::Enable).await.unwrap();
+    actor.action(GuiAction::TestInput).await.unwrap();
     actor.action(GuiAction::CancelCountdown).await.unwrap();
     assert!(actor.countdown.is_none());
     actor.stop_owned().await.unwrap();
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn immediate_enable_without_authenticated_client_stays_off() {
+    let (mut actor, _events) = actor();
+    actor.start(false, false).await.unwrap();
+    actor.owned.as_mut().unwrap().ready().await.unwrap();
+    let error = actor.action(GuiAction::Enable).await.unwrap_err();
+    assert!(error.to_string().contains("No authenticated client"));
+    assert!(actor.countdown.is_none());
+    assert!(!actor.permit.allow.load(Ordering::Acquire));
+    assert!(
+        !control::send(&actor.state_dir, "status")
+            .await
+            .unwrap()
+            .status
+            .enabled
+    );
+    actor.stop_owned().await.unwrap();
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn priority_cancel_during_immediate_resume_also_pauses_external_cli() {
+    let (mut actor, _events) = actor();
+    let token = pairing::load_or_create_token(&actor.state_dir).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config::atomic_write(
+        &actor.state_dir.join("runtime.json"),
+        &serde_json::to_vec(&control::RuntimeRecord {
+            pid: std::process::id(),
+            port: listener.local_addr().unwrap().port(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let permit = actor.permit.clone();
+    let fixture = tokio::spawn(async move {
+        for command in ["pause", "status", "resume", "pause"] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request: control::ControlRequest = control::read_json(&mut socket).await.unwrap();
+            assert_eq!(request.token, token.hex());
+            assert_eq!(request.command, command);
+            if command == "resume" {
+                // The window thread closes this same gate for Pause/Stop/Quit,
+                // without waiting for an in-flight control response.
+                permit.close();
+            }
+            control::write_json(
+                &mut socket,
+                &control::ControlResponse {
+                    ok: true,
+                    status: control::Status {
+                        connected: true,
+                        enabled: command == "resume",
+                        backend: "recording".into(),
+                        ..Default::default()
+                    },
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), actor.action(GuiAction::Enable))
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.await.unwrap();
+    assert!(actor.countdown.is_none());
+    assert!(!actor.permit.allow.load(Ordering::Acquire));
+    assert!(!actor.snapshot.status.as_ref().unwrap().enabled);
+    assert!(
+        actor
+            .snapshot
+            .message
+            .contains("cancelled by a newer safety action")
+    );
     cleanup(actor);
 }
 
@@ -468,22 +617,27 @@ fn diagnostic_export_and_history_are_bounded_and_exclude_peer_secrets_and_keys()
 }
 
 #[test]
-fn rapid_focus_flip_and_stale_countdown_cannot_reopen_output() {
+fn rapid_focus_flip_closes_only_test_output_and_stale_test_cannot_reopen() {
     let permit = OutputPermit::default();
     permit.focus_changed(false);
     let deadline = permit.epoch();
+    let focus_epoch = permit.test_focus_epoch();
     assert!(permit.arm(deadline));
+    assert!(permit.arm_test(deadline, focus_epoch));
     permit.focus_changed(true);
     permit.focus_changed(false);
-    assert!(!permit.allow.load(Ordering::Acquire));
-    assert!(!permit.arm(deadline));
-    assert!(permit.arm(permit.epoch()));
+    assert!(permit.allow.load(Ordering::Acquire));
+    assert!(!permit.test_allow.load(Ordering::Acquire));
+    assert!(!permit.arm_test(deadline, focus_epoch));
+    assert!(permit.arm(deadline));
     permit.close();
     assert!(!permit.allow.load(Ordering::Acquire));
+    assert!(!permit.test_allow.load(Ordering::Acquire));
+    assert!(!permit.arm(deadline));
 }
 
 #[test]
-fn full_gui_queue_does_not_delay_focus_pause_stop_or_quit() {
+fn full_gui_queue_keeps_normal_focus_independent_and_does_not_delay_safety_actions() {
     let (commands, mut receiver) = async_mpsc::channel(64);
     let (events, event_rx) = mpsc::sync_channel(128);
     let (quit, quit_rx) = watch::channel(false);
@@ -503,10 +657,17 @@ fn full_gui_queue_does_not_delay_focus_pause_stop_or_quit() {
     assert!(handle.send(GuiAction::Doctor).is_err());
     handle.send(GuiAction::FocusChanged(false)).unwrap();
     assert!(handle.permit.arm(handle.permit.epoch()));
+    assert!(
+        handle
+            .permit
+            .arm_test(handle.permit.epoch(), handle.permit.test_focus_epoch())
+    );
     handle.send(GuiAction::FocusChanged(true)).unwrap();
     handle.send(GuiAction::FocusChanged(false)).unwrap();
-    assert!(!handle.permit.allow.load(Ordering::Acquire));
+    assert!(handle.permit.allow.load(Ordering::Acquire));
+    assert!(!handle.permit.test_allow.load(Ordering::Acquire));
     handle.send(GuiAction::Pause).unwrap();
+    assert!(!handle.permit.allow.load(Ordering::Acquire));
     handle.send(GuiAction::CancelCountdown).unwrap();
     handle.send(GuiAction::Stop).unwrap();
     handle.send(GuiAction::TrayAvailable(false)).unwrap();
@@ -525,7 +686,7 @@ async fn newer_safety_epoch_cancels_countdown_even_before_actor_observes_focus()
     actor.action(GuiAction::FocusChanged(false)).await.unwrap();
     actor.start(false, false).await.unwrap();
     actor.owned.as_mut().unwrap().ready().await.unwrap();
-    actor.action(GuiAction::Enable).await.unwrap();
+    actor.action(GuiAction::TestInput).await.unwrap();
     actor.countdown.as_mut().unwrap().end = Instant::now();
     // Simulate the window thread returning focus, then leaving before actor polling.
     actor.permit.focus_changed(true);
@@ -539,6 +700,7 @@ async fn newer_safety_epoch_cancels_countdown_even_before_actor_observes_focus()
             .enabled
     );
     assert!(!actor.permit.allow.load(Ordering::Acquire));
+    assert!(!actor.permit.test_allow.load(Ordering::Acquire));
     assert!(actor.countdown.is_none());
     actor.stop_owned().await.unwrap();
     cleanup(actor);
@@ -562,6 +724,38 @@ async fn requesting_input_test_pauses_an_already_enabled_owned_host() {
     );
     assert!(actor.countdown.is_some());
     actor.action(GuiAction::CancelCountdown).await.unwrap();
+    actor.stop_owned().await.unwrap();
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn external_resume_during_test_countdown_cancels_the_phrase_and_pauses_hosting() {
+    let (mut actor, _events) = actor();
+    actor.action(GuiAction::FocusChanged(false)).await.unwrap();
+    actor.start(false, false).await.unwrap();
+    actor.owned.as_mut().unwrap().ready().await.unwrap();
+    actor.action(GuiAction::TestInput).await.unwrap();
+    // Simulate another CLI invocation enabling forwarding during the countdown.
+    assert!(actor.permit.arm(actor.permit.epoch()));
+    assert!(control::send(&actor.state_dir, "resume").await.unwrap().ok);
+    actor.countdown.as_mut().unwrap().end = Instant::now();
+    actor.tick().await;
+    assert!(actor.countdown.is_none());
+    assert!(
+        actor
+            .snapshot
+            .message
+            .contains("enabled during its countdown")
+    );
+    assert!(!actor.permit.allow.load(Ordering::Acquire));
+    assert!(!actor.permit.test_allow.load(Ordering::Acquire));
+    assert!(
+        !control::send(&actor.state_dir, "status")
+            .await
+            .unwrap()
+            .status
+            .enabled
+    );
     actor.stop_owned().await.unwrap();
     cleanup(actor);
 }

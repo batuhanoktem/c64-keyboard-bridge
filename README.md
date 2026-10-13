@@ -29,7 +29,7 @@ For the pinned cc65 build, sanitizers, CLI smoke checks, and release archives, u
 
 Install the architecture-specific macOS DMG, Windows per-user installer or Ubuntu 24.04+ DEB, or run `c64bridge-gui` from a portable archive. Hosting and input start disabled. Enter your C64 address on Connection, choose a matching US/UK host layout, then start the host. Deploying either C64 program requires a separate confirmation because it resets the C64 and replaces its current program.
 
-Enable Input gives you five seconds to focus a scratch application. Returning to the companion pauses its owned input. Closing the window keeps it in the tray when a tray is available; Quit releases keys and stops GUI-owned hosting. An existing separately started CLI session is identified and survives GUI Quit. Read [the GUI guide](docs/gui.md) for mappings, credential storage and installer signing status.
+**Enable input** activates immediately after connection, permission and layout checks pass, even while the companion is focused. C64 keystrokes go to the focused application; changing focus does not pause input. Use **Pause input** in the window or tray to stop it. The deliberate native input test retains its confirmation and five-second countdown to switch to a scratch application. Closing the window keeps it in the tray when a tray is available; Quit releases keys and stops GUI-owned hosting. An existing separately started CLI session is identified and survives GUI Quit. Read [the GUI guide](docs/gui.md) for mappings, credential storage and installer signing status.
 
 ## Configure and test
 

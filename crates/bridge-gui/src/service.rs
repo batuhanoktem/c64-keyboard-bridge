@@ -57,35 +57,61 @@ struct QueuedAction {
     cancel_epoch: u64,
     auto_pause_epoch: u64,
     gate_epoch: u64,
+    test_focus_epoch: u64,
 }
+#[derive(Default)]
+struct PermitEpoch {
+    input: u64,
+    test_focus: u64,
+}
+/// Regular forwarding and the deliberate test phrase have independent gates.
+/// Focus can revoke only the test gate; explicit safety actions revoke both.
 /// Serializes only permit changes, never network or backend operations.
 #[derive(Default)]
 struct OutputPermit {
-    epoch: Mutex<u64>,
+    epoch: Mutex<PermitEpoch>,
     allow: Arc<AtomicBool>,
+    test_allow: Arc<AtomicBool>,
     focus: Arc<AtomicBool>,
 }
 impl OutputPermit {
     fn close(&self) {
         let mut epoch = self.epoch.lock().unwrap();
-        *epoch = epoch.wrapping_add(1);
+        epoch.input = epoch.input.wrapping_add(1);
         self.allow.store(false, Ordering::Release);
+        self.test_allow.store(false, Ordering::Release);
     }
     fn epoch(&self) -> u64 {
-        *self.epoch.lock().unwrap()
+        self.epoch.lock().unwrap().input
+    }
+    fn test_focus_epoch(&self) -> u64 {
+        self.epoch.lock().unwrap().test_focus
     }
     fn arm(&self, expected: u64) -> bool {
         let epoch = self.epoch.lock().unwrap();
-        if *epoch != expected || !self.focus.load(Ordering::Acquire) {
+        if epoch.input != expected {
             return false;
         }
         self.allow.store(true, Ordering::Release);
         true
     }
+    fn arm_test(&self, expected: u64, expected_focus: u64) -> bool {
+        let epoch = self.epoch.lock().unwrap();
+        if epoch.input != expected
+            || epoch.test_focus != expected_focus
+            || !self.focus.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.test_allow.store(true, Ordering::Release);
+        true
+    }
     fn focus_changed(&self, focused: bool) {
+        let mut epoch = self.epoch.lock().unwrap();
         self.focus.store(!focused, Ordering::Release);
         if focused {
-            self.close();
+            epoch.test_focus = epoch.test_focus.wrapping_add(1);
+            self.test_allow.store(false, Ordering::Release);
         }
     }
 }
@@ -165,9 +191,6 @@ impl ServiceHandle {
                 self.permit.focus_changed(focused);
                 self.safety.send_modify(|s| {
                     s.focused = focused;
-                    if focused {
-                        s.auto_pause = s.auto_pause.wrapping_add(1);
-                    }
                 });
                 return Ok(());
             }
@@ -215,6 +238,7 @@ impl ServiceHandle {
                 cancel_epoch: safety.cancel,
                 auto_pause_epoch: safety.auto_pause,
                 gate_epoch: self.permit.epoch(),
+                test_focus_epoch: self.permit.test_focus_epoch(),
             })
             .map_err(|_| anyhow::anyhow!("GUI operation queue is busy; try again"))
     }
@@ -247,8 +271,8 @@ impl Drop for ServiceHandle {
 
 struct Countdown {
     end: Instant,
-    test: bool,
     gate_epoch: u64,
+    focus_epoch: u64,
 }
 struct Actor {
     state_dir: PathBuf,
@@ -271,6 +295,7 @@ struct Actor {
     safety: SafetyState,
     permit: Arc<OutputPermit>,
     command_epoch: Option<u64>,
+    command_test_focus_epoch: Option<u64>,
 }
 impl Actor {
     fn new(
@@ -307,6 +332,7 @@ impl Actor {
             safety: SafetyState::default(),
             permit: Arc::new(OutputPermit::default()),
             command_epoch: None,
+            command_test_focus_epoch: None,
         }
     }
     fn initialize(&mut self) {
@@ -443,13 +469,14 @@ impl Actor {
                     let Some(queued)=queued else {let _=self.quit.send(true);continue;};
                     let next=*safety.borrow_and_update();self.apply_safety(next).await;
                     if matches!(queued.action,GuiAction::Enable|GuiAction::TestInput|GuiAction::Configured{operation:ConnectionOperation::TestInput,..}) && (queued.cancel_epoch!=next.cancel || queued.auto_pause_epoch!=next.auto_pause){self.note("Obsolete input request cancelled by a newer safety action");self.publish();continue;}
-                    self.command_epoch=Some(queued.gate_epoch);self.snapshot.busy=true;self.publish();
+                    self.command_epoch=Some(queued.gate_epoch);self.command_test_focus_epoch=Some(queued.test_focus_epoch);self.snapshot.busy=true;self.publish();
                     let operation=operation_name(&queued.action);
                     let cancelable=matches!(queued.action,GuiAction::Doctor|GuiAction::DeviceInfo|GuiAction::Configured{operation:ConnectionOperation::Doctor|ConnectionOperation::DeviceInfo,..});
                     let result=if cancelable {
                         tokio::select!{biased;_=quit.changed()=>None,result=self.action(queued.action)=>Some(result)}
                     }else{Some(self.action(queued.action).await)};
                     self.command_epoch=None;
+                    self.command_test_focus_epoch=None;
                     if result.is_none(){self.snapshot.busy=false;if self.try_quit().await{break;}continue;}
                     let result=result.unwrap();
                     if let Err(error)=result {self.error(&format!("{operation}: {}. No automatic retry was made",display_error(&error)));}
@@ -481,6 +508,14 @@ impl Actor {
         self.snapshot.tray_available = next.tray;
         if previous.cancel != next.cancel || previous.auto_pause != next.auto_pause {
             self.countdown = None;
+        }
+        if self
+            .countdown
+            .as_ref()
+            .is_some_and(|countdown| countdown.focus_epoch != self.permit.test_focus_epoch())
+        {
+            self.countdown = None;
+            self.note("Input test countdown cancelled by returning to the GUI");
         }
         if (previous.pause != next.pause
             || (previous.auto_pause != next.auto_pause && self.owned.is_some()))
@@ -551,71 +586,117 @@ impl Actor {
         {
             let countdown = self.countdown.take().unwrap();
             self.probe_backend();
-            let local_check = countdown.test || self.owned.is_some();
-            let allowed = !self.focused
-                && (!local_check
-                    || self.snapshot.backend.as_ref().is_some_and(|p| {
+            let allowed =
+                !self.focused
+                    && self.snapshot.backend.as_ref().is_some_and(|p| {
                         p.available && p.authorized && p.layout_matches == Some(true)
-                    }));
+                    });
             if !allowed {
-                self.error("Input countdown cancelled: switch away from the GUI and verify layout/permission");
+                self.error("Input test countdown cancelled: switch away from the GUI and verify layout/permission");
                 return;
             }
-            if !self.permit.arm(countdown.gate_epoch) {
-                self.note("Input countdown cancelled by a newer focus or safety action");
+            if self.snapshot.status.as_ref().is_some_and(|s| s.enabled) {
+                let cleanup = self.pause().await;
+                self.error(if cleanup.is_ok() {
+                    "Input test cancelled because hosting was enabled during its countdown; input is paused"
+                } else {
+                    "Input test cancelled because key cleanup failed; retry Pause"
+                });
                 return;
             }
-            let result = if countdown.test {
-                if self.snapshot.status.as_ref().is_some_and(|s| s.enabled)
-                    && self.pause().await.is_err()
-                {
-                    self.error("Input test cancelled because key cleanup failed");
-                    return;
-                }
-                let config = self.effective_config();
-                match config {
-                    Ok(config) => operations::test_input_guarded_with_focus(
+            if !self
+                .permit
+                .arm_test(countdown.gate_epoch, countdown.focus_epoch)
+            {
+                self.note("Input test countdown cancelled by a newer focus or safety action");
+                return;
+            }
+            // Hosting stays paused during the independent test phrase.
+            // Focus changes close only the test gate; explicit safety actions
+            // close both gates, including during blocking native checks.
+            let result = match self.effective_config() {
+                Ok(config) => {
+                    operations::test_input_guarded_with_focus(
                         &config,
-                        self.permit.allow.clone(),
+                        self.permit.test_allow.clone(),
                         self.permit.focus.clone(),
                     )
                     .await
-                    .map(|_| ()),
-                    Err(e) => Err(e),
                 }
-            } else if self
-                .snapshot
-                .status
-                .as_ref()
-                .is_some_and(|s| s.running && s.connected)
-            {
-                control::send(&self.state_dir, "resume")
-                    .await
-                    .and_then(|r| {
-                        if r.ok {
-                            Ok(())
-                        } else {
-                            bail!("{}", r.error.unwrap_or_else(|| "Input was not enabled; inspect the runtime permission and layout checks".into()))
-                        }
-                    })
-            } else {
-                Err(anyhow::anyhow!("No authenticated client"))
+                Err(error) => Err(error),
             };
-            if countdown.test || result.is_err() {
-                self.permit.close();
-            }
+            self.permit.close();
             match result {
-                Ok(()) => self.note(if countdown.test {
-                    "Input test accepted 11 pairs; visual delivery remains user-observed"
-                } else {
-                    "Input enabled after focus countdown"
-                }),
+                Ok(_) => {
+                    self.note("Input test accepted 11 pairs; visual delivery remains user-observed")
+                }
                 Err(error) => {
                     self.error(&format!("Input stayed disabled: {}", display_error(&error)))
                 }
             }
             self.refresh_status().await;
         }
+    }
+    async fn enable_input(&mut self, expected: u64) -> Result<()> {
+        self.refresh_status().await;
+        if !self
+            .snapshot
+            .status
+            .as_ref()
+            .is_some_and(|s| s.running && s.connected)
+        {
+            bail!("No authenticated client; input stayed disabled");
+        }
+        // An external CLI session performs its own posting-process checks.
+        if self.owned.is_some() {
+            self.probe_backend();
+            let probe = self
+                .snapshot
+                .backend
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Input backend could not be checked"))?;
+            if !probe.available {
+                bail!("Input backend is unavailable; inspect Diagnostics");
+            }
+            if !probe.authorized {
+                bail!(
+                    "GUI posting permission is missing; inspect Diagnostics and enable the application in system settings"
+                );
+            }
+            if probe.layout_matches != Some(true) {
+                bail!(
+                    "Active keyboard layout does not match the configured layout; inspect Diagnostics"
+                );
+            }
+        }
+        if !self.permit.arm(expected) {
+            self.note("Input request cancelled by a newer safety action");
+            return Ok(());
+        }
+        let result = control::send(&self.state_dir, "resume").await;
+        match result {
+            Ok(response) => {
+                self.snapshot.status = Some(response.status);
+                if !response.ok {
+                    self.permit.close();
+                    bail!("{}", response.error.unwrap_or_else(|| "Input was not enabled; inspect the runtime permission and layout checks".into()));
+                }
+            }
+            Err(error) => {
+                self.permit.close();
+                return Err(error);
+            }
+        }
+        if self.permit.epoch() != expected {
+            // A priority Pause/Stop/Quit may arrive while resume is in flight.
+            // Its gate already prevents GUI output; also pause external CLI
+            // input before acknowledging the obsolete enable operation.
+            self.pause().await?;
+            self.note("Input request cancelled by a newer safety action");
+        } else {
+            self.note("Input enabled");
+        }
+        Ok(())
     }
     async fn pause(&mut self) -> Result<()> {
         self.permit.close();
@@ -674,7 +755,7 @@ impl Actor {
         if self.smoke && deploy {
             bail!("Smoke cannot deploy");
         }
-        self.owned = Some(ManagedRuntime::spawn_guarded_with_focus(
+        self.owned = Some(ManagedRuntime::spawn_guarded(
             config,
             StartOptions {
                 enable_input: false,
@@ -684,7 +765,6 @@ impl Actor {
                 fake_device,
             },
             self.permit.allow.clone(),
-            self.permit.focus.clone(),
         ));
         self.snapshot.owned = true;
         self.snapshot.phase = GuiPhase::Starting;
@@ -806,7 +886,7 @@ impl Actor {
                 if self.use_form(settings, password)? && self.owned.is_some() {
                     self.pause().await?;
                     // Account only for this operation's own pause. A newer
-                    // focus/cancel action still invalidates the queued countdown.
+                    // cancel action still invalidates the queued operation.
                     let after = before.wrapping_add(1);
                     if self.command_epoch == Some(before) && self.permit.epoch() == after {
                         self.command_epoch = Some(after);
@@ -845,6 +925,9 @@ impl Actor {
                     bail!("Smoke cannot post native input");
                 }
                 let before = self.permit.epoch();
+                let focus_epoch = self
+                    .command_test_focus_epoch
+                    .unwrap_or_else(|| self.permit.test_focus_epoch());
                 self.pause().await?;
                 let expected = before.wrapping_add(1);
                 if self.command_epoch.is_some_and(|epoch| epoch != before)
@@ -853,12 +936,20 @@ impl Actor {
                     self.note("Input request cancelled by a newer safety action");
                     return Ok(());
                 }
-                self.countdown = Some(Countdown {
-                    end: Instant::now() + Duration::from_secs(5),
-                    test,
-                    gate_epoch: expected,
-                });
-                self.note("Five-second countdown: focus the target application");
+                if test {
+                    if self.permit.test_focus_epoch() != focus_epoch {
+                        self.note("Input test request cancelled by returning to the GUI");
+                        return Ok(());
+                    }
+                    self.countdown = Some(Countdown {
+                        end: Instant::now() + Duration::from_secs(5),
+                        gate_epoch: expected,
+                        focus_epoch,
+                    });
+                    self.note("Five-second input test countdown: focus a scratch application");
+                } else {
+                    self.enable_input(expected).await?;
+                }
             }
             GuiAction::CancelCountdown => {
                 self.permit.close();
@@ -866,11 +957,10 @@ impl Actor {
                 self.note("Input countdown cancelled");
             }
             GuiAction::FocusChanged(focused) => {
-                let changed = self.focused != focused;
                 self.focused = focused;
                 self.permit.focus_changed(focused);
-                if focused && changed && self.owned.is_some() {
-                    self.pause().await?;
+                if focused && self.countdown.take().is_some() {
+                    self.note("Input test countdown cancelled by returning to the GUI");
                 }
             }
             GuiAction::TrayAvailable(available) => {
