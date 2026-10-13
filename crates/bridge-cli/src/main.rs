@@ -115,11 +115,27 @@ enum Pair {
     Rotate,
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = run_frontend() {
         eprintln!("Error: {error:#}");
         std::process::exit(1);
+    }
+}
+fn run_frontend() -> Result<()> {
+    let task = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Cannot create the CLI runtime")?
+            .block_on(run())
+    };
+    #[cfg(target_os = "macos")]
+    {
+        backend::run_with_main_thread_loop(task)?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        task()
     }
 }
 async fn run() -> Result<()> {

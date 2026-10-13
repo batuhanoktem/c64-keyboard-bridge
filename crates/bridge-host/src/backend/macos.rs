@@ -11,6 +11,7 @@ use core_graphics::{
     event::{CGEvent, CGEventFlags, CGEventTapLocation, EventField},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
+pub(super) mod main_thread;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -28,7 +29,7 @@ unsafe extern "C" {
     fn CGRequestPostEventAccess() -> bool;
 }
 
-const PERMISSION_HELP: &str = "Keyboard injection requires Accessibility permission. Open System Settings > Privacy & Security > Accessibility and authorize the executable or terminal reported by macOS, then run doctor again. No Input Monitoring permission or keyboard capture is used.";
+const PERMISSION_HELP: &str = "Keyboard injection requires permission to control this Mac. Open System Settings > Privacy & Security > Device Control and Data Access on macOS 27, or Accessibility on earlier macOS. Allow C64 Keyboard Bridge for the GUI, or the executable/terminal identified by macOS for the CLI, then check permissions again. No Input Monitoring permission or keyboard capture is used.";
 
 pub(super) fn capabilities() -> BackendCapabilities {
     BackendCapabilities {
@@ -52,6 +53,15 @@ fn layout_from_id(identifier: &str) -> Option<KeyboardLayout> {
 }
 
 fn active_layout() -> Result<KeyboardLayout, BackendError> {
+    main_thread::on_main_queue(read_layout_on_main)
+}
+
+fn read_layout_on_main() -> Result<KeyboardLayout, BackendError> {
+    if !main_thread::is_main_thread() {
+        return Err(BackendError::Unavailable(
+            "macOS input-source queries require the main thread".into(),
+        ));
+    }
     // TIS reads the selected input source. It does not install a tap or query
     // host key presses. Reject IMEs, dead-key variants, and unknown layouts.
     let source = unsafe { TISCopyCurrentKeyboardInputSource() };
@@ -79,6 +89,13 @@ fn active_layout() -> Result<KeyboardLayout, BackendError> {
 
 fn require_layout(expected: KeyboardLayout) -> Result<(), BackendError> {
     let current = active_layout()?;
+    require_current_layout(current, expected)
+}
+
+fn require_current_layout(
+    current: KeyboardLayout,
+    expected: KeyboardLayout,
+) -> Result<(), BackendError> {
     if current != expected {
         return Err(BackendError::Unsupported(format!(
             "Active macOS layout is {current:?}, but the bridge requires {expected:?}; select the matching input source"
@@ -89,8 +106,9 @@ fn require_layout(expected: KeyboardLayout) -> Result<(), BackendError> {
 
 pub(super) fn probe(layout: KeyboardLayout) -> BackendProbe {
     let allowed = authorized();
-    let layout_matches = active_layout().ok().map(|current| current == layout);
-    let layout_detail = match require_layout(layout) {
+    let current = active_layout();
+    let layout_matches = current.as_ref().ok().map(|current| *current == layout);
+    let layout_detail = match current.and_then(|current| require_current_layout(current, layout)) {
         Ok(()) => "Active keyboard layout matches.".into(),
         Err(error) => error.to_string(),
     };
@@ -111,15 +129,18 @@ pub(super) fn probe(layout: KeyboardLayout) -> BackendProbe {
 }
 
 pub(super) fn request_permission() -> Result<(), BackendError> {
-    // Only the explicit CLI permission action calls the prompting API.
-    unsafe {
-        CGRequestPostEventAccess();
-    }
-    if authorized() {
-        Ok(())
-    } else {
-        Err(BackendError::PermissionDenied(PERMISSION_HELP.into()))
-    }
+    // Only an explicit frontend permission action calls this prompting API.
+    // Opening a prompt does not mean macOS has granted authorization.
+    main_thread::on_main_queue(|| {
+        unsafe {
+            CGRequestPostEventAccess();
+        }
+        if authorized() {
+            Ok(())
+        } else {
+            Err(BackendError::PermissionDenied(PERMISSION_HELP.into()))
+        }
+    })
 }
 
 pub(super) struct MacOsBackend {
