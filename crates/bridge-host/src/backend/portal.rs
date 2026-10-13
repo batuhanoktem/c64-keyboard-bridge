@@ -1335,13 +1335,31 @@ mod tests {
         Group(u32),
         Pause,
         Stall,
+        BufferSync,
         Resume,
         PauseSibling,
         InvalidObject,
     }
+    struct FixtureCommand {
+        control: Control,
+        applied: oneshot::Sender<()>,
+    }
+    async fn apply_control(control: &sync_mpsc::Sender<FixtureCommand>, command: Control) {
+        let (applied, received) = oneshot::channel();
+        control
+            .send(FixtureCommand {
+                control: command,
+                applied,
+            })
+            .unwrap();
+        timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     struct Fixture {
         context: ei::Context,
-        control: sync_mpsc::Sender<Control>,
+        control: sync_mpsc::Sender<FixtureCommand>,
         recording: Arc<Mutex<Vec<Wire>>>,
         done: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
@@ -1353,7 +1371,7 @@ mod tests {
         fn with_sibling(map: Vec<u8>, initial_group: Option<u32>, sibling: bool) -> Self {
             let (client, server) = UnixStream::pair().unwrap();
             let context = ei::Context::new(client).unwrap();
-            let (control, controls) = sync_mpsc::channel();
+            let (control, controls) = sync_mpsc::channel::<FixtureCommand>();
             let recording = Arc::new(Mutex::new(Vec::new()));
             let server_recording = recording.clone();
             let done = Arc::new(AtomicBool::new(false));
@@ -1365,13 +1383,45 @@ mod tests {
                 let mut device: Option<eis::Device> = None;
                 let mut sibling_device: Option<eis::Device> = None;
                 let mut seat = None;
-                let mut connection = None;
+                let mut connection: Option<eis::Connection> = None;
                 let mut connected = false;
                 let mut stalled = false;
+                let mut buffer_sync = false;
+                let mut deferred_sync: Vec<eis::Callback> = Vec::new();
                 let mut file = tempfile::tempfile().unwrap();
                 file.write_all(&map).unwrap();
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 while !server_done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    let mut applied = Vec::new();
+                    while let Ok(command) = controls.try_recv() {
+                        match command.control {
+                            Control::Group(group) => {
+                                keyboard.as_ref().unwrap().modifiers(4, 0, 0, 0, group)
+                            }
+                            Control::Pause => device.as_ref().unwrap().paused(4),
+                            // Loss of Sync acknowledgments is distinct from
+                            // Device::Paused, which explicitly neutralizes keys.
+                            Control::Stall => {
+                                stalled = true;
+                                buffer_sync = false;
+                            }
+                            Control::BufferSync => {
+                                stalled = true;
+                                buffer_sync = true;
+                            }
+                            Control::Resume => {
+                                stalled = false;
+                                for callback in deferred_sync.drain(..) {
+                                    callback.done(0);
+                                }
+                            }
+                            Control::PauseSibling => sibling_device.as_ref().unwrap().paused(4),
+                            Control::InvalidObject => {
+                                connection.as_ref().unwrap().invalid_object(4, 999)
+                            }
+                        }
+                        applied.push(command.applied);
+                    }
                     if server.read().is_err() {
                         break;
                     }
@@ -1428,7 +1478,14 @@ mod tests {
                             eis::Request::Connection(
                                 _,
                                 eis::connection::Request::Sync { callback },
-                            ) if !stalled => callback.done(0),
+                            ) => {
+                                if !stalled {
+                                    callback.done(0);
+                                } else if buffer_sync {
+                                    assert!(deferred_sync.len() < COMMAND_QUEUE);
+                                    deferred_sync.push(callback);
+                                }
+                            }
                             eis::Request::Keyboard(
                                 _,
                                 eis::keyboard::Request::Key { key, state },
@@ -1453,22 +1510,13 @@ mod tests {
                             _ => {}
                         }
                     }
-                    while let Ok(control) = controls.try_recv() {
-                        match control {
-                            Control::Group(group) => {
-                                keyboard.as_ref().unwrap().modifiers(4, 0, 0, 0, group)
-                            }
-                            Control::Pause => device.as_ref().unwrap().paused(4),
-                            Control::Stall => stalled = true,
-                            Control::Resume => stalled = false,
-                            Control::PauseSibling => sibling_device.as_ref().unwrap().paused(4),
-                            Control::InvalidObject => {
-                                connection.as_ref().unwrap().invalid_object(4, 999)
-                            }
-                        }
-                    }
                     if server.flush().is_err() {
                         break;
+                    }
+                    // Receipts establish that controls and their queued EIS
+                    // responses took effect before the caller submits more.
+                    for receipt in applied {
+                        let _ = receipt.send(());
                     }
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -1544,7 +1592,7 @@ mod tests {
         sync(&mut state, &fixture.context, &mut events)
             .await
             .unwrap();
-        fixture.control.send(Control::Group(1)).unwrap();
+        apply_control(&fixture.control, Control::Group(1)).await;
         assert_eq!(
             state.handle(parse_event(events.next().await).unwrap()),
             Err(Failure::LayoutMismatch)
@@ -1573,7 +1621,7 @@ mod tests {
         sync(&mut state, &fixture.context, &mut events)
             .await
             .unwrap();
-        fixture.control.send(Control::Pause).unwrap();
+        apply_control(&fixture.control, Control::Pause).await;
         assert_eq!(
             state.handle(parse_event(events.next().await).unwrap()),
             Err(Failure::Revoked)
@@ -1593,7 +1641,7 @@ mod tests {
         sync(&mut state, &fixture.context, &mut events)
             .await
             .unwrap();
-        fixture.control.send(Control::PauseSibling).unwrap();
+        apply_control(&fixture.control, Control::PauseSibling).await;
         assert_eq!(
             state.handle(parse_event(events.next().await).unwrap()),
             Err(Failure::Revoked)
@@ -1624,7 +1672,7 @@ mod tests {
         sync(&mut state, &fixture.context, &mut events)
             .await
             .unwrap();
-        fixture.control.send(Control::InvalidObject).unwrap();
+        apply_control(&fixture.control, Control::InvalidObject).await;
         assert_eq!(
             state.handle(parse_event(events.next().await).unwrap()),
             Err(Failure::Protocol)
@@ -1649,8 +1697,7 @@ mod tests {
         let (mut state, mut events) = ready_state(&fixture.context, KeyboardLayout::Us)
             .await
             .unwrap();
-        fixture.control.send(Control::Stall).unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        apply_control(&fixture.control, Control::Stall).await;
         state.emit(NativeKey::A, true).unwrap();
         let start = Instant::now();
         assert_eq!(
@@ -1695,8 +1742,7 @@ mod tests {
         sync(&mut state, &fixture.context, &mut events)
             .await
             .unwrap();
-        fixture.control.send(Control::Stall).unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        apply_control(&fixture.control, Control::Stall).await;
         let health = Arc::new(Mutex::new(Health {
             failure: Some(Failure::Timeout),
             ready: true,
@@ -1726,7 +1772,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response(answered).await, Err(Failure::Timeout));
-            fixture.control.send(Control::Resume).unwrap();
+            apply_control(&fixture.control, Control::Resume).await;
             let (reply, answered) = sync_mpsc::channel();
             commands
                 .send(Command {
@@ -1795,8 +1841,7 @@ mod tests {
                 state.emit(NativeKey::LeftShift, true).unwrap();
                 state.emit(NativeKey::A, true).unwrap();
                 sync(&mut state, &context, &mut events).await.unwrap();
-                control.send(Control::Stall).unwrap();
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                apply_control(&control, Control::BufferSync).await;
                 ready.send(()).unwrap();
                 let mut authority = DelayedFailedClose(Some(completed));
                 assert!(
@@ -1829,7 +1874,7 @@ mod tests {
         assert!(backend.held.contains(&NativeKey::A));
         assert!(!health.lock().unwrap().neutralized);
         assert!(!*backend.shutdown.borrow());
-        fixture.control.send(Control::Resume).unwrap();
+        apply_control(&fixture.control, Control::Resume).await;
         // Wait for the deliberately delayed close result rather than making
         // recovery depend on a narrow timing margin between two 600ms calls.
         timeout(Duration::from_secs(3), initial_close_completed)
@@ -1896,8 +1941,7 @@ mod tests {
                 state.emit(NativeKey::LeftShift, true).unwrap();
                 state.emit(NativeKey::A, true).unwrap();
                 sync(&mut state, &context, &mut events).await.unwrap();
-                control.send(Control::Stall).unwrap();
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                apply_control(&control, Control::Stall).await;
                 let mut authority = DelayedFailedClose {
                     attempts: actor_attempts,
                     initial: Some(initial),
