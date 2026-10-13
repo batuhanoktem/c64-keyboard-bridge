@@ -128,7 +128,7 @@ pub fn render(
                         if response.clicked() { *selected = key; }
                         response.on_hover_text(format!("{key:?} · matrix {}:{}", key.id() / 8, key.id() % 8));
                     } else {
-                        response.on_hover_text(if cap.label == "RESTORE" {
+                        response.on_disabled_hover_text(if cap.label == "RESTORE" {
                             "RESTORE is outside the scanned matrix; independent events are unverified."
                         } else {
                             "SHIFT LOCK shares the observed left Shift state; it has no independent identity."
@@ -145,6 +145,74 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_keys_show_hover_explanations_without_changing_selection() {
+        for (label, explanation) in [
+            ("RESTORE", "RESTORE is outside the scanned matrix"),
+            (
+                "SHIFT\nLOCK",
+                "SHIFT LOCK shares the observed left Shift state",
+            ),
+        ] {
+            let context = egui::Context::default();
+            context.global_style_mut(|style| {
+                style.interaction.tooltip_delay = 0.0;
+                style.interaction.show_tooltips_only_when_still = false;
+            });
+            let mut selected = P::A;
+            let mut draw = |events| {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 500.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| render(ui, &mut selected, |_| false),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            for _ in 0..2 {
+                draw(vec![]);
+            }
+            let output = draw(vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        (text.galley.job.text == label)
+                            .then(|| text.visual_bounding_rect().center())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            draw(vec![egui::Event::PointerMoved(pos)]);
+            let output = draw(vec![]);
+            assert!(output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.starts_with(explanation))
+            }), "Tooltip missing for {label}");
+            draw(vec![
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            assert_eq!(selected, P::A);
+        }
+    }
     #[test]
     fn keyboard_contains_every_matrix_key_once_without_inventing_restore() {
         let keys: Vec<_> = ROWS

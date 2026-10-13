@@ -1,7 +1,9 @@
 //! Desktop presentation. All I/O and native input belong to the ordered service.
 use crate::{
     editor::{EditorIntent, MappingEditor},
-    model::{ConnectionOperation, GuiAction, GuiEvent, GuiPhase, GuiSettings, GuiSnapshot},
+    model::{
+        ConnectionOperation, GuiAction, GuiEvent, GuiPhase, GuiPlatform, GuiSettings, GuiSnapshot,
+    },
     presentation,
 };
 use eframe::egui;
@@ -121,6 +123,7 @@ pub struct BridgeApp {
     pub settings: GuiSettings,
     pub editor: MappingEditor,
     page: Page,
+    platform: GuiPlatform,
     password: String,
     accepted_settings: GuiSettings,
     accepted_password: String,
@@ -146,6 +149,7 @@ impl BridgeApp {
             accepted_settings: settings.clone(),
             settings,
             page: Page::Connection,
+            platform: GuiPlatform::current(),
             password: String::new(),
             accepted_password: String::new(),
             form_submissions: VecDeque::new(),
@@ -173,6 +177,11 @@ impl BridgeApp {
         };
         self.page = page;
         Some(label)
+    }
+    /// Only documentation fixtures use a display-safe path. Real exports keep
+    /// their absolute private-state destination, independent of launcher cwd.
+    pub fn prepare_documentation_capture(&mut self) {
+        self.diagnostics_path = "demo-diagnostics.json".into();
     }
     pub fn on_event(&mut self, event: &GuiEvent) {
         match event {
@@ -358,6 +367,12 @@ impl BridgeApp {
         if !snapshot.message.is_empty() {
             ui.label(&snapshot.message);
             ui.add_space(6.0);
+        }
+        if !self.platform.supports_backend(&self.settings.backend) {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "The configured backend is unavailable on this platform. Select a supported backend in Settings before saving, applying or starting. Your imported choice is preserved.",
+            );
         }
         if let Some(seconds) = snapshot.countdown {
             presentation::card(ui, |ui| {
@@ -590,7 +605,9 @@ impl BridgeApp {
                 let running = snapshot.phase == GuiPhase::Running;
                 if ui
                     .add_enabled(
-                        snapshot.phase == GuiPhase::Idle && !snapshot.busy,
+                        snapshot.phase == GuiPhase::Idle
+                            && !snapshot.busy
+                            && self.platform.supports_backend(&self.settings.backend),
                         egui::Button::new("Start host"),
                     )
                     .clicked()
@@ -602,7 +619,9 @@ impl BridgeApp {
                 }
                 if ui
                     .add_enabled(
-                        snapshot.phase == GuiPhase::Idle && !snapshot.busy,
+                        snapshot.phase == GuiPhase::Idle
+                            && !snapshot.busy
+                            && self.platform.supports_backend(&self.settings.backend),
                         egui::Button::new("Start + deploy…"),
                     )
                     .clicked()
@@ -617,7 +636,9 @@ impl BridgeApp {
                 }
                 if ui
                     .add_enabled(
-                        can_enable_input(snapshot) && !self.form_has_changes(),
+                        can_enable_input(snapshot)
+                            && !self.form_has_changes()
+                            && self.platform.supports_backend(&self.settings.backend),
                         egui::Button::new("Enable input"),
                     )
                     .clicked()
@@ -669,13 +690,19 @@ impl BridgeApp {
             self.credentials(ui, actions);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!snapshot.busy, egui::Button::new("Save settings"))
+                    .add_enabled(
+                        !snapshot.busy && self.platform.supports_backend(&self.settings.backend),
+                        egui::Button::new("Save settings"),
+                    )
                     .clicked()
                 {
                     actions.push(self.save_settings(false));
                 }
                 if ui
-                    .add_enabled(!snapshot.busy, egui::Button::new("Apply settings"))
+                    .add_enabled(
+                        !snapshot.busy && self.platform.supports_backend(&self.settings.backend),
+                        egui::Button::new("Apply settings"),
+                    )
                     .clicked()
                 {
                     actions.push(self.save_settings(true));
@@ -787,7 +814,7 @@ impl BridgeApp {
             "Remember in the operating system credential store",
         );
         ui.small("The password stays in memory unless Remember is selected and settings are explicitly saved or applied. No plaintext fallback.");
-        ui.small("An imported .env path must exist. Finder does not inherit your terminal's environment.");
+        ui.small("An imported .env path must exist. Desktop launchers do not inherit your terminal's environment.");
         if ui.button("Forget saved password").clicked() {
             self.password.clear();
             actions.push(GuiAction::ForgetPassword);
@@ -803,21 +830,19 @@ impl BridgeApp {
             if ui
                 .add_enabled(
                     !snapshot.busy,
-                    egui::Button::new("Check GUI input permission"),
+                    egui::Button::new(self.platform.permission_button()),
                 )
                 .clicked()
             {
                 actions.push(self.with_form(GuiAction::RequestPermission));
             }
-            #[cfg(target_os = "macos")]
-            if ui.button("Open input permission settings").clicked() {
+            if self.platform == GuiPlatform::MacOs
+                && ui.button("Open input permission settings").clicked()
+            {
                 actions.push(GuiAction::OpenPermissionSettings);
             }
         });
-        #[cfg(target_os = "macos")]
-        ui.small("For GUI-owned input, allow C64 Keyboard Bridge in System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS). Permission granted to the CLI does not authorize this app. After changing permission, check it again here.");
-        #[cfg(not(target_os = "macos"))]
-        ui.small("This checks the GUI posting process. A separately started CLI session checks its own input permission when resumed.");
+        ui.small(self.platform.permission_help());
     }
     fn diagnostics(
         &mut self,
@@ -954,7 +979,7 @@ impl BridgeApp {
         presentation::card(ui, |ui| {
             ui.heading("Credentials");
             self.credentials(ui, actions);
-            ui.small("macOS Keychain · Windows Credential Manager · Linux Secret Service.");
+            ui.small(self.platform.credential_store());
         });
         ui.add_space(12.0);
         egui::Grid::new("advanced-settings")
@@ -1001,7 +1026,7 @@ impl BridgeApp {
                 egui::ComboBox::from_id_salt("host-backend")
                     .selected_text(&self.settings.backend)
                     .show_ui(ui, |ui| {
-                        for value in ["auto", "macos", "windows", "x11", "uinput", "recording"] {
+                        for &value in self.platform.backends() {
                             ui.selectable_value(&mut self.settings.backend, value.into(), value);
                         }
                     });
@@ -1012,14 +1037,19 @@ impl BridgeApp {
                     &mut self.settings.mappings_file,
                     "Built-in profile when empty",
                 );
-                ui.label("Repeat delay (ms)");
-                ui.add(egui::DragValue::new(&mut self.settings.repeat_delay_ms).range(100..=5000));
-                ui.end_row();
-                ui.label("Repeat interval (ms)");
-                ui.add(
-                    egui::DragValue::new(&mut self.settings.repeat_interval_ms).range(10..=1000),
-                );
-                ui.end_row();
+                if self.platform != GuiPlatform::Linux {
+                    ui.label("Repeat delay (ms)");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.repeat_delay_ms).range(100..=5000),
+                    );
+                    ui.end_row();
+                    ui.label("Repeat interval (ms)");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.repeat_interval_ms)
+                            .range(10..=1000),
+                    );
+                    ui.end_row();
+                }
                 ui.label("Log level");
                 egui::ComboBox::from_id_salt("log-level")
                     .selected_text(&self.settings.log_level)
@@ -1032,13 +1062,19 @@ impl BridgeApp {
             });
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!snapshot.busy, egui::Button::new("Save settings"))
+                .add_enabled(
+                    !snapshot.busy && self.platform.supports_backend(&self.settings.backend),
+                    egui::Button::new("Save settings"),
+                )
                 .clicked()
             {
                 actions.push(self.save_settings(false));
             }
             if ui
-                .add_enabled(!snapshot.busy, egui::Button::new("Apply settings"))
+                .add_enabled(
+                    !snapshot.busy && self.platform.supports_backend(&self.settings.backend),
+                    egui::Button::new("Apply settings"),
+                )
                 .clicked()
             {
                 actions.push(self.save_settings(true));
@@ -1062,17 +1098,21 @@ impl BridgeApp {
         {
             self.confirm = Some(Confirm::RemoveLocalData);
         }
-        ui.small("Linux uses desktop repeat. These settings never change global Linux repeat or grant uinput access.");
+        if self.platform == GuiPlatform::Linux {
+            ui.small("Linux uses desktop repeat. The bridge never changes global repeat settings or grants uinput access. Saved repeat settings are preserved for use on other platforms.");
+        }
         ui.add_space(20.0);
         ui.separator();
         ui.label(egui::RichText::new("C64 Keyboard Bridge 0.1.0").strong());
         ui.label(
             "GPL-3.0-only · Rust host with genuine cc65 C64 programs · wire protocol version 1",
         );
-        ui.hyperlink_to(
-            "Source, installation and hardware acceptance notes",
-            "https://github.com/batuhanoktem/c64-keyboard-bridge",
-        );
+        if ui
+            .link("Source, installation and hardware acceptance notes")
+            .clicked()
+        {
+            actions.push(GuiAction::OpenProjectWebsite);
+        }
         ui.label("Closing hides to the tray when available. Quit releases GUI-owned keys and waits for graceful cleanup.");
         ui.label("Pairing tokens are transmitted in plaintext on the LAN. Use a trusted network.");
     }
@@ -1117,6 +1157,220 @@ fn can_enable_input(snapshot: &GuiSnapshot) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_fixture(
+        context: &egui::Context,
+        app: &mut BridgeApp,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Vec<GuiAction>) {
+        let mut actions = Vec::new();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 1600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| actions = app.render(ui, &GuiSnapshot::default()),
+        );
+        output.textures_delta.clear();
+        (output, actions)
+    }
+
+    fn text_center(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    (text.galley.job.text == label).then(|| text.visual_bounding_rect().center())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("Widget not rendered: {label}"))
+    }
+
+    fn pointer_click(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    fn texts(output: &egui::FullOutput) -> Vec<&str> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.job.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn about_link_pointer_click_dispatches_trusted_background_navigation() {
+        let context = egui::Context::default();
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.page = Page::Settings;
+        for _ in 0..2 {
+            render_fixture(&context, &mut app, vec![]);
+        }
+        let (output, _) = render_fixture(&context, &mut app, vec![]);
+        let pos = text_center(
+            &output,
+            "Source, installation and hardware acceptance notes",
+        );
+        let (_, actions) = render_fixture(&context, &mut app, pointer_click(pos));
+        assert!(matches!(
+            actions.as_slice(),
+            [GuiAction::OpenProjectWebsite]
+        ));
+        assert!(app.form_submissions.is_empty());
+    }
+
+    #[test]
+    fn sidebar_buttons_navigate_without_dispatching_io_or_input() {
+        let context = egui::Context::default();
+        let mut app = BridgeApp::new(GuiSettings::default());
+        for (page, label) in [
+            (Page::Keyboard, "Keyboard / Mappings"),
+            (Page::Diagnostics, "Diagnostics"),
+            (Page::Settings, "Settings / About"),
+            (Page::Connection, "Connection"),
+        ] {
+            for _ in 0..2 {
+                render_fixture(&context, &mut app, vec![]);
+            }
+            let (output, _) = render_fixture(&context, &mut app, vec![]);
+            let pos = text_center(&output, label);
+            let (_, actions) = render_fixture(&context, &mut app, pointer_click(pos));
+            assert!(actions.is_empty());
+            assert!(app.page == page);
+        }
+    }
+
+    #[test]
+    fn sidebar_supports_tab_and_space_navigation() {
+        let context = egui::Context::default();
+        let mut app = BridgeApp::new(GuiSettings::default());
+        for _ in 0..3 {
+            render_fixture(&context, &mut app, vec![]);
+        }
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render_fixture(&context, &mut app, vec![key(egui::Key::Tab)]);
+        let first = context.memory(|memory| memory.focused());
+        render_fixture(&context, &mut app, vec![key(egui::Key::Tab)]);
+        let second = context.memory(|memory| memory.focused());
+        assert!(first.is_some());
+        assert_ne!(first, second);
+        let (_, actions) = render_fixture(&context, &mut app, vec![key(egui::Key::Space)]);
+        assert!(actions.is_empty());
+        assert!(app.page == Page::Keyboard);
+    }
+
+    #[test]
+    fn platform_controls_and_backend_menu_use_the_current_posting_platform() {
+        for platform in [GuiPlatform::MacOs, GuiPlatform::Windows, GuiPlatform::Linux] {
+            let context = egui::Context::default();
+            let mut app = BridgeApp::new(GuiSettings::default());
+            app.platform = platform;
+            for _ in 0..2 {
+                render_fixture(&context, &mut app, vec![]);
+            }
+            let (output, _) = render_fixture(&context, &mut app, vec![]);
+            let labels = texts(&output);
+            assert!(labels.contains(&platform.permission_button()));
+            assert_eq!(
+                labels.contains(&"Open input permission settings"),
+                platform == GuiPlatform::MacOs
+            );
+            assert!(labels.contains(&platform.permission_help()));
+
+            app.page = Page::Settings;
+            for _ in 0..2 {
+                render_fixture(&context, &mut app, vec![]);
+            }
+            let (output, _) = render_fixture(&context, &mut app, vec![]);
+            let labels = texts(&output);
+            assert!(labels.contains(&platform.credential_store()));
+            for other in [GuiPlatform::MacOs, GuiPlatform::Windows, GuiPlatform::Linux] {
+                if other != platform {
+                    assert!(!labels.contains(&other.credential_store()));
+                }
+            }
+            assert_eq!(
+                labels.contains(&"Repeat delay (ms)"),
+                platform != GuiPlatform::Linux
+            );
+            assert_eq!(
+                labels.contains(&"Repeat interval (ms)"),
+                platform != GuiPlatform::Linux
+            );
+            let pos = text_center(&output, "auto");
+            render_fixture(&context, &mut app, pointer_click(pos));
+            let (output, _) = render_fixture(&context, &mut app, vec![]);
+            let labels = texts(&output);
+            for candidate in ["macos", "windows", "x11", "uinput", "recording"] {
+                assert_eq!(
+                    labels.contains(&candidate),
+                    platform.supports_backend(candidate),
+                    "{platform:?}: {candidate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_backend_draft_stays_visible_and_cannot_be_saved_by_a_pointer_click() {
+        let context = egui::Context::default();
+        let mut app = BridgeApp::new(GuiSettings {
+            backend: "windows".into(),
+            repeat_delay_ms: 777,
+            repeat_interval_ms: 66,
+            ..Default::default()
+        });
+        app.platform = GuiPlatform::Linux;
+        app.page = Page::Settings;
+        let original = app.settings.clone();
+        for _ in 0..2 {
+            render_fixture(&context, &mut app, vec![]);
+        }
+        let (output, _) = render_fixture(&context, &mut app, vec![]);
+        assert!(
+            texts(&output)
+                .iter()
+                .any(|text| text.contains("Your imported choice is preserved"))
+        );
+        let pos = text_center(&output, "Save settings");
+        let (_, actions) = render_fixture(&context, &mut app, pointer_click(pos));
+        assert!(actions.is_empty());
+        assert_eq!(app.settings, original);
+        assert!(app.form_submissions.is_empty());
+    }
     use bridge_core::{BindingDocument, NativeKey};
     use bridge_protocol::PhysicalKey;
     #[test]
@@ -1384,7 +1638,7 @@ mod tests {
             ),
             ("Device information", None, ConnectionOperation::DeviceInfo),
             (
-                "Check GUI input permission",
+                GuiPlatform::current().permission_button(),
                 None,
                 ConnectionOperation::RequestPermission,
             ),

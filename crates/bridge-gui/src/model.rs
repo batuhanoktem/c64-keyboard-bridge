@@ -3,6 +3,89 @@ use bridge_host::control::Status;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Presentation choices follow the posting process, never an imported backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuiPlatform {
+    MacOs,
+    Windows,
+    Linux,
+}
+impl GuiPlatform {
+    pub const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+    pub const fn backends(self) -> &'static [&'static str] {
+        match self {
+            Self::MacOs => &["auto", "macos", "recording"],
+            Self::Windows => &["auto", "windows", "recording"],
+            Self::Linux => &["auto", "x11", "uinput", "recording"],
+        }
+    }
+    pub fn supports_backend(self, backend: &str) -> bool {
+        self.backends().contains(&backend)
+    }
+    pub const fn credential_store(self) -> &'static str {
+        match self {
+            Self::MacOs => "macOS Keychain",
+            Self::Windows => "Windows Credential Manager",
+            Self::Linux => "Linux Secret Service",
+        }
+    }
+    pub const fn permission_button(self) -> &'static str {
+        match self {
+            Self::MacOs => "Check GUI input permission",
+            Self::Windows => "Check GUI input availability",
+            Self::Linux => "Check GUI input access",
+        }
+    }
+    pub const fn permission_help(self) -> &'static str {
+        match self {
+            Self::MacOs => {
+                "For GUI-owned input, allow C64 Keyboard Bridge in System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS). Permission granted to the CLI does not authorize this app. After changing permission, check it again here."
+            }
+            Self::Windows => {
+                "Windows SendInput cannot post into applications running at a higher integrity level, such as an elevated editor. Use a normal user application. This checks the GUI posting process; a separate CLI session checks its own access."
+            }
+            Self::Linux => {
+                "X11 uses the existing desktop keyboard map through XTEST. Wayland requires explicitly granted /dev/uinput access. Never run the network application as root. This checks the GUI posting process; a separate CLI session checks its own access."
+            }
+        }
+    }
+}
+
+/// No peer or editable text can supply an external navigation target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalTarget {
+    ProjectWebsite,
+    MacInputSettings,
+}
+impl ExternalTarget {
+    pub const fn url(self) -> &'static str {
+        match self {
+            Self::ProjectWebsite => "https://github.com/batuhanoktem/c64-keyboard-bridge",
+            Self::MacInputSettings => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            }
+        }
+    }
+    pub const fn failure(self) -> &'static str {
+        match self {
+            Self::ProjectWebsite => {
+                "The project website could not be opened. Open https://github.com/batuhanoktem/c64-keyboard-bridge in your browser manually."
+            }
+            Self::MacInputSettings => {
+                "Open System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS) manually."
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GuiSettings {
@@ -134,6 +217,7 @@ pub enum GuiAction {
     Doctor,
     RequestPermission,
     OpenPermissionSettings,
+    OpenProjectWebsite,
     RotatePairing,
     TestInput,
     ImportProfile(PathBuf),

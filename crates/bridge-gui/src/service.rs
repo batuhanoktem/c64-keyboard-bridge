@@ -4,8 +4,6 @@ use crate::{
     model::*,
     secrets::{MemorySecretStore, OsSecretStore, SecretStore},
 };
-#[cfg(target_os = "macos")]
-use anyhow::Context;
 use anyhow::{Result, bail};
 use bridge_core::MappingDocument;
 use bridge_host::{
@@ -433,7 +431,7 @@ impl Actor {
         self.snapshot.configuration_warning = if !self.settings.env_file.is_empty()
             && !Path::new(&self.settings.env_file).is_file()
         {
-            "The selected .env file was not found. Enter the C64 network password on Connection, or choose an existing .env file in Settings. Finder does not inherit your terminal configuration.".into()
+            "The selected .env file was not found. Enter the C64 network password on Connection, or choose an existing .env file in Settings. Desktop launchers do not inherit your terminal configuration.".into()
         } else {
             String::new()
         };
@@ -743,6 +741,7 @@ impl Actor {
         Ok(())
     }
     async fn start(&mut self, deploy: bool, allow_reset: bool) -> Result<()> {
+        validate_platform_backend(&self.settings)?;
         if self.owned.is_some() || self.state_dir.join("runtime.json").exists() {
             bail!("A bridge is already running");
         }
@@ -773,6 +772,7 @@ impl Actor {
         Ok(())
     }
     fn save_form(&mut self, mut settings: GuiSettings, password: String) -> Result<()> {
+        validate_platform_backend(&settings)?;
         if settings.credential_id.is_empty() {
             settings.credential_id = if self.settings.credential_id.is_empty() {
                 config::random_id()?
@@ -833,6 +833,7 @@ impl Actor {
     /// Buttons act on one validated copy of the current form. This does not
     /// write settings or touch the credential store; Save/Apply remain explicit.
     fn use_form(&mut self, mut settings: GuiSettings, password: String) -> Result<bool> {
+        validate_platform_backend(&settings)?;
         if settings.credential_id.is_empty() {
             settings.credential_id = self.settings.credential_id.clone();
         }
@@ -915,6 +916,7 @@ impl Actor {
             }
             GuiAction::Pause => self.pause().await?,
             GuiAction::Enable | GuiAction::TestInput => {
+                validate_platform_backend(&self.settings)?;
                 let test = matches!(action, GuiAction::TestInput);
                 if !test && self.snapshot.settings_pending {
                     bail!(
@@ -1120,12 +1122,18 @@ impl Actor {
                     result?;
                     self.note("Native authorization checked for the GUI application");
                 } else {
-                    self.note("GUI backend permission status refreshed; this backend has no macOS permission prompt");
+                    self.note("GUI input access refreshed; consult the platform instructions in Diagnostics");
                 }
             }
             GuiAction::OpenPermissionSettings => {
-                open_permission_settings()?;
-                self.note("Permission settings opened; enable C64 Keyboard Bridge under Device Control and Data Access (Accessibility on older macOS), then refresh Diagnostics");
+                if self.open_external(ExternalTarget::MacInputSettings).await? {
+                    self.note("Permission settings opened; enable C64 Keyboard Bridge under Device Control and Data Access (Accessibility on older macOS), then refresh Diagnostics");
+                }
+            }
+            GuiAction::OpenProjectWebsite => {
+                if self.open_external(ExternalTarget::ProjectWebsite).await? {
+                    self.note("Project website opened in the default browser");
+                }
             }
             GuiAction::RotatePairing => {
                 if self.owned.is_some() {
@@ -1194,6 +1202,15 @@ impl Actor {
         }
         Ok(())
     }
+    async fn open_external(&mut self, target: ExternalTarget) -> Result<bool> {
+        if self.smoke {
+            self.note("Isolated fixture: external navigation suppressed");
+            return Ok(false);
+        }
+        let mut command = external_command(GuiPlatform::current(), target)?;
+        run_external(&mut command, target, Duration::from_secs(5)).await?;
+        Ok(true)
+    }
 }
 
 /// Show the controlled outer context, never chained transport errors, response
@@ -1219,6 +1236,7 @@ fn operation_name(action: &GuiAction) -> &'static str {
         GuiAction::Doctor => "Diagnostics failed",
         GuiAction::RequestPermission => "Permission request needs attention",
         GuiAction::OpenPermissionSettings => "Accessibility settings could not be opened",
+        GuiAction::OpenProjectWebsite => "Website could not be opened",
         GuiAction::RotatePairing => "Pairing rotation failed",
         GuiAction::ImportProfile(_) => "Mapping import failed",
         GuiAction::SaveProfile { .. } | GuiAction::ExportProfile { .. } => "Mapping save failed",
@@ -1250,24 +1268,63 @@ impl ConnectionOperation {
     }
 }
 
-fn open_permission_settings() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = std::process::Command::new("/usr/bin/open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .context("Open System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS) manually")?;
-        if !status.success() {
-            bail!(
-                "Open System Settings > Privacy & Security > Device Control and Data Access (Accessibility on older macOS) manually"
-            );
-        }
-        Ok(())
+fn validate_platform_backend(settings: &GuiSettings) -> Result<()> {
+    if !GuiPlatform::current().supports_backend(&settings.backend) {
+        bail!(
+            "The configured backend is unavailable on this platform. Select a supported backend in Settings; the imported choice has been preserved"
+        );
     }
-    #[cfg(not(target_os = "macos"))]
-    bail!("This shortcut is available on macOS only")
+    Ok(())
+}
+
+fn external_command(
+    platform: GuiPlatform,
+    target: ExternalTarget,
+) -> Result<std::process::Command> {
+    if target == ExternalTarget::MacInputSettings && platform != GuiPlatform::MacOs {
+        bail!("This settings shortcut is available on macOS only");
+    }
+    let mut command = match platform {
+        GuiPlatform::MacOs => std::process::Command::new("/usr/bin/open"),
+        GuiPlatform::Windows => {
+            let mut command = std::process::Command::new("rundll32.exe");
+            command.arg("url.dll,FileProtocolHandler");
+            command
+        }
+        GuiPlatform::Linux => std::process::Command::new("xdg-open"),
+    };
+    command.arg(target.url());
+    Ok(command)
+}
+
+/// Poll a bounded child on the service thread without blocking the GUI or Tokio.
+/// Never surface desktop-opener output: it can contain local paths or credentials.
+async fn run_external(
+    command: &mut std::process::Command,
+    target: ExternalTarget,
+    timeout: Duration,
+) -> Result<()> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| anyhow::anyhow!(target.failure()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => bail!("{}", target.failure()),
+            Ok(None) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{}", target.failure());
+            }
+        }
+    }
 }
 
 pub fn diagnostic_export(snapshot: &GuiSnapshot) -> Result<Vec<u8>> {

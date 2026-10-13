@@ -1,5 +1,133 @@
 use super::*;
 
+#[test]
+fn trusted_external_targets_use_argument_vectors_and_platform_specific_openers() {
+    for (platform, program, prefix) in [
+        (GuiPlatform::MacOs, "/usr/bin/open", None),
+        (
+            GuiPlatform::Windows,
+            "rundll32.exe",
+            Some("url.dll,FileProtocolHandler"),
+        ),
+        (GuiPlatform::Linux, "xdg-open", None),
+    ] {
+        let command = external_command(platform, ExternalTarget::ProjectWebsite).unwrap();
+        assert_eq!(command.get_program(), program);
+        let mut expected: Vec<&str> = prefix.into_iter().collect();
+        expected.push("https://github.com/batuhanoktem/c64-keyboard-bridge");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            external_command(platform, ExternalTarget::MacInputSettings).is_ok(),
+            platform == GuiPlatform::MacOs,
+        );
+    }
+}
+
+#[tokio::test]
+async fn isolated_gui_link_does_not_launch_a_browser_or_touch_settings() {
+    let (mut actor, _events) = actor();
+    let original = actor.settings.clone();
+    actor.action(GuiAction::OpenProjectWebsite).await.unwrap();
+    assert!(
+        actor
+            .snapshot
+            .message
+            .contains("external navigation suppressed")
+    );
+    assert_eq!(actor.settings, original);
+    assert!(!actor.state_dir.join("gui-settings.toml").exists());
+    assert!(actor.owned.is_none());
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn browser_failure_is_actionable_and_excludes_subprocess_output() {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'OPENER_SECRET_SENTINEL' >&2; exit 1"]);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd.exe");
+        command.args(["/C", "echo OPENER_SECRET_SENTINEL >&2 & exit /B 1"]);
+        command
+    };
+    let error = run_external(
+        &mut command,
+        ExternalTarget::ProjectWebsite,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        display_error(&error),
+        ExternalTarget::ProjectWebsite.failure()
+    );
+    assert!(!display_error(&error).contains("OPENER_SECRET_SENTINEL"));
+}
+
+#[tokio::test]
+async fn hanging_desktop_opener_is_bounded() {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("2");
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 2",
+        ]);
+        command
+    };
+    let before = Instant::now();
+    assert!(
+        run_external(
+            &mut command,
+            ExternalTarget::ProjectWebsite,
+            Duration::from_millis(40)
+        )
+        .await
+        .is_err()
+    );
+    assert!(before.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn unavailable_imported_backend_requires_correction_before_saving_or_using_form() {
+    let (mut actor, _events) = actor();
+    let mut foreign = actor.settings.clone();
+    foreign.backend = if GuiPlatform::current() == GuiPlatform::MacOs {
+        "windows"
+    } else {
+        "macos"
+    }
+    .into();
+    actor.settings = foreign.clone();
+    assert!(
+        actor
+            .save_form(foreign.clone(), "DO_NOT_STORE_SENTINEL".into())
+            .is_err()
+    );
+    assert!(
+        actor
+            .use_form(foreign.clone(), "DO_NOT_STORE_SENTINEL".into())
+            .is_err()
+    );
+    assert!(actor.action(GuiAction::Enable).await.is_err());
+    assert_eq!(actor.settings, foreign);
+    assert!(actor.password.is_none());
+    assert!(!actor.state_dir.join("gui-settings.toml").exists());
+    cleanup(actor);
+}
+
 async fn rest_fixture(status: &str, body: &str) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -133,7 +261,8 @@ async fn startup_bind_failure_is_visible_and_clears_host_ownership() {
     actor.start(false, false).await.unwrap();
     assert!(actor.owned.as_mut().unwrap().ready().await.is_err());
     actor.refresh_status().await;
-    assert!(actor.snapshot.message.contains("bind"));
+    assert!(actor.snapshot.message.contains("port is already in use"));
+    assert!(actor.snapshot.message.contains("BRIDGE_PORT"));
     assert!(actor.snapshot.message.contains("Hosting and input are off"));
     assert_eq!(actor.snapshot.phase, GuiPhase::Idle);
     assert!(!actor.snapshot.owned);
@@ -168,7 +297,12 @@ fn missing_import_is_visible_and_unchanged_save_does_not_require_host_restart() 
             .configuration_warning
             .contains(".env file was not found")
     );
-    assert!(actor.snapshot.configuration_warning.contains("Finder"));
+    assert!(
+        actor
+            .snapshot
+            .configuration_warning
+            .contains("Desktop launchers")
+    );
     actor.snapshot.status = Some(control::Status::default());
     actor
         .save_form(actor.settings.clone(), String::new())

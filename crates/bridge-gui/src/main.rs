@@ -42,10 +42,17 @@ struct Args {
     smoke_report: Option<PathBuf>,
     #[arg(long, requires = "smoke")]
     screenshot: Option<PathBuf>,
+    /// Force a theme only for isolated documentation/smoke captures.
+    #[arg(long, requires = "smoke", value_parser = ["light", "dark"])]
+    smoke_theme: Option<String>,
+    #[arg(long, requires = "smoke", value_parser = clap::value_parser!(u16).range(640..=1440))]
+    smoke_height: Option<u16>,
 }
 
 #[derive(Default, Serialize)]
 struct SmokeEvidence {
+    platform: String,
+    theme: String,
     ok: bool,
     frames: u64,
     pages_rendered: Vec<String>,
@@ -158,7 +165,20 @@ impl NativeApp {
         let mac_main_thread = bridge_host::backend::MacOsMainThreadContext::install()?;
         let context = cc.egui_ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || context.request_repaint());
-        let app = BridgeApp::new_for_state(GuiSettings::default(), &state_dir);
+        let mut app = BridgeApp::new_for_state(GuiSettings::default(), &state_dir);
+        if args.smoke {
+            app.prepare_documentation_capture();
+            evidence.lock().unwrap().platform = std::env::consts::OS.into();
+            evidence.lock().unwrap().theme =
+                args.smoke_theme.clone().unwrap_or_else(|| "system".into());
+        }
+        if let Some(theme) = &args.smoke_theme {
+            cc.egui_ctx.set_theme(if theme == "dark" {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+        }
         let service =
             ServiceHandle::spawn(state_dir, args.env_file.clone(), args.smoke, wake.clone())?;
         let show_tx = sender.clone();
@@ -603,7 +623,14 @@ fn run() -> Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_title("C64 Keyboard Bridge")
         .with_app_id("com.flameliongames.c64keyboardbridge")
-        .with_inner_size([1200.0, 840.0])
+        .with_inner_size([
+            1200.0,
+            if args.smoke {
+                f32::from(args.smoke_height.unwrap_or(1100))
+            } else {
+                840.0
+            },
+        ])
         .with_min_inner_size([900.0, 640.0])
         .with_icon(egui::IconData {
             rgba: image.as_raw().clone(),
@@ -622,6 +649,8 @@ fn run() -> Result<()> {
         smoke: args.smoke,
         smoke_report: args.smoke_report.clone(),
         screenshot: args.screenshot.clone(),
+        smoke_theme: args.smoke_theme.clone(),
+        smoke_height: args.smoke_height,
     };
     eframe::run_native(
         "C64 Keyboard Bridge",
