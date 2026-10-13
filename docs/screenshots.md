@@ -24,6 +24,20 @@ Dark theme, selected only for this capture without changing the system theme:
 
 ![Dark Connection page on macOS, isolated recording fixture](screenshots/macos-dark.png)
 
+## Ubuntu
+
+Actual GUI captures on Ubuntu in a native Wayland session, using isolated recording services. Linux controls show the current backend choices and desktop-controlled repeat.
+
+![Connection page on Ubuntu, with hosting and input off](screenshots/ubuntu-connection.png)
+
+![Keyboard mapping editor on Ubuntu, isolated recording fixture](screenshots/ubuntu-mappings.png)
+
+![Diagnostics page on Ubuntu with recording-backend evidence](screenshots/ubuntu-diagnostics.png)
+
+![Settings page on Ubuntu with Linux backend and Secret Service instructions](screenshots/ubuntu-settings.png)
+
+![Dark Connection page on Ubuntu, isolated recording fixture](screenshots/ubuntu-dark.png)
+
 ## C64 programs in VICE
 
 These are the genuine, unconfigured release templates running in VICE 3.10. They display deployment instructions because no pairing token or network destination is embedded. VICE does not emulate Ultimate UCI, so these images do not show or claim successful networking. The original 384 × 272 pixel proportions are preserved.

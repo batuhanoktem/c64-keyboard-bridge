@@ -82,6 +82,66 @@
       "capture_revision": "d3c042d",
       "hardware_contacted": false,
       "uci_emulated": false
+    },
+    {
+      "file": "ubuntu-connection.png",
+      "platform": "Ubuntu",
+      "origin": "actual GUI, native Wayland, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "294a267bb1764af1168a2e31a662151a44eeb3004d03a7464e514532e66656d4",
+      "capture_revision": "87a083bba84569e9044c41f9733c3589c19682ce",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "ubuntu-mappings.png",
+      "platform": "Ubuntu",
+      "origin": "actual GUI, native Wayland, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "7a77812df35ebea8d6cf3ec1fa22f3ec24cdf3c8dc1757fda35ef8bb24995314",
+      "capture_revision": "87a083bba84569e9044c41f9733c3589c19682ce",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "ubuntu-diagnostics.png",
+      "platform": "Ubuntu",
+      "origin": "actual GUI, native Wayland, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "d630cc35358a1fa38a69af4800560df836cf3c68d3fa1c0f061e0cf1f8ea189c",
+      "capture_revision": "87a083bba84569e9044c41f9733c3589c19682ce",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "ubuntu-settings.png",
+      "platform": "Ubuntu",
+      "origin": "actual GUI, native Wayland, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "4a8b513a650603187a99342ecc1da83ea5e73d395094e4adee75b93b769bf50b",
+      "capture_revision": "87a083bba84569e9044c41f9733c3589c19682ce",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "ubuntu-dark.png",
+      "platform": "Ubuntu",
+      "origin": "actual GUI, native Wayland, isolated recording services",
+      "theme": "dark",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "643fec44fc72e78b009a384dd3aa4e88dc41130cfad6a67ad8f67a3215cd2cab",
+      "capture_revision": "87a083bba84569e9044c41f9733c3589c19682ce",
+      "hardware_contacted": false,
+      "native_input": false
     }
   ]
 }
