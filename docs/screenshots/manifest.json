@@ -169,6 +169,79 @@
       "simulated_credential_pending": true,
       "hardware_contacted": false,
       "native_input": false
+    },
+    {
+      "file": "windows-connection.png",
+      "platform": "Windows x64",
+      "origin": "actual GUI, native Windows, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "b85ef7b7734026328ba66def38ae97b39680a074e69b53c32d254800bfe3a3b1",
+      "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "windows-mappings.png",
+      "platform": "Windows x64",
+      "origin": "actual GUI, native Windows, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "f8004a0fb0665cdcd5beae531ef59fb7e2b57f0885e67ddf6815b81ad42810ce",
+      "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "windows-diagnostics.png",
+      "platform": "Windows x64",
+      "origin": "actual GUI, native Windows, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "47e1fe271ecb1004c4613e8327c474320ebdc8ac73ade5674984147650015a2e",
+      "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "windows-settings.png",
+      "platform": "Windows x64",
+      "origin": "actual GUI, native Windows, isolated recording services",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "96f16e3c60b30209ca21f1a05e043b2b78e8786eb8a86ffb12ab3726b08876f1",
+      "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "windows-password-store-waiting.png",
+      "platform": "Windows x64",
+      "origin": "actual GUI, native Windows, isolated recording services, simulated password-store delay",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "06cbf6b9d8ab557fbdb625d4876661f08c9920873e12c00c980e211e949f0723",
+      "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
+      "simulated_credential_pending": true,
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "windows-dark.png",
+      "platform": "Windows x64",
+      "origin": "actual GUI, native Windows, isolated recording services",
+      "theme": "dark",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "f6c10f3bc1b9cd37df94e057cd377042960a55199caebbd100c9442a90169245",
+      "capture_revision": "0ececfd18cd2be57d0c784f9137df6ec131d8f6d",
+      "hardware_contacted": false,
+      "native_input": false
     }
   ]
 }

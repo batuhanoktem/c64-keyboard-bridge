@@ -52,9 +52,11 @@ SHIFT LOCK uses the observed Shift matrix state and cannot be mapped independent
 
 **Remember password** is opt-in and uses macOS Keychain, Windows Credential Manager or Linux Secret Service. The private settings file stores a credential reference rather than a password. Credential requests run separately from networking and input cleanup. While the store is responding, connection checks and hosting remain available using the session password; a delayed store response never claims that saving or deletion succeeded. An unavailable or locked store leaves the supplied password in memory and reports the failure; there is no plaintext fallback. **Forget saved password** reports deletion failure rather than claiming success.
 
-On macOS, Windows and Linux, the waiting state keeps **Start host** and **Device information** available while Remember and Forget are disabled. These examples show the actual macOS and Ubuntu GUIs with a simulated password-store delay, empty credentials and recording services; they do not access an OS password store or contact a device.
+On macOS, Windows and Linux, the waiting state keeps **Start host** and **Device information** available while Remember and Forget are disabled. These examples show the actual macOS, Windows and Ubuntu GUIs with a simulated password-store delay, empty credentials and recording services; they do not access an OS password store or contact a device.
 
 ![Password-store waiting state in the actual macOS GUI, with a simulated delay and connection controls available](screenshots/macos-password-store-waiting.png)
+
+![Password-store waiting state in the actual Windows GUI, with a simulated delay and connection controls available](screenshots/windows-password-store-waiting.png)
 
 ![Password-store waiting state in the actual Ubuntu Wayland GUI, with a simulated delay and connection controls available](screenshots/ubuntu-password-store-waiting.png)
 

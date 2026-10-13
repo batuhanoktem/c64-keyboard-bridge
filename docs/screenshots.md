@@ -28,6 +28,34 @@ Dark theme, selected only for this capture without changing the system theme:
 
 ![Dark Connection page on macOS, isolated recording fixture](screenshots/macos-dark.png)
 
+## Windows
+
+Actual GUI captures on native Windows x64, using isolated recording services. Windows controls show SendInput availability guidance, elevated-application restrictions and Credential Manager instructions.
+
+Connection controls and Windows input-availability guidance:
+
+![Connection page on Windows with hosting stopped and input disabled](screenshots/windows-connection.png)
+
+Physical keyboard and shared mapping preview:
+
+![Keyboard mapping editor on Windows, isolated recording fixture](screenshots/windows-mappings.png)
+
+Diagnostics for the GUI posting process using recording-backend evidence:
+
+![Diagnostics page on Windows with recording-backend evidence](screenshots/windows-diagnostics.png)
+
+Settings show Windows Credential Manager instructions and host repeat settings:
+
+![Settings page on Windows with Credential Manager and host repeat settings](screenshots/windows-settings.png)
+
+Password-store waiting state on Windows: connection controls remain available while Remember and Forget are disabled. This is the actual native Windows GUI with a simulated delay; the fixture makes no Credential Manager request.
+
+![Connection page on Windows with a simulated password-store delay, disabled credential controls and available connection controls](screenshots/windows-password-store-waiting.png)
+
+Dark theme, selected only for this capture without changing the system theme:
+
+![Dark Connection page on Windows, isolated recording fixture](screenshots/windows-dark.png)
+
 ## Ubuntu
 
 Actual GUI captures on Ubuntu in a native Wayland session, using isolated recording services. Linux controls show GNOME portal guidance, the current backend choices and desktop-controlled repeat.
