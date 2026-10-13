@@ -140,7 +140,7 @@ impl ServiceHandle {
         let permit = Arc::new(OutputPermit::default());
         let gate = permit.clone();
         let handle = thread::Builder::new()
-            .name("c64bridge-gui-service".into())
+            .name("c64-keyboard-bridge-gui-service".into())
             .spawn(move || {
                 let executor = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)

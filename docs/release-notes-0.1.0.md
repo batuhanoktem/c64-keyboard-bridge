@@ -11,7 +11,7 @@ Prepared notes for the first release. This document does not create a tag or pub
 - Drag-to-Applications Mac DMGs, per-user Windows installers, Ubuntu DEBs and portable archives with corresponding source and licensing notices.
 - Protected release preparation signs and notarizes Mac packages after owner approval and verifies final downloads and checksums before explicit publication. Local signed-only development packages carry a separate classification. Windows installers remain unsigned.
 
-Settings, pairing state and saved credential references are preserved across the executable/app-ID rename. macOS may require renewed application permissions or Keychain approval.
+The new application storage and credential namespace requires fresh configuration and pairing. Saved credentials from older builds are not queried; old data is left untouched without automatic migration. Re-enter the password and deliberately redeploy the newly paired C64 client when ready. macOS may require renewed application permissions or Keychain approval.
 
 Device and platform acceptance is described in [compatibility](device-compatibility.md), [platform support](platforms.md) and [hardware testing](hardware-testing.md). Linux XTEST fixture success and GUI screenshots do not establish physical Wayland/uinput input acceptance. GNOME uses approved portal sessions; Sway/Hyprland uinput requires user-granted device access and its supported layout-query path. Installation grants no input permission and never runs the network application as root.
 

@@ -72,7 +72,7 @@ def main():
                         '--output', str(output), '--theme', args.theme, '--session-child'], check=True, timeout=90)
         return
     processes = []
-    with tempfile.TemporaryDirectory(prefix='c64bridge-gui-smoke-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='c64-keyboard-bridge-gui-smoke-') as temporary:
         private = Path(temporary)
         environment = os.environ.copy()
         # Ordinary startup reads .env and may inspect platform credentials. Smoke mode uses fake services;

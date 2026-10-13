@@ -9,9 +9,9 @@ REVISION = "555282497c3ecf8b313d87d5973093af19c35bd5"
 
 
 def verify(root: Path) -> None:
-    if (root / ".c64bridge-source-revision").read_text().strip() != REVISION:
+    if (root / ".c64-keyboard-bridge-source-revision").read_text().strip() != REVISION:
         raise ValueError("Archived cc65 source revision does not match the pinned revision")
-    manifest = json.loads((root / ".c64bridge-source-sha256.json").read_text())
+    manifest = json.loads((root / ".c64-keyboard-bridge-source-sha256.json").read_text())
     if manifest.get("revision") != REVISION or not manifest.get("files"):
         raise ValueError("Invalid cc65 source manifest")
     for name, expected in manifest["files"].items():

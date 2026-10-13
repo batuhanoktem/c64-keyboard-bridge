@@ -365,7 +365,9 @@ async fn test_input(config: &Config, countdown: u64) -> Result<()> {
     } else {
         operations::test_input(config).await?;
     }
-    println!("Input events posted. Verify the phrase c64 bridge in the focused application.");
+    println!(
+        "Input events posted. Verify the phrase c64 keyboard bridge in the focused application."
+    );
     Ok(())
 }
 

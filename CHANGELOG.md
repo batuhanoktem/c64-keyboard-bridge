@@ -17,6 +17,8 @@ User-visible changes are collected here. Unreleased changes do not imply that a 
 ### Changed
 
 - Public commands are c64-keyboard-bridge and c64-keyboard-bridge-gui; the application ID is com.flameliongames.c64keyboardbridge.
+- Private settings, pairing and OS credentials use the new application namespace. Fresh configuration and pairing are required; older data remains untouched and is not read or migrated.
+- The deliberate input test now types `c64 keyboard bridge` and Enter, with 20 balanced press/release pairs.
 - Enable input activates immediately after connection, permission and layout checks. The deliberate input test retains its countdown.
 
 ### Fixed

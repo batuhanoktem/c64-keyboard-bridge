@@ -215,7 +215,7 @@ def archive_cc65(destination: Path) -> None:
         existing = ROOT / "third-party/cc65"
         run("python" if platform.system() == "Windows" else sys.executable,
             ROOT / "scripts/verify-cc65-source.py", existing)
-        manifest = json.loads((existing / ".c64bridge-source-sha256.json").read_text())
+        manifest = json.loads((existing / ".c64-keyboard-bridge-source-sha256.json").read_text())
         for name in manifest["files"]:
             copy_file(existing / name, destination / name)
     else:
@@ -238,8 +238,8 @@ def archive_cc65(destination: Path) -> None:
                     path.chmod(member.mode & 0o777)
     hashes = {p.relative_to(destination).as_posix(): hash_file(p)
               for p in sorted(destination.rglob("*")) if p.is_file()}
-    (destination / ".c64bridge-source-revision").write_text(REVISION + "\n")
-    (destination / ".c64bridge-source-sha256.json").write_text(
+    (destination / ".c64-keyboard-bridge-source-revision").write_text(REVISION + "\n")
+    (destination / ".c64-keyboard-bridge-source-sha256.json").write_text(
         json.dumps({"revision": REVISION, "files": hashes}, indent=2) + "\n")
 
 
@@ -367,8 +367,8 @@ def main() -> None:
             collect_runtime_notices(binary / "third-party/rust-runtime")
             if suffix:
                 copy_file(ROOT / "installers/nsis-notices/COPYING", binary / "third-party/nsis/COPYING")
-            copy_file(ROOT / "assets/c64bridge.png", binary / "assets/c64bridge.png")
-            copy_file(ROOT / "assets/c64bridge.svg", binary / "assets/c64bridge.svg")
+            copy_file(ROOT / "assets/c64-keyboard-bridge.png", binary / "assets/c64-keyboard-bridge.png")
+            copy_file(ROOT / "assets/c64-keyboard-bridge.svg", binary / "assets/c64-keyboard-bridge.svg")
             (binary / "build-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
             app = None
             if macos_minimum:

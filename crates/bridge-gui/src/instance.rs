@@ -158,7 +158,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn second_launch_restores_primary_without_replacing_its_lock_or_record() {
         let dir = std::env::temp_dir().join(format!(
-            "c64bridge-gui-instance-{}",
+            "c64-keyboard-bridge-gui-instance-{}",
             crate::config::random_id().unwrap()
         ));
         let Instance::Primary(mut guard) = acquire(&dir).unwrap() else {

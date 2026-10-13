@@ -45,14 +45,14 @@ def icon(size):
 
 def main():
     images = {size: icon(size) for size in (32, 128, 256, 512, 1024)}
-    (ROOT / 'c64bridge.png').write_bytes(images[256])
+    (ROOT / 'c64-keyboard-bridge.png').write_bytes(images[256])
     data = images[256]
-    (ROOT / 'c64bridge.ico').write_bytes(struct.pack('<HHH', 0, 1, 1)
+    (ROOT / 'c64-keyboard-bridge.ico').write_bytes(struct.pack('<HHH', 0, 1, 1)
                                       + struct.pack('<BBBBHHII', 0, 0, 0, 0, 1, 32, len(data), 22) + data)
     pieces = b''.join(kind + struct.pack('>I', len(images[size]) + 8) + images[size]
                       for kind, size in [(b'icp5', 32), (b'ic07', 128), (b'ic08', 256),
                                          (b'ic09', 512), (b'ic10', 1024)])
-    (ROOT / 'c64bridge.icns').write_bytes(b'icns' + struct.pack('>I', len(pieces) + 8) + pieces)
+    (ROOT / 'c64-keyboard-bridge.icns').write_bytes(b'icns' + struct.pack('>I', len(pieces) + 8) + pieces)
 
 
 if __name__ == '__main__':

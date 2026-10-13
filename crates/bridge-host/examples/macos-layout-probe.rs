@@ -33,7 +33,7 @@ fn main() {
 
     let result = backend::run_with_main_thread_loop(move || {
         let service = std::thread::Builder::new()
-            .name("c64bridge-gui-service".into())
+            .name("c64-keyboard-bridge-gui-service".into())
             .spawn(|| backend::probe_backend("macos", KeyboardLayout::Us))
             .expect("create read-only service probe");
         let probe = service.join().expect("service probe must not crash");
@@ -47,7 +47,7 @@ fn main() {
             );
         }
         let worker = std::thread::Builder::new()
-            .name("c64bridge-input-worker".into())
+            .name("c64-keyboard-bridge-input-worker".into())
             .spawn(move || {
                 if probe.authorized && layout_known {
                     let actual = if probe.layout_matches == Some(true) {

@@ -133,7 +133,7 @@ class ReleaseFixture(unittest.TestCase):
                      **{"c64/" + name: data for name, data in prgs.items()}}
             assets = []
             if "apple" in target:
-                files[service.APP + "/Contents/Resources/c64bridge.icns"] = b"icon fixture"
+                files[service.APP + "/Contents/Resources/c64-keyboard-bridge.icns"] = b"icon fixture"
                 files[service.APP + "/Contents/Info.plist"] = plistlib.dumps({"CFBundleIdentifier": service.APP_ID,
                     "CFBundleExecutable": service.BINARIES[1], "CFBundleShortVersionString": "0.1.0"})
                 for name, data in binaries.items():

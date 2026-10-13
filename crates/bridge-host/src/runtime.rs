@@ -467,7 +467,7 @@ fn spawn_worker_with_backend_factory(
     let control_order = Arc::new(Mutex::new(()));
     let worker_order = control_order.clone();
     let worker_generation = generation.clone();
-    let thread=thread::Builder::new().name("c64bridge-input".into()).spawn(move || {
+    let thread=thread::Builder::new().name("c64-keyboard-bridge-input".into()).spawn(move || {
         let mut mapper=Mapper::new(profile,platform());
         let mut preparations = BTreeMap::<u64, PendingPreparation>::new();
         let mut active_preparation: Option<(u64, bool)> = None;

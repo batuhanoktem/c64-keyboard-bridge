@@ -248,7 +248,7 @@ def validate_bundle_members(archive, root):
                                    "CONTRIBUTING.md", "SECURITY.md", ".env.example", "build-provenance.json"}
     for name, member in ordinary.items():
         path = PurePosixPath(name)
-        require(name in allowed_root or name in {"assets/c64bridge.png", "assets/c64bridge.svg", "c64/README.md", "scripts/README.md",
+        require(name in allowed_root or name in {"assets/c64-keyboard-bridge.png", "assets/c64-keyboard-bridge.svg", "c64/README.md", "scripts/README.md",
                 "c64/KEYBRIDGE.PRG", "c64/NETWORKTEST.PRG", "c64/prg-manifest.json"}
                 or name.startswith(("docs/", "config/layouts/", "third-party/rust-crates/", "third-party/rust-runtime/")),
                 "Mac payload contains files outside its expected resource inventory")
@@ -259,7 +259,7 @@ def validate_bundle_members(archive, root):
                 prefix = stream.read(4)
             require(prefix not in {b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe"}
                     and not prefix.startswith(b"MZ"), "Mac payload contains executable bytes in a resource")
-    expected = {APP + "/Contents/Info.plist", APP + "/Contents/Resources/c64bridge.icns"}
+    expected = {APP + "/Contents/Info.plist", APP + "/Contents/Resources/c64-keyboard-bridge.icns"}
     expected.update(APP + "/Contents/MacOS/" + name for name in BINARIES)
     expected.update(APP + "/Contents/Resources/" + name for name in ordinary if name not in BINARIES)
     actual = {name for name in files if name.startswith(APP + "/")}

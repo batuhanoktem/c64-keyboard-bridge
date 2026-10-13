@@ -218,7 +218,7 @@ pub fn run_with_main_thread_loop<T: Send + 'static>(
     let context = MacOsMainThreadContext::install()?;
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker = thread::Builder::new()
-        .name("c64bridge-cli-runtime".into())
+        .name("c64-keyboard-bridge-cli-runtime".into())
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(task));
             let _ = sender.send(result);

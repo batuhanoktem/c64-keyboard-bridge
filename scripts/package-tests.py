@@ -41,9 +41,9 @@ class PackagingTests(unittest.TestCase):
 
     def test_source_allowlist_contains_gui_build_inputs_and_no_private_state(self):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE["source_files"]()}
-        for name in ["assets/c64bridge.png", "assets/c64bridge.svg", "assets/c64bridge.ico",
-                     "assets/c64bridge.icns", "assets/generate-icons.py", "installers/nsis-notices/COPYING",
-                     "installers/windows/c64bridge.nsi", "installers/linux/com.flameliongames.c64keyboardbridge.desktop"]:
+        for name in ["assets/c64-keyboard-bridge.png", "assets/c64-keyboard-bridge.svg", "assets/c64-keyboard-bridge.ico",
+                     "assets/c64-keyboard-bridge.icns", "assets/generate-icons.py", "installers/nsis-notices/COPYING",
+                     "installers/windows/c64-keyboard-bridge.nsi", "installers/linux/com.flameliongames.c64keyboardbridge.desktop"]:
             self.assertIn(name, names)
         self.assertTrue(any(name.startswith("crates/bridge-gui/") for name in names))
         for name in ("CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", "docs/build-and-release.md",

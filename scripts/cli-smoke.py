@@ -13,7 +13,7 @@ import time
 
 def smoke(binary: Path) -> None:
     binary = binary.resolve()
-    with tempfile.TemporaryDirectory(prefix="c64bridge-smoke-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-smoke-") as temporary:
         directory = Path(temporary)
         environment = os.environ.copy()
         config_names = {

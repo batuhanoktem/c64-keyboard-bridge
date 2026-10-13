@@ -23,7 +23,7 @@ def bootstrap():
         with tempfile.NamedTemporaryFile(dir=archive_path.parent, delete=False) as temporary:
             temporary_path = Path(temporary.name)
             try:
-                request = urllib.request.Request(URL, headers={"User-Agent": "C64Bridge-release-builder"})
+                request = urllib.request.Request(URL, headers={"User-Agent": "C64KeyboardBridge-release-builder"})
                 with urllib.request.urlopen(request, timeout=60) as response:
                     data = response.read(8 * 1024 * 1024 + 1)
                 if len(data) > 8 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != SHA256:

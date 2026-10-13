@@ -170,7 +170,7 @@ define_class!(
     unsafe impl NSObjectProtocol for QuitTarget {}
 
     impl QuitTarget {
-        #[unsafe(method(requestC64BridgeQuit:))]
+        #[unsafe(method(requestC64KeyboardBridgeQuit:))]
         fn request_quit(&self, _sender: Option<&AnyObject>) { (self.ivars().callback)(); }
     }
 );
@@ -212,7 +212,7 @@ impl QuitMenu {
         // one-object action signature. It remains alive until the action is restored.
         unsafe {
             item.setTarget(Some(&target));
-            item.setAction(Some(sel!(requestC64BridgeQuit:)));
+            item.setAction(Some(sel!(requestC64KeyboardBridgeQuit:)));
         }
         Ok(Self {
             item,

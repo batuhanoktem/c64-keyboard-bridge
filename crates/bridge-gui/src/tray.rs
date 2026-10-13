@@ -61,7 +61,7 @@ impl Tray {
                 }
             }));
             let image = image::load_from_memory_with_format(
-                include_bytes!("../../../assets/c64bridge.png"),
+                include_bytes!("../../../assets/c64-keyboard-bridge.png"),
                 image::ImageFormat::Png,
             )?
             .into_rgba8();
@@ -82,7 +82,7 @@ impl Tray {
         {
             let (stop, mut stopping) = tokio::sync::watch::channel(false);
             let (updates, mut enabled) = tokio::sync::watch::channel(false);
-            let thread = std::thread::Builder::new().name("c64bridge-tray".into()).spawn(move || {
+            let thread = std::thread::Builder::new().name("c64-keyboard-bridge-tray".into()).spawn(move || {
                 use ksni::TrayMethods;
                 let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                     Ok(runtime) => runtime,
@@ -186,7 +186,7 @@ impl ksni::Tray for LinuxTray {
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let Ok(image) = image::load_from_memory_with_format(
-            include_bytes!("../../../assets/c64bridge.png"),
+            include_bytes!("../../../assets/c64-keyboard-bridge.png"),
             image::ImageFormat::Png,
         ) else {
             return Vec::new();

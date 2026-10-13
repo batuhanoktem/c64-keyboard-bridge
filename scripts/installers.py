@@ -34,13 +34,13 @@ def macos_bundle(payload, version, minimum):
             shutil.copytree(path, resources / path.name)
         else:
             shutil.copy2(path, resources / path.name)
-    shutil.copy2(ROOT / "assets/c64bridge.icns", resources / "c64bridge.icns")
+    shutil.copy2(ROOT / "assets/c64-keyboard-bridge.icns", resources / "c64-keyboard-bridge.icns")
     info = {
         "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "c64-keyboard-bridge-gui",
         "CFBundleIdentifier": BUNDLE_ID, "CFBundleName": "C64 Keyboard Bridge",
         "CFBundleDisplayName": "C64 Keyboard Bridge", "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": version, "CFBundleVersion": version,
-        "CFBundleIconFile": "c64bridge.icns", "LSMinimumSystemVersion": minimum,
+        "CFBundleIconFile": "c64-keyboard-bridge.icns", "LSMinimumSystemVersion": minimum,
         "NSPrincipalClass": "NSApplication", "NSHighResolutionCapable": True,
         "NSAccessibilityUsageDescription": "Send keys from your paired C64 keyboard when you explicitly enable input.",
         "NSLocalNetworkUsageDescription": "Connect to your configured C64 Ultimate on the local network and receive its keyboard data when you explicitly start hosting.",
@@ -76,7 +76,7 @@ def macos_sign(app, identity):
 
 
 def macos_dmg(app, output, identity=None, notary_profile=None):
-    with tempfile.TemporaryDirectory(prefix="c64bridge-dmg-", dir=ROOT / "target/package-staging") as temporary:
+    with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-dmg-", dir=ROOT / "target/package-staging") as temporary:
         stage = Path(temporary)
         shutil.copytree(app, stage / app.name, symlinks=True)
         (stage / "Applications").symlink_to("/Applications")
@@ -107,7 +107,7 @@ def windows_installer(payload, output, version):
     notices = payload / "third-party/nsis"
     notices.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / "installers/nsis-notices/COPYING", notices / "COPYING")
-    with tempfile.TemporaryDirectory(prefix="c64bridge-nsis-", dir=ROOT / "target/package-staging") as temporary:
+    with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-nsis-", dir=ROOT / "target/package-staging") as temporary:
         manifest = Path(temporary) / "uninstall-files.nsh"
         lines = []
         # Delete only the installed inventory; user-created .env and other files are preserved.
@@ -121,12 +121,12 @@ def windows_installer(payload, output, version):
             lines.append(f'  RMDir "$INSTDIR\\{escaped(path)}"')
         manifest.write_text('\n'.join(lines) + '\n')
         run(compiler, "/WX", "/V3", f"/DPAYLOAD={payload}", f"/DOUTPUT={output}",
-            f"/DVERSION={version}", f"/DICON={ROOT / 'assets/c64bridge.ico'}",
-            f"/DUNINSTALL_FILES={manifest}", ROOT / "installers/windows/c64bridge.nsi")
+            f"/DVERSION={version}", f"/DICON={ROOT / 'assets/c64-keyboard-bridge.ico'}",
+            f"/DUNINSTALL_FILES={manifest}", ROOT / "installers/windows/c64-keyboard-bridge.nsi")
 
 
 def linux_deb(payload, output, version, architecture):
-    with tempfile.TemporaryDirectory(prefix="c64bridge-deb-", dir=ROOT / "target/package-staging") as temporary:
+    with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-deb-", dir=ROOT / "target/package-staging") as temporary:
         stage = Path(temporary)
         library = stage / "usr/lib/c64-keyboard-bridge"
         shutil.copytree(payload, library)
@@ -140,10 +140,10 @@ def linux_deb(payload, output, version, architecture):
                      desktop / "com.flameliongames.c64keyboardbridge.desktop")
         icons = stage / "usr/share/icons/hicolor/256x256/apps"
         icons.mkdir(parents=True)
-        shutil.copy2(ROOT / "assets/c64bridge.png", icons / "com.flameliongames.c64keyboardbridge.png")
+        shutil.copy2(ROOT / "assets/c64-keyboard-bridge.png", icons / "com.flameliongames.c64keyboardbridge.png")
         scalable = stage / "usr/share/icons/hicolor/scalable/apps"
         scalable.mkdir(parents=True)
-        shutil.copy2(ROOT / "assets/c64bridge.svg", scalable / "com.flameliongames.c64keyboardbridge.svg")
+        shutil.copy2(ROOT / "assets/c64-keyboard-bridge.svg", scalable / "com.flameliongames.c64keyboardbridge.svg")
         control = stage / "DEBIAN"
         control.mkdir()
         size = sum(path.stat().st_size for path in stage.rglob('*') if path.is_file()) // 1024

@@ -177,7 +177,7 @@ Run `c64-keyboard-bridge permissions` and `doctor` without enabling a host. On m
 c64-keyboard-bridge test-input --countdown 5
 ```
 
-Observe `c64 bridge` and Enter in the focused application. Test TextEdit or VS Code on macOS, Notepad or VS Code on Windows, and both the intended desktop editor and terminal on Linux. Record actual results for each. A posted event or successful permission check does not prove delivery. Avoid holding the computer's own modifier keys while doing these tests.
+Observe `c64 keyboard bridge` and Enter in the focused application. Test TextEdit or VS Code on macOS, Notepad or VS Code on Windows, and both the intended desktop editor and terminal on Linux. Record actual results for each. A posted event or successful permission check does not prove delivery. Avoid holding the computer's own modifier keys while doing these tests.
 
 ## 4. Physical keyboard and mappings
 

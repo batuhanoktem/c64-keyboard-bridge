@@ -40,7 +40,7 @@ def supplement(package):
     for name in CANDIDATES:
         url = f'https://raw.githubusercontent.com/{repository}/{revision}/{name}'
         try:
-            request = urllib.request.Request(url, headers={'User-Agent': 'C64Bridge-notice-audit'})
+            request = urllib.request.Request(url, headers={'User-Agent': 'C64KeyboardBridge-notice-audit'})
             with urllib.request.urlopen(request, timeout=30) as response:
                 data = response.read(128 * 1024 + 1)
             if len(data) > 128 * 1024:

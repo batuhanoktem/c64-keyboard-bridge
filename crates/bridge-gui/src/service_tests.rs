@@ -354,7 +354,7 @@ async fn changed_form_pauses_owned_host_and_requires_apply_before_deployment() {
 
 fn actor() -> (Actor, mpsc::Receiver<GuiEvent>) {
     let directory = std::env::temp_dir().join(format!(
-        "c64bridge-gui-controller-{}",
+        "c64-keyboard-bridge-gui-controller-{}",
         config::random_id().unwrap()
     ));
     pairing::prepare_directory(&directory).unwrap();
@@ -1198,7 +1198,7 @@ async fn deliberate_test_countdown_starts_after_consent_and_reuses_retained_back
     assert!(!actor.snapshot.test_authorization_pending);
     actor.countdown.as_mut().unwrap().end = Instant::now();
     actor.tick().await;
-    assert_eq!(events.lock().unwrap().len(), 22);
+    assert_eq!(events.lock().unwrap().len(), 40);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(actor.countdown.is_none());
     assert!(!actor.permit.test_allow.load(Ordering::SeqCst));

@@ -7,6 +7,15 @@ use std::{
     time::Duration,
 };
 
+/// Public application namespace shared by both frontends and OS credentials.
+pub const APPLICATION_ID: &str = "com.flameliongames.c64keyboardbridge";
+
+pub fn default_state_dir() -> PathBuf {
+    directories::ProjectDirs::from("com", "flameliongames", "c64keyboardbridge")
+        .map(|dirs| dirs.data_local_dir().to_owned())
+        .unwrap_or_else(|| PathBuf::from(".c64-keyboard-bridge-state"))
+}
+
 #[derive(Clone)]
 pub struct Secret(String);
 impl Secret {
@@ -101,11 +110,7 @@ impl Config {
         };
         let state_dir = optional("BRIDGE_STATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                directories::ProjectDirs::from("net", "c64bridge", "C64 Keyboard Bridge")
-                    .map(|d| d.data_local_dir().to_owned())
-                    .unwrap_or_else(|| PathBuf::from(".c64bridge-state"))
-            });
+            .unwrap_or_else(default_state_dir);
         let allowed_ips = optional("C64_ALLOWED_IPS")
             .map(|s| {
                 s.split(',')
@@ -254,6 +259,34 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
     }
+    #[test]
+    fn application_namespace_and_explicit_state_override_are_distinct() {
+        assert_eq!(APPLICATION_ID, "com.flameliongames.c64keyboardbridge");
+        let configured =
+            Config::from_values(BTreeMap::new(), BTreeMap::new(), Overrides::default()).unwrap();
+        assert_eq!(configured.state_dir, default_state_dir());
+        let expected = directories::ProjectDirs::from("com", "flameliongames", "c64keyboardbridge")
+            .map(|dirs| dirs.data_local_dir().to_owned())
+            .unwrap_or_else(|| PathBuf::from(".c64-keyboard-bridge-state"));
+        assert_eq!(configured.state_dir, expected);
+
+        let prior = tempfile::tempdir().unwrap();
+        let sentinel = prior.path().join("pairing.key");
+        std::fs::write(&sentinel, "older pairing sentinel").unwrap();
+        let explicit = Config::from_values(
+            values(&[("BRIDGE_STATE_DIR", prior.path().to_str().unwrap())]),
+            BTreeMap::new(),
+            Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(explicit.state_dir, prior.path());
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "older pairing sentinel"
+        );
+        assert_eq!(std::fs::read_dir(prior.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn precedence_and_secret_redaction() {
         let c = Config::from_values(

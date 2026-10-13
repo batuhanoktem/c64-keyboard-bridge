@@ -12,7 +12,7 @@ fn main() {
     let require_layout = std::env::args().any(|arg| arg == "--require-layout");
     backend::run_with_main_thread_loop(move || {
         let directory = std::env::temp_dir().join(format!(
-            "c64bridge-native-service-{}", config::random_id().unwrap()
+            "c64-keyboard-bridge-native-service-{}", config::random_id().unwrap()
         ));
         pairing::prepare_directory(&directory).unwrap();
         let settings = GuiSettings {

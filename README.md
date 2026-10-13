@@ -35,7 +35,7 @@ For the pinned cc65 build, sanitizers, CLI smoke checks, and release archives, u
 
 The [screenshot gallery](docs/screenshots.md) covers platform-specific GUI pages and genuine C64 PRG screens in VICE. Screenshots use isolated demonstration settings and do not establish physical input acceptance.
 
-Install the architecture-specific macOS DMG, Windows per-user installer or Ubuntu 24.04+ DEB, or run `c64-keyboard-bridge-gui` from a portable archive. Hosting and input start disabled. Enter your C64 address on Connection, choose a matching US/UK host layout, then start the host. Deploying either C64 program requires a separate confirmation because it resets the C64 and replaces its current program.
+Install the architecture-specific macOS DMG, Windows per-user installer or Ubuntu 24.04+ DEB, or run `c64-keyboard-bridge-gui` from a portable archive. Hosting and input start disabled. This build uses a new private settings, pairing and credential namespace; re-enter configuration and the password when upgrading from earlier builds. Older data remains untouched without automatic migration. Enter your C64 address on Connection, choose a matching US/UK host layout, then start the host. Deploying either C64 program requires a separate confirmation because it resets the C64 and replaces its current program.
 
 **Enable input** activates immediately after connection, permission and layout checks pass, even while the companion is focused. C64 keystrokes go to the focused application; changing focus does not pause input. Use **Pause input** in the window or tray to stop it. The deliberate native input test retains its confirmation and five-second countdown to switch to a scratch application. Closing the window keeps it in the tray when a tray is available; Quit releases keys and stops GUI-owned hosting. An existing separately started CLI session is identified and survives GUI Quit. Read [the GUI guide](docs/gui.md) for mappings, credential storage and installer signing status.
 
@@ -53,7 +53,7 @@ c64-keyboard-bridge device info
 c64-keyboard-bridge permissions
 ```
 
-`doctor` and `permissions` inspect authorization without typing or opening a permission prompt. On macOS, explicitly request the Accessibility prompt with `c64-keyboard-bridge permissions --request`. A deliberate native test is `c64-keyboard-bridge test-input --countdown 5`: focus an empty scratch document before the countdown finishes and verify `c64 bridge` followed by Enter.
+`doctor` and `permissions` inspect authorization without typing or opening a permission prompt. On macOS, explicitly request the Accessibility prompt with `c64-keyboard-bridge permissions --request`. A deliberate native test is `c64-keyboard-bridge test-input --countdown 5`: focus an empty scratch document before the countdown finishes and verify `c64 keyboard bridge` followed by Enter.
 
 Before relying on UCI networking, stop the bridge and run:
 

@@ -11,9 +11,7 @@ use std::{
 pub const SETTINGS_LIMIT: u64 = 1024 * 1024;
 
 pub fn default_state_dir() -> PathBuf {
-    directories::ProjectDirs::from("net", "c64bridge", "C64 Keyboard Bridge")
-        .map(|d| d.data_local_dir().to_owned())
-        .unwrap_or_else(|| PathBuf::from(".c64bridge-state"))
+    bridge_host::config::default_state_dir()
 }
 
 pub fn random_id() -> Result<String> {
@@ -69,7 +67,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     } else if fs::symlink_metadata(path).is_ok() {
         bail!("Refusing to replace a dangling symlink");
     }
-    let temporary = parent.join(format!(".c64bridge-{}.tmp", random_id()?));
+    let temporary = parent.join(format!(".c64-keyboard-bridge-{}.tmp", random_id()?));
     let result = (|| {
         let mut file = bridge_host::pairing::private_file(&temporary, true)?;
         file.write_all(bytes)?;
@@ -234,9 +232,21 @@ pub fn save_settings(state_dir: &Path, settings: &GuiSettings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gui_and_host_share_the_new_application_state_directory() {
+        let host =
+            Config::from_values(BTreeMap::new(), BTreeMap::new(), Overrides::default()).unwrap();
+        assert_eq!(default_state_dir(), host.state_dir);
+        assert_eq!(
+            default_state_dir(),
+            bridge_host::config::default_state_dir()
+        );
+    }
     fn directory() -> PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("c64bridge-gui-settings-{}", random_id().unwrap()));
+        let p = std::env::temp_dir().join(format!(
+            "c64-keyboard-bridge-gui-settings-{}",
+            random_id().unwrap()
+        ));
         bridge_host::pairing::prepare_directory(&p).unwrap();
         p
     }

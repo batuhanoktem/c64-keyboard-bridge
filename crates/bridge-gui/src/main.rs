@@ -156,7 +156,7 @@ impl ActivationServer {
         let token = guard.token();
         let (stop, stopping) = tokio::sync::watch::channel(false);
         let thread = thread::Builder::new()
-            .name("c64bridge-gui-activation".into())
+            .name("c64-keyboard-bridge-gui-activation".into())
             .spawn(move || {
                 if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -765,7 +765,7 @@ fn run() -> Result<()> {
     let evidence = Arc::new(Mutex::new(SmokeEvidence::default()));
     let app_evidence = evidence.clone();
     let image = image::load_from_memory_with_format(
-        include_bytes!("../../../assets/c64bridge.png"),
+        include_bytes!("../../../assets/c64-keyboard-bridge.png"),
         image::ImageFormat::Png,
     )?
     .into_rgba8();

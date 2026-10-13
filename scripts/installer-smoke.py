@@ -39,10 +39,10 @@ def verify_payload(path, windows=False):
 
 def linux_check(directory):
     for package in sorted(directory.glob('*.deb')):
-        with tempfile.TemporaryDirectory(prefix="c64bridge-install-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-install-") as temporary:
             root = Path(temporary) / "root"
             root.mkdir()
-            sentinel = root / "home/sandbox/.config/c64bridge/preserved-settings"
+            sentinel = root / "home/sandbox/.config/c64keyboardbridge/preserved-settings"
             sentinel.parent.mkdir(parents=True)
             sentinel.write_text("PRIVATE_USER_SENTINEL")
             control = Path(temporary) / "control"
@@ -69,7 +69,7 @@ def linux_check(directory):
 
 def windows_check(directory):
     for package in sorted(directory.glob('*-setup.exe')):
-        with tempfile.TemporaryDirectory(prefix="c64bridge-install-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-install-") as temporary:
             install = Path(temporary) / "program"
             sentinel = Path(temporary) / "private-user-settings"
             sentinel.write_text("PRIVATE_USER_SENTINEL")
@@ -102,7 +102,7 @@ def windows_check(directory):
 
 def macos_check(directory):
     for package in sorted(directory.glob('*.dmg')):
-        with tempfile.TemporaryDirectory(prefix="c64bridge-mount-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-mount-") as temporary:
             mount = Path(temporary)
             attached = False
             try:

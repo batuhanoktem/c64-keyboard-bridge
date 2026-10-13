@@ -64,7 +64,7 @@ impl Confirm {
                 "Hosting must be stopped before rotation. Previously configured C64 programs will no longer authenticate. Deploy a newly paired program deliberately when ready."
             }
             Self::InputTest => {
-                "After a five-second countdown the bridge will type ‘c64 bridge’ and Enter into the focused application. Open an empty scratch document and switch to it during the countdown."
+                "After a five-second countdown the bridge will type ‘c64 keyboard bridge’ and Enter into the focused application. Open an empty scratch document and switch to it during the countdown."
             }
             Self::WriteProfile { .. } | Self::WriteDiagnostics(_) => {
                 "This writes the selected file and replaces its contents if it already exists. Choose a different path to keep an existing file."
@@ -160,7 +160,7 @@ impl BridgeApp {
             pending_save: None,
             queued: Vec::new(),
             diagnostics_path: state_dir
-                .join("c64bridge-diagnostics.json")
+                .join("c64-keyboard-bridge-diagnostics.json")
                 .to_string_lossy()
                 .into_owned(),
             local_error: None,
@@ -1427,16 +1427,16 @@ mod tests {
     use bridge_protocol::PhysicalKey;
     #[test]
     fn selected_state_directory_sets_the_absolute_diagnostic_export_default() {
-        let state = std::env::temp_dir().join("c64bridge custom state");
+        let state = std::env::temp_dir().join("c64-keyboard-bridge custom state");
         let app = BridgeApp::new_for_state(GuiSettings::default(), &state);
         let path = Path::new(&app.diagnostics_path);
         assert!(path.is_absolute());
-        assert_eq!(path, state.join("c64bridge-diagnostics.json"));
+        assert_eq!(path, state.join("c64-keyboard-bridge-diagnostics.json"));
     }
     #[test]
     fn diagnostic_export_default_is_independent_of_desktop_launch_directory() {
         let fixture = std::env::temp_dir().join(format!(
-            "c64bridge-export-default-{}",
+            "c64-keyboard-bridge-export-default-{}",
             crate::config::random_id().unwrap()
         ));
         let state = fixture.join("selected-state");
@@ -1449,7 +1449,7 @@ mod tests {
                     "--exact",
                     "app::tests::diagnostic_export_constructor_fixture_child",
                 ])
-                .env("C64BRIDGE_GUI_EXPORT_TEST_STATE", &state)
+                .env("C64_KEYBOARD_BRIDGE_GUI_EXPORT_TEST_STATE", &state)
                 .current_dir(cwd)
                 .output()
                 .unwrap();
@@ -1463,7 +1463,7 @@ mod tests {
     }
     #[test]
     fn diagnostic_export_constructor_fixture_child() {
-        let Some(state) = std::env::var_os("C64BRIDGE_GUI_EXPORT_TEST_STATE") else {
+        let Some(state) = std::env::var_os("C64_KEYBOARD_BRIDGE_GUI_EXPORT_TEST_STATE") else {
             return;
         };
         let state = PathBuf::from(state);
@@ -1471,7 +1471,7 @@ mod tests {
         assert!(Path::new(&app.diagnostics_path).is_absolute());
         assert_eq!(
             Path::new(&app.diagnostics_path),
-            state.join("c64bridge-diagnostics.json")
+            state.join("c64-keyboard-bridge-diagnostics.json")
         );
         assert_ne!(
             Path::new(&app.diagnostics_path).parent(),

@@ -187,11 +187,22 @@ fn post_prepared_test_blocking(
 }
 
 fn post_input_test(backend: &mut dyn KeyboardBackend) -> Result<InputTestReport> {
+    // The product-name phrase is shared with recording and native test fixtures.
+    // Event acceptance alone cannot establish delivery to the focused application.
     use NativeKey as K;
     let keys = [
         K::C,
         K::Num6,
         K::Num4,
+        K::Space,
+        K::K,
+        K::E,
+        K::Y,
+        K::B,
+        K::O,
+        K::A,
+        K::R,
+        K::D,
         K::Space,
         K::B,
         K::R,
@@ -221,7 +232,7 @@ fn post_input_test(backend: &mut dyn KeyboardBackend) -> Result<InputTestReport>
         }
     }
     Ok(InputTestReport {
-        phrase: "c64 bridge\n",
+        phrase: "c64 keyboard bridge\n",
         accepted_pairs: keys.len(),
         delivery_verified: false,
     })
@@ -237,10 +248,31 @@ mod tests {
     fn deliberate_phrase_posts_balanced_pairs_without_claiming_delivery() {
         let mut backend = RecordingBackend::default();
         let report = post_input_test(&mut backend).unwrap();
-        assert_eq!(report.phrase, "c64 bridge\n");
-        assert_eq!(report.accepted_pairs, 11);
+        assert_eq!(report.phrase, "c64 keyboard bridge\n");
+        assert_eq!(report.accepted_pairs, 20);
         assert!(!report.delivery_verified);
-        assert_eq!(backend.events.len(), 22);
+        assert_eq!(backend.events.len(), 40);
+        let recorded: String = backend
+            .events
+            .iter()
+            .filter_map(|event| {
+                let RecordingEvent::Press(key) = event else {
+                    return None;
+                };
+                Some(match key {
+                    NativeKey::Num6 => '6',
+                    NativeKey::Num4 => '4',
+                    NativeKey::Space => ' ',
+                    NativeKey::Enter => '\n',
+                    letter => {
+                        let name = format!("{letter:?}");
+                        assert_eq!(name.len(), 1, "Unexpected non-letter in test phrase");
+                        name.chars().next().unwrap().to_ascii_lowercase()
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(recorded, report.phrase);
         for pair in backend.events.as_chunks::<2>().0 {
             assert!(
                 matches!(pair, [RecordingEvent::Press(down), RecordingEvent::Release(up)] if down == up)

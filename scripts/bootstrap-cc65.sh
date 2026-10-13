@@ -4,11 +4,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 revision=555282497c3ecf8b313d87d5973093af19c35bd5
-if [[ -d "$C64BRIDGE_ROOT/third-party/cc65" ]]; then
-    cc65_source="$C64BRIDGE_ROOT/third-party/cc65"
-    "$C64BRIDGE_PYTHON" "$C64BRIDGE_ROOT/scripts/verify-cc65-source.py" "$cc65_source" >&2
+if [[ -d "$C64_KEYBOARD_BRIDGE_ROOT/third-party/cc65" ]]; then
+    cc65_source="$C64_KEYBOARD_BRIDGE_ROOT/third-party/cc65"
+    "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/verify-cc65-source.py" "$cc65_source" >&2
 else
-    cc65_source="$C64BRIDGE_ROOT/target/toolchains/cc65-V2.19"
+    cc65_source="$C64_KEYBOARD_BRIDGE_ROOT/target/toolchains/cc65-V2.19"
     if [[ ! -d "$cc65_source/.git" ]]; then
         if [[ -e "$cc65_source" ]]; then
             echo "Refusing to replace an existing cc65 directory without pinned Git metadata: $cc65_source" >&2
@@ -27,10 +27,10 @@ else
     fi
     git -C "$cc65_source" diff --quiet
     git -C "$cc65_source" diff --cached --quiet
-    printf '%s\n' "$revision" > "$cc65_source/.c64bridge-source-revision"
+    printf '%s\n' "$revision" > "$cc65_source/.c64-keyboard-bridge-source-revision"
 fi
 
-jobs="$("$C64BRIDGE_PYTHON" -c 'import os; print(min(os.cpu_count() or 2, 8))')"
+jobs="$("$C64_KEYBOARD_BRIDGE_PYTHON" -c 'import os; print(min(os.cpu_count() or 2, 8))')"
 make -C "$cc65_source/src" -j "$jobs" BUILD_ID='Git 55528249' cc65 ca65 cl65 ar65 ld65 >&2
 make -C "$cc65_source/libsrc" -j "$jobs" BUILD_ID='Git 55528249' c64 >&2
 for tool in cc65 ca65 cl65 ar65 ld65; do

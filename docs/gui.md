@@ -1,6 +1,6 @@
 # Desktop companion
 
-The companion and CLI share the keyboard protocol, native input backends, mappings, diagnostics and real C64 PRGs. Open **C64 Keyboard Bridge** from the installed application shortcut, or run `c64-keyboard-bridge-gui`. Version 0.1.0 does not start a network host, deploy a C64 program or enable input automatically. The desktop application identifier is `com.flameliongames.c64keyboardbridge`; the CLI and GUI retain their shared state directory and legacy internal credential-store namespace. Renaming the public application ID can require a new macOS posting or Keychain approval. The `.desktop` suffix names the Linux launcher file and is not part of the application ID.
+The companion and CLI share the keyboard protocol, native input backends, mappings, diagnostics and real C64 PRGs. Open **C64 Keyboard Bridge** from the installed application shortcut, or run `c64-keyboard-bridge-gui`. Version 0.1.0 does not start a network host, deploy a C64 program or enable input automatically. The desktop application identifier is `com.flameliongames.c64keyboardbridge`; the CLI and GUI share its new private storage namespace. This build starts with fresh configuration, pairing and saved-password references; it does not look up or migrate older state or credentials. Older data remains untouched. macOS may require new posting or Keychain approval. The `.desktop` suffix names the Linux launcher file and is not part of the application ID.
 
 ## Install
 
@@ -15,7 +15,7 @@ Installing a Linux package does not grant `/dev/uinput` access, load modules or 
 
 Uninstall removes program files and shortcuts and preserves private settings, pairing state and OS-vault credentials. Use **Forget saved password** to remove the credential deliberately. **Reset local bridge data** separately confirms removal of saved GUI settings, pairing state, GUI-owned profiles and saved credentials while hosting is stopped. It preserves imported `.env` files and external/exported profiles and requires fresh C64 pairing/deployment afterward.
 
-The renamed commands are `c64-keyboard-bridge` and `c64-keyboard-bridge-gui`; no `c64bridge` alias is installed. On Windows, uninstall an older **C64 Keyboard Bridge** package through its existing uninstaller before installing this renamed build. This preserves settings and removes only that package’s recorded files. The new installer does not delete an unrelated `c64bridge` executable, owned by another installation.
+The installer removes only files recorded as belonging to its installation; it does not delete unrelated programs or user-created files.
 
 ## macOS setup
 
@@ -25,7 +25,7 @@ Communication with the C64 uses the separate **Local Network** permission. If it
 
 Finder launches do not inherit the working directory or environment of your project terminal. To use an existing `.env`, enter its **absolute path** in **Settings / About → .env import path**, then save or apply. A missing import file does not supply its password or other values; connection fields in the companion remain explicit overrides. On the first launch, before GUI settings have been saved, you can also initialize the form by launching the app's executable with `--env-file /absolute/path/to/.env`. A saved import path remains absolute on later Finder launches; the companion does not copy, modify or bundle the file.
 
-GUI settings and pairing state use `~/Library/Application Support/net.c64bridge.C64-Keyboard-Bridge` by default, shared with the CLI. The app's public bundle identifier is separate from this existing data-directory name. To share a custom CLI state directory, pass the same `--state-dir` to the companion or set `BRIDGE_STATE_DIR` in its launch environment; selecting an `.env` file does not choose the GUI instance's state directory. **Remember password** is optional. When it is off, enter the password again after quitting and reopening unless a readable imported `.env` or process environment supplies it.
+GUI settings and pairing state use `~/Library/Application Support/com.flameliongames.c64keyboardbridge` on macOS by default, shared with the CLI. Both frontends use the `com` / `flameliongames` / `c64keyboardbridge` project namespace on every platform, with `.c64-keyboard-bridge-state` as the fallback. The OS credential service is `com.flameliongames.c64keyboardbridge`. Re-enter configuration and the password, create new pairing state, and deliberately redeploy when ready; no older credentials are queried or state migrated automatically. To share a custom CLI state directory, pass the same `--state-dir` to the companion or set `BRIDGE_STATE_DIR` in its launch environment; selecting an `.env` file does not choose the GUI instance's state directory. **Remember password** is optional. When it is off, enter the password again after quitting and reopening unless a readable imported `.env` or process environment supplies it.
 
 ## Connection and input
 
@@ -34,7 +34,7 @@ GUI settings and pairing state use `~/Library/Application Support/net.c64bridge.
 3. If the keyboard program needs deployment, choose the client or networking probe operation. Each load/run confirmation explains that both reset the C64 and replace its current BASIC program. A failed ambiguous request is never retried automatically.
 4. Choose **Enable input** to activate immediately. You can enable it while the companion is focused; there is no countdown or requirement to switch applications. Activation still requires an authenticated keyboard connection and valid permission/layout checks. Apply any pending form changes before enabling input.
 
-C64 keystrokes go to whichever application has focus, including the companion. Changing focus leaves regular input enabled. Choose **Pause input** in the window or tray to release bridge-owned keys and stop forwarding. The deliberate native input test has a separate confirmation and five-second countdown: switch to an empty scratch document before it ends. It cancels if the companion remains focused or permission/layout checks fail, and otherwise types `c64 bridge` followed by Return into the focused application.
+C64 keystrokes go to whichever application has focus, including the companion. Changing focus leaves regular input enabled. Choose **Pause input** in the window or tray to release bridge-owned keys and stop forwarding. The deliberate native input test has a separate confirmation and five-second countdown: switch to an empty scratch document before it ends. It cancels if the companion remains focused or permission/layout checks fail, and otherwise types `c64 keyboard bridge` followed by Return into the focused application.
 
 Closing the window hides it only when a tray is available. Tray commands open the window, pause/enable, stop hosting or quit. On Linux, an unavailable tray keeps the window visible. Losing an established tray restores the window and pauses owned input. **Quit** cancels pending countdowns and waits for graceful runtime cleanup. A cleanup failure stays visible so you can retry; the application does not abandon held keys to force an exit.
 
@@ -54,7 +54,7 @@ SHIFT LOCK uses the observed Shift matrix state and cannot be mapped independent
 
 **Diagnostics** shows current phase, failure counters, retained session failure and cleanup outcome, plus a bounded activity history. Exported diagnostics omit passwords, pairing/control tokens, addresses, key identities, matrices and peer-supplied text. Permission checks identify whether the companion or CLI is the posting process. On macOS, grant Device Control and Data Access (Accessibility on older versions) to the process actually sending events; authorizing a terminal for CLI use does not authorize the app automatically. Failed asynchronous actions show a persistent error above the current page, with the activity history retaining the operation's result.
 
-The export path defaults to `c64bridge-diagnostics.json` inside the selected private bridge state directory, including when launched from Finder or a desktop shortcut. You can choose another destination before confirming the export; an existing file is replaced only after that confirmation.
+The export path defaults to `c64-keyboard-bridge-diagnostics.json` inside the selected private bridge state directory, including when launched from Finder or a desktop shortcut. You can choose another destination before confirming the export; an existing file is replaced only after that confirmation.
 
 ## Signing and acceptance
 

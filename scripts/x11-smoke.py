@@ -228,10 +228,10 @@ def collect(configuration_path: Path) -> None:
             else:
                 if process.returncode:
                     raise RuntimeError("CLI input failed: " + diagnostic[-2048:])
-                if "".join(text) != "c64 bridge\r":
+                if "".join(text) != "c64 keyboard bridge\r":
                     raise RuntimeError(f"Unexpected private-window text: {''.join(text)!r}")
-                if len(events) != 22:
-                    raise RuntimeError(f"Expected 22 balanced events, received {len(events)}")
+                if len(events) != 40:
+                    raise RuntimeError(f"Expected 40 balanced events, received {len(events)}")
                 for index in range(0, len(events), 2):
                     if events[index][0] != 2 or events[index + 1] != (3, events[index][1]):
                         raise RuntimeError("Private-window press/release order is unbalanced")
@@ -462,7 +462,7 @@ def smoke(binary: Path) -> None:
                            + "; install xvfb xauth x11-xkb-utils x11-utils libx11-6")
     server = None
     owned_paths = []
-    with tempfile.TemporaryDirectory(prefix="c64bridge-x11-smoke-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-x11-smoke-") as temporary:
         directory = Path(temporary)
         authority = directory / "Xauthority"
         authority.touch(mode=0o600)
