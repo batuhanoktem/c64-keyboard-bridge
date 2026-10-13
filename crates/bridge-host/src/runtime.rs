@@ -990,9 +990,14 @@ async fn run_managed(
     let setup = async {
         let network = config.network().await?;
         let token = crate::pairing::load_or_create_token(&config.state_dir)?;
-        let listener = TcpListener::bind(network.bind)
-            .await
-            .context("Cannot bind bridge TCP listener")?;
+        let listener = TcpListener::bind(network.bind).await.map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::AddrInUse {
+                "Bridge TCP port is already in use. Stop the conflicting listener or explicitly change BRIDGE_PORT. Changing the port requires redeploying the C64 client; no alternative port is selected automatically."
+            } else {
+                "Cannot bind bridge TCP listener; check the bind interface and local permissions"
+            };
+            anyhow::Error::new(error).context(message)
+        })?;
         let control_listener = TcpListener::bind("127.0.0.1:0").await?;
         let guard = RuntimeGuard::create(
             &config.state_dir,
