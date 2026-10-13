@@ -25,7 +25,7 @@ use std::{
 
 #[derive(Parser)]
 #[command(
-    name = "c64bridge-gui",
+    name = "c64-keyboard-bridge-gui",
     version,
     about = "C64 Keyboard Bridge desktop companion"
 )]
@@ -602,7 +602,7 @@ fn run() -> Result<()> {
     .into_rgba8();
     let viewport = egui::ViewportBuilder::default()
         .with_title("C64 Keyboard Bridge")
-        .with_app_id("com.flameliongames.c64bridge")
+        .with_app_id("com.flameliongames.c64keyboardbridge")
         .with_inner_size([1200.0, 840.0])
         .with_min_inner_size([900.0, 640.0])
         .with_icon(egui::IconData {

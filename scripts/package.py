@@ -294,7 +294,7 @@ def main() -> None:
     environment["CARGO_TARGET_DIR"] = str(ROOT / "target")
     macos_minimum = configure_macos_deployment(target, environment)
     if not args.source_only:
-        run("cargo", "build", "--release", "--locked", "--bin", "c64bridge", "--bin", "c64bridge-gui", "--target", target, env=environment)
+        run("cargo", "build", "--release", "--locked", "--bin", "c64-keyboard-bridge", "--bin", "c64-keyboard-bridge-gui", "--target", target, env=environment)
     require_stable_sources()
     provenance = {"schema": 2, "version": version, **revision_info(), "project_source_sha256": before,
                   "rustc": rustc.strip(), "build_host_target": host, "binary_target": target, "prgs": prg_manifest,
@@ -305,7 +305,7 @@ def main() -> None:
     if not args.source_only:
         suffix = ".exe" if target == "x86_64-pc-windows-msvc" else ""
         provenance["executables"] = {name + suffix: hash_file(ROOT / "target" / target / "release" / (name + suffix))
-                                    for name in ("c64bridge", "c64bridge-gui")}
+                                    for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui")}
     (ROOT / "target/package-staging").mkdir(parents=True, exist_ok=True)
     archives = []
     with tempfile.TemporaryDirectory(prefix="release-", dir=ROOT / "target/package-staging") as temporary:
@@ -343,12 +343,12 @@ def main() -> None:
             binary = stage / f"c64-keyboard-bridge-{version}-{target}"
             binary.mkdir()
             suffix = ".exe" if target == "x86_64-pc-windows-msvc" else ""
-            for name in ("c64bridge", "c64bridge-gui"):
+            for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
                 copy_file(ROOT / "target" / target / "release" / (name + suffix), binary / (name + suffix))
             if args.sign_macos:
                 INSTALLERS["macos_sign_binaries"](binary, INSTALLERS["SIGNING_IDENTITY"])
                 provenance["executables"] = {name: hash_file(binary / name)
-                                            for name in ("c64bridge", "c64bridge-gui")}
+                                            for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui")}
             for name in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", ".env.example"):
                 copy_file(ROOT / name, binary / name)
             for path in files:
@@ -385,7 +385,7 @@ def main() -> None:
                     "developer_id": INSTALLERS["SIGNING_IDENTITY"] if args.sign_macos else None,
                     "notarized_artifacts": [path.name] if status == "notarized" else [],
                     "app_executables": {name: hash_file(app / "Contents/MacOS" / name)
-                                        for name in ("c64bridge", "c64bridge-gui")}}, indent=2) + "\n")
+                                        for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui")}}, indent=2) + "\n")
                 archives.extend([path, metadata])
             elif suffix:
                 path = output / (binary.name + "-setup.exe")

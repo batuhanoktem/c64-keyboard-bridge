@@ -30,8 +30,8 @@ Unicode actions require a backend with text support and are separate from native
 The shipped templates are in [`config/layouts`](../config/layouts). Inspect and validate them with:
 
 ```sh
-c64bridge mappings list
-c64bridge mappings validate config/layouts/modern-us.toml
+c64-keyboard-bridge mappings list
+c64-keyboard-bridge mappings validate config/layouts/modern-us.toml
 ```
 
 Set `MAPPINGS_FILE` to your profile path and validate it before startup. Its layout must match `KEYBOARD_LAYOUT`. Paths are relative to the current working directory. A profile uses a built-in base and optional ordinary-key overrides:

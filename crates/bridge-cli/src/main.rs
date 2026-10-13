@@ -14,7 +14,7 @@ const PROBE_PRG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/NETWORKTEST.P
 
 #[derive(Parser)]
 #[command(
-    name = "c64bridge",
+    name = "c64-keyboard-bridge",
     version,
     about = "Use the physical C64 Ultimate keyboard on a modern computer"
 )]
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn cli_has_explicit_start_safety_flags() {
         let args = Cli::try_parse_from([
-            "c64bridge",
+            "c64-keyboard-bridge",
             "start",
             "--deploy",
             "--allow-reset",

@@ -430,7 +430,7 @@ int main(void) {
     probe_report[4] = 48; probe_report[5] = 46; probe_report[6] = 49;
     probe_report[7] = 46; probe_report[8] = 48; /* Build release 0.1.0. */
 #endif
-    if (!config_valid()) { message("NO CONFIG: DEPLOY USING C64BRIDGE"); state = STATE_HALTED; }
+    if (!config_valid()) { message("NO CONFIG: DEPLOY FROM HOST"); state = STATE_HALTED; }
     else if (!uci_available(&uci)) { message("UCI NOT AVAILABLE (EXPECTED $C9)"); state = STATE_HALTED; }
     else {
         command[0] = 3; command[1] = 1;

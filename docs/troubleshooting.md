@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Start with `c64bridge doctor` or `c64bridge doctor --json`, then `c64bridge status` if a host is running. The report distinguishes REST reachability, native authorization, listener availability, and saved UCI probe evidence. Successful API calls or permission checks cannot establish delivery to an application.
+Start with `c64-keyboard-bridge doctor` or `c64-keyboard-bridge doctor --json`, then `c64-keyboard-bridge status` if a host is running. The report distinguishes REST reachability, native authorization, listener availability, and saved UCI probe evidence. Successful API calls or permission checks cannot establish delivery to an application.
 
 | Symptom | Check |
 | --- | --- |

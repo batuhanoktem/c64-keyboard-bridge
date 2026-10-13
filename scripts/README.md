@@ -40,7 +40,7 @@ On Ubuntu 24.04, install the public distribution packages and run the harness as
 
 ```sh
 sudo apt install python3 xvfb xauth x11-xkb-utils libx11-6 x11-utils
-python3 scripts/x11-smoke.py --binary target/release/c64bridge
+python3 scripts/x11-smoke.py --binary target/release/c64-keyboard-bridge
 ```
 
 CI uses Python 3.12 and runs this test on its Ubuntu Linux jobs. A debug executable or an extracted Linux release executable can also be supplied through `--binary`. The executable must run on the distribution's architecture and libc; the packaged Linux binaries are built on Ubuntu 24.04. For an older Ubuntu with an incompatible glibc, rebuild the matching source locally rather than changing its system libc. On other operating systems the harness reports a skip.
@@ -58,12 +58,12 @@ On 2026-10-12, the initial phrase/layout checks passed against a packaged ARM64 
 The separate recording test can be run inside Ubuntu without any display packages:
 
 ```sh
-python3 scripts/cli-smoke.py --binary target/release/c64bridge
+python3 scripts/cli-smoke.py --binary target/release/c64-keyboard-bridge
 ```
 
 ## Release packaging
 
-`package.sh` writes portable archives, native installers and checksums to `target/dist/`, with both `c64bridge` and `c64bridge-gui`, `.env.example`, mapping templates, documentation, both unconfigured PRGs and their manifest, build provenance, crate/font notices and Rust runtime notices. It defaults to the native Rust host. `--target` accepts the five CI target triples, and executable suffixes, archive names and ZIP/tar.gz format follow that binary target. `--binary-only`, `--source-only`, and `--output DIR` are also supported. Distribute the matching source archive with GPL-covered binaries, even when creating archives in separate jobs.
+`package.sh` writes portable archives, native installers and checksums to `target/dist/`, with both `c64-keyboard-bridge` and `c64-keyboard-bridge-gui`, `.env.example`, mapping templates, documentation, both unconfigured PRGs and their manifest, build provenance, crate/font notices and Rust runtime notices. It defaults to the native Rust host. `--target` accepts the five CI target triples, and executable suffixes, archive names and ZIP/tar.gz format follow that binary target. `--binary-only`, `--source-only`, and `--output DIR` are also supported. Distribute the matching source archive with GPL-covered binaries, even when creating archives in separate jobs.
 
 Native packaging produces an `.app` plus DMG on each Mac architecture, a per-user NSIS installer on Windows x64 and an Ubuntu 24.04+ DEB on each Linux architecture. Windows packaging downloads the checksum-pinned official NSIS 3.13 portable compiler under `target/tools/` and checks `v3.13` before execution. Its Zlib runtime notices accompany the installer. Linux requires `dpkg-deb`; packages have no maintainer scripts, uinput permission changes or automatic startup. `installer-smoke.py target/dist` mounts DMGs read-only, silently installs/uninstalls NSIS on the ephemeral CI user, or installs/purges DEBs under a private dpkg root, checking that both frontends and resources match the portable package.
 
@@ -96,7 +96,7 @@ CI runs native jobs on macOS ARM64/x86_64, Linux ARM64/x86_64 and Windows x86_64
 On Ubuntu 24.04, install `xvfb xauth libgl1-mesa-dri dbus-x11 python3-dbus python3-gi` and run:
 
 ```sh
-python3 scripts/gui-smoke.py --binary target/debug/c64bridge-gui
+python3 scripts/gui-smoke.py --binary target/debug/c64-keyboard-bridge-gui
 ```
 
 This launches the actual window/event loop with Mesa software rendering on a private authenticated Xvfb display and an isolated D-Bus StatusNotifierWatcher fixture. Smoke mode uses fake services, private settings/state and a working directory without `.env`; it never connects to a C64, reads the real credential store or enables native input. The harness requires successful rendered frames, a PNG screenshot, actual tray registration and clean exit. Results and screenshots are retained under `target/gui-smoke/`. On other systems a deliberately invoked `gui-smoke.py` requires an available graphical session; the five-platform native CI always compiles and tests GUI logic, while the Linux jobs also exercise the real graphical fixtures. Physical native GUI input, real desktop tray/vault interaction and permission acceptance remain separate checks.

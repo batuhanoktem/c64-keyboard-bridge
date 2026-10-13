@@ -105,7 +105,7 @@ The [C64U user guide](https://downloads.commodore-international.com/documentatio
 
 ## 1. Device and REST baseline
 
-Set the private configuration and run `c64bridge doctor --json` and `c64bridge device info`. Record firmware, FPGA, core, host OS, backend, layout, and commit. Confirm the product is C64 Ultimate. These commands do not reset or type. Review diagnostic metadata before sharing it.
+Set the private configuration and run `c64-keyboard-bridge doctor --json` and `c64-keyboard-bridge device info`. Record firmware, FPGA, core, host OS, backend, layout, and commit. Confirm the product is C64 Ultimate. These commands do not reset or type. Review diagnostic metadata before sharing it.
 
 Stop any bridge host. Every subsequent deployment command resets the C64 and replaces its running program; save anything needed first. This program does not resume overwritten software on exit.
 
@@ -126,7 +126,7 @@ The counter advanced 368 ticks over 6.133780 seconds, or 59.996 ticks per second
 ## 2. UCI feasibility gate
 
 ```sh
-c64bridge device test --allow-reset
+c64-keyboard-bridge device test --allow-reset
 ```
 
 Watch the C64 screen and confirm all of the following:
@@ -163,10 +163,10 @@ The user observed these TextEdit checks pass on ARM macOS with US layout: `Hello
 
 The user then observed the requested VS Code checks behave correctly: typing; symbols `+ = * @ : ;`; Right/Left/Down/Up cursors; F1 opening the Command Palette; RUN/STOP acting as Escape; and Commodore+A selecting all. The complete session reached 391 raw events without errors or blocked combinations. Other applications, layouts and platforms still need their own acceptance tests.
 
-Run `c64bridge permissions` and `doctor` without enabling a host. On macOS, use `permissions --request` only when you deliberately want the Accessibility prompt. Focus an empty scratch document and run:
+Run `c64-keyboard-bridge permissions` and `doctor` without enabling a host. On macOS, use `permissions --request` only when you deliberately want the Accessibility prompt. Focus an empty scratch document and run:
 
 ```sh
-c64bridge test-input --countdown 5
+c64-keyboard-bridge test-input --countdown 5
 ```
 
 Observe `c64 bridge` and Enter in the focused application. Test TextEdit or VS Code on macOS, Notepad or VS Code on Windows, and both the intended desktop editor and terminal on Linux. Record actual results for each. A posted event or successful permission check does not prove delivery. Avoid holding the computer's own modifier keys while doing these tests.
@@ -178,7 +178,7 @@ The first observed physical sequence passed on the device/version combination ab
 Start with deliberate deployment and input:
 
 ```sh
-c64bridge start --deploy --allow-reset --enable-input
+c64-keyboard-bridge start --deploy --allow-reset --enable-input
 ```
 
 Verify letters, digits, punctuation, Space, Return, both Shifts, CTRL, Commodore shortcuts, DEL/Shift+DEL, HOME, cursor directions, all eight function keys, and RUN/STOP. Test US and UK only with matching active input sources. Test available Unicode actions separately; document unsupported Linux text actions and authentic-profile symbol gaps.

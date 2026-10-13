@@ -57,7 +57,7 @@ Section "C64 Keyboard Bridge" SEC_MAIN
   File /r "${PAYLOAD}\*.*"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateDirectory "$SMPROGRAMS\C64 Keyboard Bridge"
-  CreateShortcut "$SMPROGRAMS\C64 Keyboard Bridge\C64 Keyboard Bridge.lnk" "$INSTDIR\c64bridge-gui.exe"
+  CreateShortcut "$SMPROGRAMS\C64 Keyboard Bridge\C64 Keyboard Bridge.lnk" "$INSTDIR\c64-keyboard-bridge-gui.exe"
   CreateShortcut "$SMPROGRAMS\C64 Keyboard Bridge\Uninstall.lnk" "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "Software\C64KeyboardBridge\Installer" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\C64KeyboardBridge" "DisplayName" "C64 Keyboard Bridge"

@@ -7,7 +7,7 @@ rust-version.workspace = true
 build = "build.rs"
 
 [[bin]]
-name = "c64bridge"
+name = "c64-keyboard-bridge"
 path = "src/main.rs"
 
 [dependencies]

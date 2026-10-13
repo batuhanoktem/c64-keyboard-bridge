@@ -176,7 +176,7 @@ struct LinuxTray {
 #[cfg(target_os = "linux")]
 impl ksni::Tray for LinuxTray {
     fn id(&self) -> String {
-        "com.flameliongames.c64bridge".into()
+        "com.flameliongames.c64keyboardbridge".into()
     }
     fn title(&self) -> String {
         "C64 Keyboard Bridge".into()

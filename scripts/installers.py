@@ -11,7 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_NAME = "C64 Keyboard Bridge.app"
-BUNDLE_ID = "com.flameliongames.c64bridge"
+BUNDLE_ID = "com.flameliongames.c64keyboardbridge"
 SIGNING_IDENTITY = "Developer ID Application: Flame Lion Ltd (TUGY329T35)"
 
 
@@ -25,10 +25,10 @@ def macos_bundle(payload, version, minimum):
     resources = app / "Contents/Resources"
     executables.mkdir(parents=True)
     resources.mkdir(parents=True)
-    for name in ("c64bridge", "c64bridge-gui"):
+    for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
         shutil.copy2(payload / name, executables / name)
     for path in list(payload.iterdir()):
-        if path == app or path.name in {"c64bridge", "c64bridge-gui"}:
+        if path == app or path.name in {"c64-keyboard-bridge", "c64-keyboard-bridge-gui"}:
             continue
         if path.is_dir():
             shutil.copytree(path, resources / path.name)
@@ -36,7 +36,7 @@ def macos_bundle(payload, version, minimum):
             shutil.copy2(path, resources / path.name)
     shutil.copy2(ROOT / "assets/c64bridge.icns", resources / "c64bridge.icns")
     info = {
-        "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "c64bridge-gui",
+        "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "c64-keyboard-bridge-gui",
         "CFBundleIdentifier": BUNDLE_ID, "CFBundleName": "C64 Keyboard Bridge",
         "CFBundleDisplayName": "C64 Keyboard Bridge", "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": version, "CFBundleVersion": version,
@@ -63,7 +63,7 @@ def validate_signing_identity(identity):
 
 def macos_sign_binaries(directory, identity):
     validate_signing_identity(identity)
-    for binary in ("c64bridge", "c64bridge-gui"):
+    for binary in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
         run("codesign", "--force", "--sign", identity, "--options", "runtime", "--timestamp",
             directory / binary)
         run("codesign", "--verify", "--strict", directory / binary)
@@ -132,18 +132,18 @@ def linux_deb(payload, output, version, architecture):
         shutil.copytree(payload, library)
         executable = stage / "usr/bin"
         executable.mkdir(parents=True)
-        for name in ("c64bridge", "c64bridge-gui"):
+        for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
             (executable / name).symlink_to(f"../lib/c64-keyboard-bridge/{name}")
         desktop = stage / "usr/share/applications"
         desktop.mkdir(parents=True)
-        shutil.copy2(ROOT / "installers/linux/com.flameliongames.c64bridge.desktop",
-                     desktop / "com.flameliongames.c64bridge.desktop")
+        shutil.copy2(ROOT / "installers/linux/com.flameliongames.c64keyboardbridge.desktop",
+                     desktop / "com.flameliongames.c64keyboardbridge.desktop")
         icons = stage / "usr/share/icons/hicolor/256x256/apps"
         icons.mkdir(parents=True)
-        shutil.copy2(ROOT / "assets/c64bridge.png", icons / "c64bridge.png")
+        shutil.copy2(ROOT / "assets/c64bridge.png", icons / "com.flameliongames.c64keyboardbridge.png")
         scalable = stage / "usr/share/icons/hicolor/scalable/apps"
         scalable.mkdir(parents=True)
-        shutil.copy2(ROOT / "assets/c64bridge.svg", scalable / "c64bridge.svg")
+        shutil.copy2(ROOT / "assets/c64bridge.svg", scalable / "com.flameliongames.c64keyboardbridge.svg")
         control = stage / "DEBIAN"
         control.mkdir()
         size = sum(path.stat().st_size for path in stage.rglob('*') if path.is_file()) // 1024

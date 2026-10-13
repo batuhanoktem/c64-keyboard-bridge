@@ -570,7 +570,7 @@ def smoke(binary: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, help="Linux c64bridge executable")
+    parser.add_argument("--binary", type=Path, help="Linux c64-keyboard-bridge executable")
     parser.add_argument("--collector", type=Path, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     if (arguments.binary is None) == (arguments.collector is None):

@@ -18,7 +18,7 @@ class PackagingTests(unittest.TestCase):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE["source_files"]()}
         for name in ["assets/c64bridge.png", "assets/c64bridge.svg", "assets/c64bridge.ico",
                      "assets/c64bridge.icns", "assets/generate-icons.py", "installers/nsis-notices/COPYING",
-                     "installers/windows/c64bridge.nsi", "installers/linux/com.flameliongames.c64bridge.desktop"]:
+                     "installers/windows/c64bridge.nsi", "installers/linux/com.flameliongames.c64keyboardbridge.desktop"]:
             self.assertIn(name, names)
         self.assertTrue(any(name.startswith("crates/bridge-gui/") for name in names))
         self.assertFalse(any(name == ".env" or name.startswith("target/")
@@ -28,18 +28,18 @@ class PackagingTests(unittest.TestCase):
     def test_macos_bundle_contains_both_frontends_and_resources(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = Path(directory)
-            for name in ("c64bridge", "c64bridge-gui"):
+            for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
                 (payload / name).write_text(name)
             (payload / "c64").mkdir()
             (payload / "c64/KEYBRIDGE.PRG").write_bytes(b"unconfigured fixture")
             (payload / "LICENSE").write_text("license fixture")
             app = INSTALLERS["macos_bundle"](payload, "0.1.0", "11.0")
             info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-            self.assertEqual(info["CFBundleIdentifier"], "com.flameliongames.c64bridge")
-            self.assertEqual(info["CFBundleExecutable"], "c64bridge-gui")
+            self.assertEqual(info["CFBundleIdentifier"], "com.flameliongames.c64keyboardbridge")
+            self.assertEqual(info["CFBundleExecutable"], "c64-keyboard-bridge-gui")
             self.assertEqual(info["LSMinimumSystemVersion"], "11.0")
             self.assertIn("configured C64 Ultimate", info["NSLocalNetworkUsageDescription"])
-            for name in ("c64bridge", "c64bridge-gui"):
+            for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
                 self.assertEqual((app / "Contents/MacOS" / name).read_text(), name)
             self.assertEqual((app / "Contents/Resources/c64/KEYBRIDGE.PRG").read_bytes(), b"unconfigured fixture")
             self.assertFalse((app / "Contents/Resources" / app.name).exists())

@@ -1,6 +1,6 @@
 # Desktop companion
 
-The companion and CLI share the keyboard protocol, native input backends, mappings, diagnostics and real C64 PRGs. Open **C64 Keyboard Bridge** from the installed application shortcut, or run `c64bridge-gui`. Version 0.1.0 does not start a network host, deploy a C64 program or enable input automatically. The desktop application identifier is `com.flameliongames.c64bridge`; the CLI and GUI retain their shared state directory.
+The companion and CLI share the keyboard protocol, native input backends, mappings, diagnostics and real C64 PRGs. Open **C64 Keyboard Bridge** from the installed application shortcut, or run `c64-keyboard-bridge-gui`. Version 0.1.0 does not start a network host, deploy a C64 program or enable input automatically. The desktop application identifier is `com.flameliongames.c64keyboardbridge`; the CLI and GUI retain their shared state directory and legacy internal credential-store namespace. Renaming the public application ID can require a new macOS posting or Keychain approval. The `.desktop` suffix names the Linux launcher file and is not part of the application ID.
 
 ## Install
 
@@ -14,6 +14,8 @@ The companion and CLI share the keyboard protocol, native input backends, mappin
 Installing a Linux package does not grant `/dev/uinput` access, load modules or run the network application as root. Arrange explicit device access separately when using a supported Wayland compositor. See [platform support](platforms.md). Windows runtime requirements and elevated-application restrictions continue to apply.
 
 Uninstall removes program files and shortcuts and preserves private settings, pairing state and OS-vault credentials. Use **Forget saved password** to remove the credential deliberately. **Reset local bridge data** separately confirms removal of saved GUI settings, pairing state, GUI-owned profiles and saved credentials while hosting is stopped. It preserves imported `.env` files and external/exported profiles and requires fresh C64 pairing/deployment afterward.
+
+The renamed commands are `c64-keyboard-bridge` and `c64-keyboard-bridge-gui`; no `c64bridge` alias is installed. On Windows, uninstall an older **C64 Keyboard Bridge** package through its existing uninstaller before installing this renamed build. This preserves settings and removes only that package’s recorded files. The new installer does not delete an unrelated `c64bridge` executable, including one installed by the separate C64 Bridge project.
 
 ## macOS setup
 

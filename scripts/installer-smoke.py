@@ -23,7 +23,7 @@ def run(*args, **kwargs):
 
 def verify_payload(path, windows=False):
     provenance = json.loads((path / "build-provenance.json").read_text())
-    for name in ("c64bridge", "c64bridge-gui"):
+    for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
         name += ".exe" if windows else ""
         executable = path / name
         if hashlib.sha256(executable.read_bytes()).hexdigest() != provenance["executables"][name]:
@@ -54,10 +54,10 @@ def linux_check(directory):
                     "--force-not-root", "--force-bad-path", "--force-depends"]
             run(*args, "--install", package)
             verify_payload(root / "usr/lib/c64-keyboard-bridge")
-            for name in ("c64bridge", "c64bridge-gui"):
+            for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
                 if not (root / "usr/bin" / name).is_symlink():
                     raise ValueError("Installed command launcher is missing")
-            if not (root / "usr/share/applications/com.flameliongames.c64bridge.desktop").is_file():
+            if not (root / "usr/share/applications/com.flameliongames.c64keyboardbridge.desktop").is_file():
                 raise ValueError("Installed desktop launcher is missing")
             run(*args, "--purge", "c64-keyboard-bridge")
             if (root / "usr/lib/c64-keyboard-bridge").exists():
@@ -110,13 +110,13 @@ def macos_check(directory):
                 attached = True
                 app = mount / "C64 Keyboard Bridge.app"
                 info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-                if info["CFBundleIdentifier"] != "com.flameliongames.c64bridge":
+                if info["CFBundleIdentifier"] != "com.flameliongames.c64keyboardbridge":
                     raise ValueError("Wrong macOS application identity")
                 resources = app / "Contents/Resources"
                 provenance = json.loads((resources / "build-provenance.json").read_text())
                 if PRGS['verify'](resources / 'c64') != provenance['prgs']:
                     raise ValueError('DMG PRGs do not match portable package provenance')
-                for name in ("c64bridge", "c64bridge-gui"):
+                for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
                     executable = app / "Contents/MacOS" / name
                     if not executable.is_file():
                         raise ValueError("macOS app omitted a frontend")
