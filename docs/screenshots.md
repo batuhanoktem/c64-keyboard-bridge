@@ -26,7 +26,7 @@ Dark theme, selected only for this capture without changing the system theme:
 
 ## Ubuntu
 
-Actual GUI captures on Ubuntu in a native Wayland session, using isolated recording services. Linux controls show the current backend choices and desktop-controlled repeat.
+Actual GUI captures on Ubuntu in a native Wayland session, using isolated recording services. Linux controls show GNOME portal guidance, the current backend choices and desktop-controlled repeat.
 
 ![Connection page on Ubuntu, with hosting and input off](screenshots/ubuntu-connection.png)
 
