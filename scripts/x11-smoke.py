@@ -519,7 +519,7 @@ def smoke(binary: Path) -> None:
                     raise RuntimeError("Private Xvfb unexpectedly admits unauthenticated clients")
                 for actual, configured in (("us", "US"), ("gb", "UK")):
                     run([shutil.which("setxkbmap"), "-layout", actual, "-variant", "", "-option", ""],
-                        environment, 3)
+                        environment, 10)
                     probe = json.loads(run(command(binary, directory, configured, "permissions"),
                                            environment, 3).stdout)
                     if not (probe["available"] and probe["authorized"] and probe["layout_matches"]):

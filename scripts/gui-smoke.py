@@ -83,9 +83,11 @@ def main():
                 processes.append(fixture)
                 wait_for(tray_report.exists, fixture)
             report = output / 'gui-result.json'
+            progress = report.with_suffix('.progress.json')
             screenshot = output / 'gui.png'
             images = [output / f'gui-{page}.png' for page in ('connection', 'diagnostics', 'settings')]
             report.unlink(missing_ok=True)
+            progress.unlink(missing_ok=True)
             for image in [screenshot, *images]:
                 image.unlink(missing_ok=True)
             state_dir = private / 'state'
@@ -104,9 +106,15 @@ def main():
                                    check=True, timeout=10)
                     wait_for(lambda: json.loads(tray_report.read_text()).get('items_registered', 0) >= 1, primary)
                     wait_for(lambda: screenshot.is_file() and all(image.is_file() for image in images), primary, seconds=15)
-                    # Let screenshot acknowledgments hide the window and the adapter's bounded
-                    # watcher/host/item ownership proof complete before exercising hidden Show.
-                    time.sleep(.75)
+                    # File creation precedes save completion and GUI acknowledgment.
+                    # Wait for the GUI's explicit hidden-stage acknowledgment.
+                    wait_for(lambda: progress.is_file()
+                             and json.loads(progress.read_text()).get('hidden_window_exercised') is True,
+                             primary, seconds=20)
+                    subprocess.run(['/usr/bin/python3', str(ROOT / 'scripts/gui-tray-control.py'),
+                                    '--report', str(output / 'tray-menu-result.json')],
+                                   env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT,
+                                   check=True, timeout=15)
                     subprocess.run([str(binary), '--smoke', '--state-dir', str(state_dir),
                                     '--smoke-report', str(private / 'hidden-duplicate-unused.json'),
                                     '--screenshot', str(private / 'hidden-duplicate-unused.png')],
@@ -135,6 +143,8 @@ def main():
                     raise ValueError('Actual GUI did not exercise a hidden window with its tray present')
                 if evidence.get('tray_loss_observed') is not True or evidence.get('activation_requests', 0) < 2:
                     raise ValueError('Actual GUI did not observe watcher loss and both authenticated duplicate launches')
+                if set(evidence.get('hidden_tray_commands', [])) != {'stop', 'enable'} or evidence.get('rejected_tray_enable') is not True:
+                    raise ValueError('Actual hidden tray did not process Stop and safely reject Enable without a session')
                 (output / 'tray-result.json').write_text(json.dumps(tray, indent=2) + '\n')
             print('PASS real GUI launch, four rendered pages, software-only defaults and clean exit')
         finally:

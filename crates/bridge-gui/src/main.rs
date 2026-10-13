@@ -71,6 +71,8 @@ struct SmokeEvidence {
     native_termination_dirty_preserved: bool,
     native_termination_hook_restored: bool,
     hidden_window_exercised: bool,
+    hidden_tray_commands: Vec<String>,
+    rejected_tray_enable: bool,
     error: Option<String>,
 }
 
@@ -85,6 +87,7 @@ enum NativeEvent {
         page: String,
         result: std::result::Result<(), String>,
     },
+    CaptureProgressFailed,
 }
 struct ActivationServer {
     stop: tokio::sync::watch::Sender<bool>,
@@ -145,6 +148,8 @@ struct NativeApp {
     smoke: bool,
     smoke_hidden: bool,
     screenshot: Option<PathBuf>,
+    smoke_progress: Option<PathBuf>,
+    smoke_progress_sent: bool,
     captured: BTreeSet<String>,
     requested: BTreeSet<String>,
     received: BTreeSet<String>,
@@ -242,6 +247,11 @@ impl NativeApp {
             smoke: args.smoke,
             smoke_hidden: false,
             screenshot: args.screenshot.clone(),
+            smoke_progress: args
+                .smoke_report
+                .as_ref()
+                .map(|path| path.with_extension("progress.json")),
+            smoke_progress_sent: false,
             captured: BTreeSet::new(),
             requested: BTreeSet::new(),
             received: BTreeSet::new(),
@@ -275,6 +285,20 @@ impl NativeApp {
         }
     }
     fn on_tray(&mut self, event: TrayEvent, ctx: &egui::Context) {
+        if self.smoke && self.smoke_hidden {
+            let command = match event {
+                TrayEvent::Stop => Some("stop"),
+                TrayEvent::Enable => Some("enable"),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.evidence
+                    .lock()
+                    .unwrap()
+                    .hidden_tray_commands
+                    .push(command.into());
+            }
+        }
         match event {
             TrayEvent::Open => self.show(ctx),
             TrayEvent::Pause => self.dispatch(GuiAction::Pause, ctx),
@@ -420,13 +444,34 @@ impl eframe::App for NativeApp {
                         self.evidence.lock().unwrap().screenshots_saved.push(page);
                     }
                 }
+                NativeEvent::CaptureProgressFailed => {
+                    self.evidence.lock().unwrap().error =
+                        Some("Could not save isolated GUI readiness evidence".into());
+                    self.quit(ctx);
+                }
             }
         }
         while let Some(event) = self.service.try_recv() {
             self.app.on_event(&event);
             match event {
                 GuiEvent::Snapshot(snapshot) => self.snapshot = *snapshot,
-                GuiEvent::ShowWindow | GuiEvent::Error(_) => self.show(ctx),
+                GuiEvent::Error(_) => {
+                    let mut evidence = self.evidence.lock().unwrap();
+                    evidence.rejected_tray_enable |= self.smoke
+                        && evidence
+                            .hidden_tray_commands
+                            .iter()
+                            .any(|command| command == "enable")
+                        && self.snapshot.phase == GuiPhase::Idle
+                        && !self
+                            .snapshot
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.enabled);
+                    drop(evidence);
+                    self.show(ctx);
+                }
+                GuiEvent::ShowWindow => self.show(ctx),
                 _ => {}
             }
         }
@@ -434,6 +479,30 @@ impl eframe::App for NativeApp {
             self.dispatch(action, ctx);
         }
         self.capture(ctx);
+        // A later logic tick acknowledges both completed image saves and the
+        // hide request. The harness must not remove the tray based on PNG paths
+        // appearing before the save threads' acknowledgments are consumed.
+        if self.smoke
+            && self.smoke_hidden
+            && self.tray_available
+            && !self.smoke_progress_sent
+            && let Some(path) = self.smoke_progress.clone()
+        {
+            self.smoke_progress_sent = true;
+            let sender = self.sender.clone();
+            let wake = ctx.clone();
+            self.capture_threads.push(thread::spawn(move || {
+                if config::atomic_write(
+                    &path,
+                    b"{\"hidden_window_exercised\":true,\"screenshots_saved\":4}\n",
+                )
+                .is_err()
+                {
+                    let _ = sender.send(NativeEvent::CaptureProgressFailed);
+                    wake.request_repaint();
+                }
+            }));
+        }
         if self.smoke && !self.smoke_hidden && self.tray_available && self.captured.len() == 4 {
             self.smoke_hidden = true;
             self.dispatch(GuiAction::CancelCountdown, ctx);
@@ -541,8 +610,12 @@ impl eframe::App for NativeApp {
                         }
                     }
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(target_os = "windows")]
                 self.quit(ctx);
+                #[cfg(target_os = "linux")]
+                if self.evidence.lock().unwrap().tray_loss_observed {
+                    self.quit(ctx);
+                }
             }
             ctx.request_repaint_after(Duration::from_millis(33));
         }

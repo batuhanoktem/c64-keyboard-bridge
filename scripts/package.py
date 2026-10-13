@@ -357,6 +357,7 @@ def main() -> None:
                 if relative.parts[0] == "docs" or relative.parts[:2] == ("config", "layouts"):
                     copy_file(path, binary / relative)
             copy_file(ROOT / "c64/README.md", binary / "c64/README.md")
+            copy_file(ROOT / "scripts/README.md", binary / "scripts/README.md")
             for name in (*PRGS["NAMES"], "prg-manifest.json"):
                 copy_file(prg_directory / name, binary / "c64" / name)
             collect_crate_notices(source / "vendor", binary / "third-party/rust-crates")
