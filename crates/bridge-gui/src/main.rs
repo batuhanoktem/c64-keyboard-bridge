@@ -8,7 +8,10 @@ use bridge_gui::{
     app::BridgeApp,
     config,
     instance::{self, Instance, InstanceGuard},
-    model::{GuiAction, GuiEvent, GuiPhase, GuiSettings, GuiSnapshot},
+    model::{
+        CommandOutcome, GuiAction, GuiEvent, GuiPhase, GuiSettings, GuiSnapshot, TrayCommand,
+        TrayCommandAck,
+    },
     service::ServiceHandle,
     tray::{Tray, TrayEvent},
 };
@@ -76,7 +79,58 @@ struct SmokeEvidence {
     hidden_window_exercised: bool,
     hidden_tray_commands: Vec<String>,
     rejected_tray_enable: bool,
+    tray_stop_completed: bool,
+    tray_command_sequence: u64,
+    tray_command_ack: Option<TrayCommandAck>,
+    #[serde(skip)]
+    pending_stop_after: Option<u64>,
+    #[serde(skip)]
+    pending_enable_after: Option<u64>,
     error: Option<String>,
+}
+impl SmokeEvidence {
+    fn dispatched_hidden_command(&mut self, command: TrayCommand, after_sequence: u64) {
+        match command {
+            TrayCommand::Stop => {
+                self.hidden_tray_commands.push("stop".into());
+                self.pending_stop_after = Some(after_sequence);
+            }
+            TrayCommand::Enable => {
+                self.hidden_tray_commands.push("enable".into());
+                self.pending_enable_after = Some(after_sequence);
+            }
+        }
+    }
+    fn observe_tray_ack(&mut self, ack: TrayCommandAck) {
+        let pending = match ack.command {
+            TrayCommand::Stop => &mut self.pending_stop_after,
+            TrayCommand::Enable => &mut self.pending_enable_after,
+        };
+        if !pending.is_some_and(|sequence| ack.sequence > sequence) {
+            return;
+        }
+        *pending = None;
+        self.tray_command_sequence = ack.sequence;
+        self.tray_command_ack = Some(ack);
+        match ack.command {
+            TrayCommand::Stop => {
+                self.tray_stop_completed = ack.outcome == CommandOutcome::Completed
+            }
+            TrayCommand::Enable => {
+                self.rejected_tray_enable = ack.outcome == CommandOutcome::Rejected;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+struct SmokeProgress {
+    hidden_window_exercised: bool,
+    screenshots_saved: usize,
+    tray_stop_completed: bool,
+    rejected_tray_enable: bool,
+    tray_command_sequence: u64,
+    tray_command_ack: Option<TrayCommandAck>,
 }
 
 enum NativeEvent {
@@ -154,7 +208,9 @@ struct NativeApp {
     smoke_hidden: bool,
     screenshot: Option<PathBuf>,
     smoke_progress: Option<PathBuf>,
-    smoke_progress_sent: bool,
+    smoke_progress_sent: Option<SmokeProgress>,
+    smoke_progress_revision: u64,
+    smoke_progress_written: Arc<Mutex<u64>>,
     captured: BTreeSet<String>,
     requested: BTreeSet<String>,
     received: BTreeSet<String>,
@@ -258,7 +314,9 @@ impl NativeApp {
                 .smoke_report
                 .as_ref()
                 .map(|path| path.with_extension("progress.json")),
-            smoke_progress_sent: false,
+            smoke_progress_sent: None,
+            smoke_progress_revision: 0,
+            smoke_progress_written: Arc::new(Mutex::new(0)),
             captured: BTreeSet::new(),
             requested: BTreeSet::new(),
             received: BTreeSet::new(),
@@ -294,16 +352,16 @@ impl NativeApp {
     fn on_tray(&mut self, event: TrayEvent, ctx: &egui::Context) {
         if self.smoke && self.smoke_hidden {
             let command = match event {
-                TrayEvent::Stop => Some("stop"),
-                TrayEvent::Enable => Some("enable"),
+                TrayEvent::Stop => Some(TrayCommand::Stop),
+                TrayEvent::Enable => Some(TrayCommand::Enable),
                 _ => None,
             };
             if let Some(command) = command {
+                let after = self.snapshot.tray_command_ack.map_or(0, |ack| ack.sequence);
                 self.evidence
                     .lock()
                     .unwrap()
-                    .hidden_tray_commands
-                    .push(command.into());
+                    .dispatched_hidden_command(command, after);
             }
         }
         match event {
@@ -311,9 +369,6 @@ impl NativeApp {
             TrayEvent::Pause => self.dispatch(GuiAction::Pause, ctx),
             TrayEvent::Enable => {
                 if self.app.form_has_changes() {
-                    if self.smoke {
-                        self.evidence.lock().unwrap().rejected_tray_enable = true;
-                    }
                     self.dispatch(GuiAction::CancelCountdown, ctx);
                     self.app.on_event(&GuiEvent::Error(
                         "Apply settings before enabling input".into(),
@@ -464,17 +519,15 @@ impl eframe::App for NativeApp {
         while let Some(event) = self.service.try_recv() {
             self.app.on_event(&event);
             match event {
-                GuiEvent::Snapshot(snapshot) => self.snapshot = *snapshot,
-                GuiEvent::Error(_) => {
-                    let mut evidence = self.evidence.lock().unwrap();
-                    evidence.rejected_tray_enable |= self.smoke
-                        && evidence
-                            .hidden_tray_commands
-                            .iter()
-                            .any(|command| command == "enable");
-                    drop(evidence);
-                    self.show(ctx);
+                GuiEvent::Snapshot(snapshot) => {
+                    if self.smoke
+                        && let Some(ack) = snapshot.tray_command_ack
+                    {
+                        self.evidence.lock().unwrap().observe_tray_ack(ack);
+                    }
+                    self.snapshot = *snapshot;
                 }
+                GuiEvent::Error(_) => self.show(ctx),
                 GuiEvent::ShowWindow => self.show(ctx),
                 _ => {}
             }
@@ -483,29 +536,48 @@ impl eframe::App for NativeApp {
             self.dispatch(action, ctx);
         }
         self.capture(ctx);
-        // A later logic tick acknowledges both completed image saves and the
-        // hide request. The harness must not remove the tray based on PNG paths
-        // appearing before the save threads' acknowledgments are consumed.
+        // Each persisted progress change acknowledges work already observed by
+        // the GUI. D-Bus dispatch alone is not a background-service result.
         if self.smoke
             && self.smoke_hidden
             && self.tray_available
-            && !self.smoke_progress_sent
             && let Some(path) = self.smoke_progress.clone()
         {
-            self.smoke_progress_sent = true;
-            let sender = self.sender.clone();
-            let wake = ctx.clone();
-            self.capture_threads.push(thread::spawn(move || {
-                if config::atomic_write(
-                    &path,
-                    b"{\"hidden_window_exercised\":true,\"screenshots_saved\":4}\n",
-                )
-                .is_err()
-                {
-                    let _ = sender.send(NativeEvent::CaptureProgressFailed);
-                    wake.request_repaint();
-                }
-            }));
+            let evidence = self.evidence.lock().unwrap();
+            let progress = SmokeProgress {
+                hidden_window_exercised: evidence.hidden_window_exercised,
+                screenshots_saved: self.captured.len(),
+                tray_stop_completed: evidence.tray_stop_completed,
+                rejected_tray_enable: evidence.rejected_tray_enable,
+                tray_command_sequence: evidence.tray_command_sequence,
+                tray_command_ack: evidence.tray_command_ack,
+            };
+            drop(evidence);
+            if self.smoke_progress_sent != Some(progress) {
+                self.smoke_progress_sent = Some(progress);
+                self.smoke_progress_revision += 1;
+                let revision = self.smoke_progress_revision;
+                let written = self.smoke_progress_written.clone();
+                let sender = self.sender.clone();
+                let wake = ctx.clone();
+                self.capture_threads.push(thread::spawn(move || {
+                    // Save threads may run out of order. Hold this small writer
+                    // lock so an older acknowledgment cannot overwrite a newer one.
+                    let mut last = written.lock().unwrap();
+                    if revision <= *last {
+                        return;
+                    }
+                    let result = serde_json::to_vec(&progress)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|bytes| config::atomic_write(&path, &bytes));
+                    if result.is_err() {
+                        let _ = sender.send(NativeEvent::CaptureProgressFailed);
+                        wake.request_repaint();
+                    } else {
+                        *last = revision;
+                    }
+                }));
+            }
         }
         if self.smoke && !self.smoke_hidden && self.tray_available && self.captured.len() == 4 {
             self.smoke_hidden = true;
@@ -751,4 +823,49 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod smoke_tests {
+    use super::*;
+
+    #[test]
+    fn tray_progress_requires_a_fresh_matching_service_acknowledgment() {
+        let mut evidence = SmokeEvidence::default();
+        evidence.dispatched_hidden_command(TrayCommand::Stop, 7);
+        evidence.observe_tray_ack(TrayCommandAck {
+            sequence: 7,
+            command: TrayCommand::Stop,
+            outcome: CommandOutcome::Completed,
+        });
+        assert!(!evidence.tray_stop_completed);
+        evidence.observe_tray_ack(TrayCommandAck {
+            sequence: 8,
+            command: TrayCommand::Enable,
+            outcome: CommandOutcome::Rejected,
+        });
+        assert!(!evidence.rejected_tray_enable);
+        assert_eq!(evidence.tray_command_sequence, 0);
+        evidence.observe_tray_ack(TrayCommandAck {
+            sequence: 8,
+            command: TrayCommand::Stop,
+            outcome: CommandOutcome::Completed,
+        });
+        assert!(evidence.tray_stop_completed);
+        evidence.dispatched_hidden_command(TrayCommand::Enable, 8);
+        evidence.observe_tray_ack(TrayCommandAck {
+            sequence: 9,
+            command: TrayCommand::Enable,
+            outcome: CommandOutcome::Cancelled,
+        });
+        assert!(!evidence.rejected_tray_enable);
+        evidence.dispatched_hidden_command(TrayCommand::Enable, 9);
+        evidence.observe_tray_ack(TrayCommandAck {
+            sequence: 10,
+            command: TrayCommand::Enable,
+            outcome: CommandOutcome::Rejected,
+        });
+        assert!(evidence.rejected_tray_enable);
+        assert_eq!(evidence.tray_command_sequence, 10);
+    }
 }

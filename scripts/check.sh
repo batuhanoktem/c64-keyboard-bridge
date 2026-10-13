@@ -33,6 +33,7 @@ fi
 "$C64BRIDGE_PYTHON" "$C64BRIDGE_ROOT/scripts/cli-smoke.py" --binary "$binary"
 "$C64BRIDGE_PYTHON" "$C64BRIDGE_ROOT/scripts/package-tests.py"
 "$C64BRIDGE_PYTHON" "$C64BRIDGE_ROOT/scripts/release-tests.py"
+"$C64BRIDGE_PYTHON" "$C64BRIDGE_ROOT/scripts/gui-smoke-tests.py"
 if [[ "$(uname -s)" == "Darwin" ]]; then
     # Native, read-only service/worker queries. Headless runners may report an
     # unknown source, but must never assert, retain cancelled work, or hang.

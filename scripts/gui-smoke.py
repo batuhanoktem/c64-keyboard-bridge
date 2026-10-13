@@ -27,6 +27,26 @@ def wait_for(predicate, process, seconds=10):
     raise ValueError("GUI acceptance fixture readiness timed out")
 
 
+def tray_completion(progress, command, after_sequence):
+    """Only a fresh GUI-observed service result acknowledges a native menu click."""
+    if not progress.is_file():
+        return False
+    evidence = json.loads(progress.read_text())
+    sequence = evidence.get('tray_command_sequence', 0)
+    if (evidence.get('hidden_window_exercised') is not True or type(sequence) is not int
+            or sequence <= after_sequence):
+        return False
+    acknowledgment = evidence.get('tray_command_ack')
+    if (not isinstance(acknowledgment, dict) or acknowledgment.get('sequence') != sequence
+            or acknowledgment.get('command') != command):
+        return False
+    expected = 'completed' if command == 'stop' else 'rejected'
+    if acknowledgment.get('outcome') != expected:
+        raise ValueError('Private tray command completed with an unexpected service outcome')
+    field = 'tray_stop_completed' if command == 'stop' else 'rejected_tray_enable'
+    return evidence.get(field) is True
+
+
 def terminate(process):
     if process.poll() is None:
         process.terminate()
@@ -112,10 +132,17 @@ def main():
                     wait_for(lambda: progress.is_file()
                              and json.loads(progress.read_text()).get('hidden_window_exercised') is True,
                              primary, seconds=20)
-                    subprocess.run(['/usr/bin/python3', str(ROOT / 'scripts/gui-tray-control.py'),
-                                    '--report', str(output / 'tray-menu-result.json')],
-                                   env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT,
-                                   check=True, timeout=15)
+                    sequence = 0
+                    for command, filename in (('stop', 'tray-stop-result.json'), ('enable', 'tray-menu-result.json')):
+                        subprocess.run(['/usr/bin/python3', str(ROOT / 'scripts/gui-tray-control.py'),
+                                        '--command', command, '--report', str(output / filename)],
+                                       env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT,
+                                       check=True, timeout=15)
+                        # D-Bus completion means the menu click was queued, not that the
+                        # background action completed. Do not change safety state until
+                        # its fresh typed service acknowledgment reached the GUI.
+                        wait_for(lambda: tray_completion(progress, command, sequence), primary, seconds=15)
+                        sequence = json.loads(progress.read_text())['tray_command_sequence']
                     subprocess.run([str(binary), '--smoke', '--state-dir', str(state_dir),
                                     '--smoke-report', str(private / 'hidden-duplicate-unused.json'),
                                     '--screenshot', str(private / 'hidden-duplicate-unused.png')],
@@ -144,7 +171,7 @@ def main():
                     raise ValueError('Actual GUI did not exercise a hidden window with its tray present')
                 if evidence.get('tray_loss_observed') is not True or evidence.get('activation_requests', 0) < 2:
                     raise ValueError('Actual GUI did not observe watcher loss and both authenticated duplicate launches')
-                if set(evidence.get('hidden_tray_commands', [])) != {'stop', 'enable'} or evidence.get('rejected_tray_enable') is not True:
+                if set(evidence.get('hidden_tray_commands', [])) != {'stop', 'enable'} or evidence.get('rejected_tray_enable') is not True or evidence.get('tray_stop_completed') is not True:
                     raise ValueError('Actual hidden tray did not process Stop and safely reject Enable without a session')
                 (output / 'tray-result.json').write_text(json.dumps(tray, indent=2) + '\n')
             print('PASS real GUI launch, four rendered pages, software-only defaults and clean exit')

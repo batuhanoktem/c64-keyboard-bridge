@@ -66,30 +66,34 @@ class Watcher(dbus.service.Object):
         save_report()
         self.StatusNotifierItemRegistered(registration)
 
-    @dbus.service.method(CONTROL, in_signature='', out_signature='s')
-    def ExerciseHiddenMenu(self):
+    @dbus.service.method(CONTROL, in_signature='s', out_signature='s')
+    def ExerciseHiddenMenu(self, command):
         """The harness invokes this only after the GUI confirms it is hidden.
 
         Resolve IDs from the real exported dbusmenu on each click. Do not use
         synthetic GUI actions, open a user menu, or post native input.
         """
-        if evidence['menu_commands']:
-            raise dbus.exceptions.DBusException('Fixture menu commands were already exercised')
+        labels = {"stop": "Stop bridge", "enable": "Enable input"}
+        expected = ("stop", "enable")
+        next_index = len(evidence["menu_commands"])
+        command = str(command)
+        if next_index >= len(expected) or command != expected[next_index]:
+            raise dbus.exceptions.DBusException('Fixture commands must be exercised once in order')
+        label = labels[command]
         menu = find_item_menu()
-        for label in ('Stop bridge', 'Enable input'):
-            _, layout = menu.GetLayout(dbus.Int32(0), dbus.Int32(-1),
-                                      dbus.Array(['label', 'enabled', 'visible'], signature='s'), timeout=2)
-            matches = [identifier for identifier, properties in menu_entries(layout)
-                       if str(properties.get('label', '')) == label
-                       and bool(properties.get('enabled', True))
-                       and bool(properties.get('visible', True))]
-            if len(matches) != 1:
-                raise dbus.exceptions.DBusException('Expected bridge fixture menu command is absent')
-            menu.Event(dbus.Int32(matches[0]), 'clicked', dbus.String('', variant_level=1),
-                       dbus.UInt32(0), timeout=2)
-            evidence['menu_commands'].append(label)
-            save_report()
-        return json.dumps({"menu_commands": evidence['menu_commands'],
+        _, layout = menu.GetLayout(dbus.Int32(0), dbus.Int32(-1),
+                                  dbus.Array(['label', 'enabled', 'visible'], signature='s'), timeout=2)
+        matches = [identifier for identifier, properties in menu_entries(layout)
+                   if str(properties.get('label', '')) == label
+                   and bool(properties.get('enabled', True))
+                   and bool(properties.get('visible', True))]
+        if len(matches) != 1:
+            raise dbus.exceptions.DBusException('Expected bridge fixture menu command is absent')
+        menu.Event(dbus.Int32(matches[0]), 'clicked', dbus.String('', variant_level=1),
+                   dbus.UInt32(0), timeout=2)
+        evidence['menu_commands'].append(label)
+        save_report()
+        return json.dumps({"menu_commands": evidence['menu_commands'], "dispatched_command": command,
                            "item_id": APP_ID, "actual_dbusmenu": True})
 
     @dbus.service.method(WATCHER, in_signature='s', out_signature='')
