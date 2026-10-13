@@ -18,7 +18,7 @@ Apple must accept the executable/app payload before app stapling. Shipped portab
 
 Credential cleanup must succeed before promoted assets are uploaded. A separate job with release-write permission and no Apple credentials assembles the exact Mac, Windows, Linux and corresponding-source assets, regenerates SHA256SUMS, then downloads and verifies the complete set. Releases remain drafts unless publication is explicitly selected. Published releases are not overwritten.
 
-The reviewed implementation is public: [native CI](../.github/workflows/ci.yml), [release workflow](../.github/workflows/release.yml), [promotion service](../scripts/release_service.py), [safety fixtures](../scripts/release-tests.py) and [packaging](../scripts/package.py). Account setup and credential provisioning are private maintainer operations. No credential values belong in an issue, pull request or diagnostic attachment.
+The reviewed implementation is public: [native CI](https://github.com/batuhanoktem/c64-keyboard-bridge/blob/main/.github/workflows/ci.yml), [release workflow](https://github.com/batuhanoktem/c64-keyboard-bridge/blob/main/.github/workflows/release.yml), [promotion service](https://github.com/batuhanoktem/c64-keyboard-bridge/blob/main/scripts/release_service.py), [safety fixtures](https://github.com/batuhanoktem/c64-keyboard-bridge/blob/main/scripts/release-tests.py) and [packaging](https://github.com/batuhanoktem/c64-keyboard-bridge/blob/main/scripts/package.py). Account setup and credential provisioning are private maintainer operations. No credential values belong in an issue, pull request or diagnostic attachment.
 
 ## Download verification and limitations
 
