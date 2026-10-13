@@ -47,6 +47,9 @@ struct Args {
     smoke_theme: Option<String>,
     #[arg(long, requires = "smoke", value_parser = clap::value_parser!(u16).range(640..=1440))]
     smoke_height: Option<u16>,
+    /// Require the harness-owned Linux tray fixture before smoke completion.
+    #[arg(long, requires = "smoke")]
+    smoke_require_tray: bool,
 }
 
 #[derive(Default, Serialize)]
@@ -146,6 +149,8 @@ struct NativeApp {
     exiting: bool,
     service_joined: bool,
     smoke: bool,
+    #[cfg(target_os = "linux")]
+    smoke_require_tray: bool,
     smoke_hidden: bool,
     screenshot: Option<PathBuf>,
     smoke_progress: Option<PathBuf>,
@@ -245,6 +250,8 @@ impl NativeApp {
             exiting: false,
             service_joined: false,
             smoke: args.smoke,
+            #[cfg(target_os = "linux")]
+            smoke_require_tray: args.smoke_require_tray,
             smoke_hidden: false,
             screenshot: args.screenshot.clone(),
             smoke_progress: args
@@ -304,6 +311,9 @@ impl NativeApp {
             TrayEvent::Pause => self.dispatch(GuiAction::Pause, ctx),
             TrayEvent::Enable => {
                 if self.app.form_has_changes() {
+                    if self.smoke {
+                        self.evidence.lock().unwrap().rejected_tray_enable = true;
+                    }
                     self.dispatch(GuiAction::CancelCountdown, ctx);
                     self.app.on_event(&GuiEvent::Error(
                         "Apply settings before enabling input".into(),
@@ -461,13 +471,7 @@ impl eframe::App for NativeApp {
                         && evidence
                             .hidden_tray_commands
                             .iter()
-                            .any(|command| command == "enable")
-                        && self.snapshot.phase == GuiPhase::Idle
-                        && !self
-                            .snapshot
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.enabled);
+                            .any(|command| command == "enable");
                     drop(evidence);
                     self.show(ctx);
                 }
@@ -613,7 +617,7 @@ impl eframe::App for NativeApp {
                 #[cfg(target_os = "windows")]
                 self.quit(ctx);
                 #[cfg(target_os = "linux")]
-                if self.evidence.lock().unwrap().tray_loss_observed {
+                if !self.smoke_require_tray || self.evidence.lock().unwrap().tray_loss_observed {
                     self.quit(ctx);
                 }
             }
@@ -724,6 +728,7 @@ fn run() -> Result<()> {
         screenshot: args.screenshot.clone(),
         smoke_theme: args.smoke_theme.clone(),
         smoke_height: args.smoke_height,
+        smoke_require_tray: args.smoke_require_tray,
     };
     eframe::run_native(
         "C64 Keyboard Bridge",

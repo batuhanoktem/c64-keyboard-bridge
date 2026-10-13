@@ -92,9 +92,10 @@ def main():
                 image.unlink(missing_ok=True)
             state_dir = private / 'state'
             with (output / 'gui.log').open('w') as log:
+                tray_flags = ['--smoke-require-tray'] if platform.system() == 'Linux' else []
                 primary = subprocess.Popen([str(binary), '--smoke', '--state-dir', str(state_dir),
                                             '--smoke-report', str(report), '--screenshot', str(screenshot),
-                                            '--smoke-theme', args.theme],
+                                            '--smoke-theme', args.theme, *tray_flags],
                                            env=environment, cwd=private, stdout=log, stderr=subprocess.STDOUT)
                 processes.append(primary)
                 if platform.system() == 'Linux':
