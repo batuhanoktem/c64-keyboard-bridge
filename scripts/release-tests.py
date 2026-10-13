@@ -175,6 +175,12 @@ class ReleaseFixture(unittest.TestCase):
             return completed(stderr=f"Identifier={identifier}\nTeamIdentifier={service.TEAM}\nflags=0x10000(runtime)\n".encode())
         if tool == "ditto" or tool == "hdiutil":
             Path(args[-1]).write_bytes(b"signed fixture")
+        if "stapler" in args and args[-1].endswith(".app"):
+            ticket = Path(args[-1]) / "Contents/CodeResources"
+            if "staple" in args:
+                ticket.write_bytes(b"fixture-only ticket")
+            elif "validate" in args:
+                self.assertEqual(ticket.read_bytes(), b"fixture-only ticket")
         if "notarytool" in args:
             return completed(json.dumps(RECEIPT).encode())
         return completed()
@@ -345,6 +351,21 @@ class ReleaseFixture(unittest.TestCase):
         with self.assertRaisesRegex(service.ReleaseError, "exact architecture"):
             service.verify_final(output, self.identity)
 
+    def test_public_community_documents_allowed_and_private_guides_rejected(self):
+        for name in ("CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md"):
+            self.assertTrue(service.source_path(name))
+        for name in ("docs/secure-releases.md", "docs/store-distribution.md"):
+            self.assertFalse(service.source_path(name))
+            path = self.root / "private-guide.tar.gz"
+            write_tar(path, {name: b"private operational fixture"}, "root")
+            with tarfile.open(path) as archive, self.assertRaisesRegex(service.ReleaseError, "private"):
+                service.archive_members(archive, "root")
+            zip_path = self.root / "private-guide.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("root/" + name, b"private operational fixture")
+            with zipfile.ZipFile(zip_path) as archive, self.assertRaisesRegex(service.ReleaseError, "private"):
+                service.zip_members(archive, "root")
+
     def test_resource_limit_checked_before_extraction(self):
         path = self.root / "oversized.tar.gz"
         with tarfile.open(path, "w:gz") as archive:
@@ -402,6 +423,51 @@ class ReleaseFixture(unittest.TestCase):
         service.checksum_manifest(output)
         with self.assertRaisesRegex(service.ReleaseError, "notarized"):
             service.verify_final(output, self.identity)
+
+    def test_shipped_portable_signature_or_ticket_failure_blocks_promotion(self):
+        for failed_tool in ("codesign", "stapler"):
+            output = self.root / ("failed-portable-" + failed_tool)
+            def recording(*args, **kwargs):
+                tool = Path(str(args[0])).name
+                if any(part.endswith("-portable") for part in Path(args[-1]).parts) and (
+                        tool == "codesign" and failed_tool == "codesign" or
+                        tool == "xcrun" and "stapler" in args and failed_tool == "stapler"):
+                    raise service.ReleaseError("Fixture shipped portable validation failed")
+                return self.fake_mac(*args, **kwargs)
+            with patch.object(service, "run", side_effect=recording), fixture_environment():
+                with self.assertRaisesRegex(service.ReleaseError, "portable"):
+                    service.promote_macos(self.inputs, output, self.identity, profile="fixture")
+            self.assertFalse((output / "promotion.metadata.json").exists())
+
+    def test_publication_requires_shipped_portable_app_validation(self):
+        output = self.promoted()
+        path = output / "promotion.metadata.json"
+        receipt = json.loads(path.read_text())
+        self.assertTrue(all(record["portable_app_validated"] for record in receipt["targets"].values()))
+        receipt["targets"][service.TARGETS[0]]["portable_app_validated"] = False
+        path.write_text(json.dumps(receipt))
+        service.checksum_manifest(output)
+        with self.assertRaisesRegex(service.ReleaseError, "portable extraction"):
+            service.verify_final(output, self.identity)
+
+    def test_scripts_readme_mirror_is_accepted_and_mismatch_rejected(self):
+        root = "c64-keyboard-bridge-0.1.0-aarch64-apple-darwin"
+        path = self.inputs / (root + ".tar.gz")
+        with tarfile.open(path) as archive:
+            files = {member.name[len(root)+1:]: archive.extractfile(member).read()
+                     for member in archive if member.isfile()}
+        readme = (service.ROOT / "scripts/README.md").read_bytes()
+        name = "scripts/README.md"
+        mirror = service.APP + "/Contents/Resources/" + name
+        files[name] = files[mirror] = readme
+        write_tar(path, files, root)
+        with tarfile.open(path) as archive:
+            service.archive_members(archive, root)
+            service.validate_bundle_members(archive, root)
+        files[mirror] = b"mismatched app resource"
+        write_tar(path, files, root)
+        with tarfile.open(path) as archive, self.assertRaisesRegex(service.ReleaseError, "resources differ"):
+            service.validate_bundle_members(archive, root)
 
     def test_final_inventory_and_checksum_mismatch(self):
         promoted = self.promoted()

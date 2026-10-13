@@ -33,7 +33,8 @@ MAX_FILES = 150000
 ARTIFACT_EXTENSIONS = (".tar.gz", ".zip", ".dmg", ".exe", ".deb", ".metadata.json")
 # Match the packaging allowlist, including the narrowly scoped screenshot addition.
 ROOT_FILES = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE",
-              "THIRD_PARTY_NOTICES.md", ".env.example", ".gitignore", ".gitattributes", "c64/Makefile"}
+              "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
+              ".env.example", ".gitignore", ".gitattributes", "c64/Makefile"}
 FOLDERS = {"crates": {".rs", ".toml", ".md"}, "c64": {".c", ".h", ".s", ".md", ".py", ".sh", ".cfg", ".txt"},
            "docs": {".md"}, "config/layouts": {".toml"}, "scripts": {".sh", ".py", ".md"},
            ".github": {".yml", ".yaml", ".md"}, "assets": {".svg", ".png", ".ico", ".icns", ".py", ".md"},
@@ -101,7 +102,9 @@ def archive_members(archive, root):
                 "Release archive contains duplicate files, links or special entries")
         require(not member.mode & 0o7000, "Release archive contains privileged file modes")
         require(not any(part in {".git", ".env"} or part.endswith((".p12", ".p8", ".key", ".pem"))
-                        for part in path.parts), "Release archive contains private configuration")
+                        for part in path.parts) and not member.name.endswith(
+                            ("/docs/secure-releases.md", "/docs/store-distribution.md")),
+                "Release archive contains private configuration")
         require(member.size >= 0, "Release archive contains an invalid member size")
         total += member.size
         require(total <= MAX_BYTES and member.size <= 512 * 1024**2 and len(members) < MAX_FILES,
@@ -221,7 +224,9 @@ def zip_members(archive, root):
                 and normalized not in names and not member.flag_bits & 1,
                 "Windows artifact contains links, duplicate files, encryption or privileged entries")
         require(not any(part in {".git", ".env"} or part.endswith((".p12", ".p8", ".key", ".pem"))
-                        for part in path.parts), "Windows artifact contains private configuration")
+                        for part in path.parts) and not member.filename.endswith(
+                            ("/docs/secure-releases.md", "/docs/store-distribution.md")),
+                "Windows artifact contains private configuration")
         total += member.file_size
         require(member.file_size >= 0 and member.file_size <= 512 * 1024**2
                 and total <= MAX_BYTES and len(names) < MAX_FILES, "Windows artifact exceeds resource limits")
@@ -239,7 +244,8 @@ def read_zip(archive, name, maximum=512 * 1024**2):
 def validate_bundle_members(archive, root):
     files = {member.name[len(root) + 1:]: member for member in archive.getmembers() if member.isfile()}
     ordinary = {name: member for name, member in files.items() if not name.startswith(APP + "/")}
-    allowed_root = set(BINARIES) | {"README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", ".env.example", "build-provenance.json"}
+    allowed_root = set(BINARIES) | {"README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md",
+                                   "CONTRIBUTING.md", "SECURITY.md", ".env.example", "build-provenance.json"}
     for name, member in ordinary.items():
         path = PurePosixPath(name)
         require(name in allowed_root or name in {"assets/c64bridge.png", "assets/c64bridge.svg", "c64/README.md", "scripts/README.md",
@@ -267,6 +273,8 @@ def validate_bundle_members(archive, root):
 
 def source_path(path):
     item = PurePosixPath(path)
+    if path in {"docs/secure-releases.md", "docs/store-distribution.md"}:
+        return False
     if any(part in {"build", "target", ".git", "__pycache__", "node_modules"} for part in item.parts):
         return False
     if path in ROOT_FILES:
@@ -581,6 +589,18 @@ def staple(path):
     run("xcrun", "stapler", "validate", path)
 
 
+def verify_portable_macos(archive_path, destination, root, notarized):
+    """Assess the shipped archive's extracted files; never launch package executables."""
+    packaged = extract_archive(archive_path, destination, root)
+    app = packaged / APP
+    for name in BINARIES:
+        run("/usr/bin/codesign", "--verify", "--strict", packaged / name)
+        run("/usr/bin/codesign", "--verify", "--strict", app / "Contents/MacOS" / name)
+    run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
+    if notarized:
+        run("xcrun", "stapler", "validate", app)
+
+
 def promote_macos(inputs, output, identity, credentials=None, profile=None, signed_only=False):
     require(not os.environ.get("CI") or not signed_only, "CI promotion requires successful notarization")
     output = Path(output)
@@ -619,7 +639,8 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
             sign(app, APP_ID, keychain)
             run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
             record = {"payload": {"status": "not-submitted"}, "app_stapled": False,
-                      "dmg": {"status": "not-submitted"}, "dmg_stapled": False}
+                      "dmg": {"status": "not-submitted"}, "dmg_stapled": False,
+                      "portable_app_validated": False}
             if not signed_only:
                 notary_zip = stage / (target + "-notary.zip")
                 run("/usr/bin/ditto", "-c", "-k", "--keepParent", payload, notary_zip)
@@ -636,6 +657,8 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
             archive_path = output / (root + ".tar.gz")
             with tarfile.open(archive_path, "w:gz") as archive:
                 archive.add(payload, arcname=root)
+            verify_portable_macos(archive_path, stage / (target + "-portable"), root, not signed_only)
+            record["portable_app_validated"] = True
             dmg_stage = stage / (target + "-dmg")
             dmg_stage.mkdir()
             shutil.copytree(app, dmg_stage / APP)
@@ -697,7 +720,8 @@ def verify_final(directory, identity, require_notarized=True):
         if require_notarized:
             require(receipt.get("signing") == "notarized" and record.get("payload", {}).get("status") == "Accepted"
                     and record.get("dmg", {}).get("status") == "Accepted" and record.get("app_stapled") is True
-                    and record.get("dmg_stapled") is True, "Mac release is not fully notarized and stapled")
+                    and record.get("dmg_stapled") is True and record.get("portable_app_validated") is True,
+                    "Mac release is not fully notarized, stapled and verified after portable extraction")
         root = f"c64-keyboard-bridge-{version}-{target}"
         require(set(record.get("files", {})) == {root + ".tar.gz", root + ".dmg"},
                 "Mac acceptance evidence must name that exact architecture's archive and DMG")
