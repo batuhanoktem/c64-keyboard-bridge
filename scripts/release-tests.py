@@ -24,6 +24,16 @@ SENTINEL = "secret-sentinel-never-log-7fa36"
 RECEIPT = {"id": "31b1c12f-1e2b-41fc-9cfa-500dab72cfce", "status": "Accepted"}
 
 
+def fixture_environment(values=None):
+    # Keep PATH/SystemRoot and other OS launch state, especially for Windows subprocesses.
+    # Isolate only release/event/credential values; real dispatch gates stay enabled in production.
+    values = {} if values is None else values
+    defaults = {"CI": "", "GITHUB_ACTIONS": "", "GITHUB_REF": "", "GITHUB_EVENT_NAME": "",
+                "MACOS_CERTIFICATE_P12_BASE64": "", "MACOS_CERTIFICATE_PASSWORD": "",
+                "APPLE_NOTARY_KEY_P8_BASE64": "", "GH_TOKEN": "", "GITHUB_TOKEN": ""}
+    return patch.dict(os.environ, {**defaults, **values})
+
+
 def completed(stdout=b"", stderr=b"", returncode=0):
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
@@ -77,6 +87,7 @@ class ReleaseFixture(unittest.TestCase):
         def git(*args):
             return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True).stdout.decode().strip()
         git("init", "-b", "main")
+        git("config", "core.autocrlf", "false")
         git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "add", ".")
         git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture")
         self.revision = git("rev-parse", "HEAD")
@@ -170,7 +181,7 @@ class ReleaseFixture(unittest.TestCase):
 
     def promoted(self):
         output = self.root / "promoted"
-        with patch.object(service, "run", side_effect=self.fake_mac), patch.dict(os.environ, {}, clear=True):
+        with patch.object(service, "run", side_effect=self.fake_mac), fixture_environment():
             service.promote_macos(self.inputs, output, self.identity, profile="fixture-profile")
         path = output / "promotion.metadata.json"
         receipt = json.loads(path.read_text())
@@ -180,7 +191,7 @@ class ReleaseFixture(unittest.TestCase):
         return output
 
     def test_exact_commit_five_platform_ci_and_source_hashes(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with fixture_environment():
             resolved = service.resolve_release("v0.1.0", 123, self.github, self.repo)
         self.assertEqual(resolved["revision"], self.revision)
         self.assertEqual(service.verify_inputs(self.inputs, self.identity, self.repo), self.source_hash)
@@ -196,8 +207,8 @@ class ReleaseFixture(unittest.TestCase):
                 service.validate_run(github.run, github.jobs, {"id": 42}, github.repository, self.revision)
 
     def test_release_requires_main_dispatch_and_version_tag(self):
-        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/other",
-                                     "GITHUB_EVENT_NAME": "workflow_dispatch"}, clear=True):
+        with fixture_environment({"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/other",
+                                  "GITHUB_EVENT_NAME": "workflow_dispatch"}):
             with self.assertRaisesRegex(service.ReleaseError, "main"):
                 service.resolve_release("v0.1.0", 123, self.github, self.repo)
         for tag in ("--help", "v0.2.0", "v0.1.0\nsecret", "v0.1.0^{}"):
@@ -205,18 +216,18 @@ class ReleaseFixture(unittest.TestCase):
                 service.resolve_release(tag, 123, self.github, self.repo)
 
     def test_untagged_development_identity_is_local_only_and_never_a_release_tag(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with fixture_environment():
             identity = service.resolve_development(self.revision, 123, self.github, self.repo)
             self.assertEqual(identity["tag"], "unreleased-v0.1.0")
             with self.assertRaises(service.ReleaseError):
                 service.resolve_release(identity["tag"], 123, self.github, self.repo)
-        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True):
+        with fixture_environment({"GITHUB_ACTIONS": "true"}):
             with self.assertRaisesRegex(service.ReleaseError, "local-only"):
                 service.resolve_development(self.revision, 123, self.github, self.repo)
 
     def test_published_release_is_never_replaced(self):
         self.github.existing = {"draft": False}
-        with self.assertRaisesRegex(service.ReleaseError, "never"):
+        with fixture_environment(), self.assertRaisesRegex(service.ReleaseError, "never"):
             service.resolve_release("v0.1.0", 123, self.github, self.repo)
 
     def test_source_bytes_must_match_git_even_with_updated_archive_checksum(self):
@@ -348,7 +359,7 @@ class ReleaseFixture(unittest.TestCase):
         def recording(*args, **kwargs):
             calls.append(tuple(str(arg) for arg in args))
             return self.fake_mac(*args, **kwargs)
-        with patch.object(service, "run", side_effect=recording), patch.dict(os.environ, {}, clear=True):
+        with patch.object(service, "run", side_effect=recording), fixture_environment():
             service.promote_macos(self.inputs, self.root / "checked", self.identity, profile="fixture")
         self.assertTrue(any("notarytool" in args for args in calls))
         self.assertTrue(all(Path(args[0]).name in {"security", "codesign", "ditto", "hdiutil", "spctl", "xcrun", "lipo"}
@@ -368,7 +379,7 @@ class ReleaseFixture(unittest.TestCase):
             calls.append(tuple(str(arg) for arg in args))
             return self.fake_mac(*args, **kwargs)
         output = self.root / "ordering"
-        with patch.object(service, "run", side_effect=recording), patch.dict(os.environ, {}, clear=True):
+        with patch.object(service, "run", side_effect=recording), fixture_environment():
             service.promote_macos(self.inputs, output, self.identity, profile="fixture")
         with self.assertRaisesRegex(service.ReleaseError, "cleanup"):
             service.verify_final(output, self.identity)
@@ -382,7 +393,7 @@ class ReleaseFixture(unittest.TestCase):
 
     def test_signed_only_local_artifacts_cannot_be_public(self):
         output = self.root / "signed-only"
-        with patch.object(service, "run", side_effect=self.fake_mac), patch.dict(os.environ, {}, clear=True):
+        with patch.object(service, "run", side_effect=self.fake_mac), fixture_environment():
             service.promote_macos(self.inputs, output, self.identity, signed_only=True)
         receipt_path = output / "promotion.metadata.json"
         receipt = json.loads(receipt_path.read_text())
@@ -443,6 +454,17 @@ class ReleaseFixture(unittest.TestCase):
 
 
 class CredentialTests(unittest.TestCase):
+    def test_fixture_environment_preserves_os_process_launch_state(self):
+        original_path = os.environ.get("PATH")
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push",
+                                     "SystemRoot": "fixture-system-root"}):
+            with fixture_environment():
+                self.assertEqual(os.environ.get("PATH"), original_path)
+                self.assertEqual(os.environ.get("SystemRoot"), "fixture-system-root")
+                self.assertEqual(os.environ["GITHUB_ACTIONS"], "")
+                self.assertEqual(os.environ["GITHUB_EVENT_NAME"], "")
+            self.assertEqual(os.environ["GITHUB_ACTIONS"], "true")
+
     def test_sensitive_process_output_and_environment_are_never_exposed(self):
         with patch.dict(os.environ, {"MACOS_CERTIFICATE_PASSWORD": SENTINEL, "GH_TOKEN": SENTINEL}):
             with patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 1)) as child:
@@ -476,11 +498,12 @@ class CredentialTests(unittest.TestCase):
                     if args[:2] == ("/usr/bin/security", "delete-keychain"):
                         Path(args[-1]).unlink()
                     return completed()
-                with patch.object(service, "run", side_effect=recording), patch.dict(os.environ, {}, clear=True):
+                with patch.object(service, "run", side_effect=recording), fixture_environment():
                     try:
                         with service.signing_credentials(directory, environment):
-                            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-                            self.assertEqual((directory / "notary.p8").stat().st_mode & 0o777, 0o600)
+                            if os.name != "nt":
+                                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+                                self.assertEqual((directory / "notary.p8").stat().st_mode & 0o777, 0o600)
                             if failure == "operation":
                                 raise service.ReleaseError("Fixture operation failed")
                             if failure == "cancel":
@@ -504,7 +527,7 @@ class CredentialTests(unittest.TestCase):
     def test_invalid_credentials_cleanup_without_plaintext_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "c64-keyboard-bridge-signing"
-            with self.assertRaises(service.ReleaseError):
+            with fixture_environment(), self.assertRaises(service.ReleaseError):
                 with service.signing_credentials(directory, {"MACOS_CERTIFICATE_P12_BASE64": "not-base64"}):
                     self.fail("Invalid credentials accepted")
             self.assertFalse(directory.exists())
