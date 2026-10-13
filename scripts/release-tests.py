@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+"""Deterministic protected-release tests; no signing key, Apple account or live release is used."""
+import base64
+from contextlib import redirect_stderr, redirect_stdout
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import plistlib
+import runpy
+import shlex
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+import release_service as service
+
+SENTINEL = "secret-sentinel-never-log-7fa36"
+RECEIPT = {"id": "31b1c12f-1e2b-41fc-9cfa-500dab72cfce", "status": "Accepted"}
+
+
+def completed(stdout=b"", stderr=b"", returncode=0):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def write_tar(path, files, root, mode=0o644):
+    with tarfile.open(path, "w:gz") as archive:
+        for name, data in files.items():
+            member = tarfile.TarInfo(root + "/" + name)
+            member.size = len(data)
+            member.mode = mode if Path(name).name in service.BINARIES else 0o644
+            archive.addfile(member, io.BytesIO(data))
+
+
+class FakeGitHub:
+    repository = "batuhanoktem/c64-keyboard-bridge"
+
+    def __init__(self, revision):
+        self.existing = None
+        self.run = {"head_sha": revision, "status": "completed", "conclusion": "success", "event": "push",
+                    "head_repository": {"full_name": self.repository}, "workflow_id": 42,
+                    "path": ".github/workflows/ci.yml"}
+        self.jobs = [{"name": name, "conclusion": "success"} for name in
+                     (*service.TARGETS, "Matching corresponding source", "Pinned C64 PRG build")]
+
+    def api(self, path):
+        if "/jobs?" in path:
+            return {"jobs": self.jobs}
+        if path == "actions/workflows/ci.yml":
+            return {"id": 42}
+        return self.run
+
+    def release(self, _tag):
+        return self.existing
+
+
+class ReleaseFixture(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.repo, self.inputs = self.root / "repository", self.root / "inputs"
+        self.repo.mkdir()
+        self.inputs.mkdir()
+        self.source = {"Cargo.toml": b'[workspace.package]\nversion="0.1.0"\n',
+                       "README.md": b"release fixture\n", "c64/Makefile": b"fixture build input\n",
+                       "c64/src/fixture.c": b"fixture C source\n", "docs/screenshots/demo.json": b'{"fixture":true}\n',
+                       "docs/screenshots/demo.png": b"png fixture"}
+        for name, data in self.source.items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True).stdout.decode().strip()
+        git("init", "-b", "main")
+        git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "add", ".")
+        git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture")
+        self.revision = git("rev-parse", "HEAD")
+        git("tag", "v0.1.0")
+        git("update-ref", "refs/remotes/origin/main", self.revision)
+        digest = hashlib.sha256()
+        for name, data in sorted(self.source.items()):
+            digest.update(name.encode() + b"\0" + data + b"\0")
+        self.source_hash = digest.hexdigest()
+        c64_digest = hashlib.sha256()
+        for name, data in sorted(self.source.items()):
+            if name.startswith("c64/"):
+                c64_digest.update(name.encode() + b"\0" + data + b"\0")
+        self.c64_hash = c64_digest.hexdigest()
+        self.identity = {"schema": 1, "tag": "v0.1.0", "version": "0.1.0", "revision": self.revision,
+                         "ci_run_id": 123, "repository": FakeGitHub.repository, "source_sha256": self.source_hash}
+        self.github = FakeGitHub(self.revision)
+        self.build_inputs()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def manifest(self, name, assets):
+        (self.inputs / name).write_text("".join(f"{service.sha256(self.inputs / asset)}  {asset}\n" for asset in assets))
+
+    def build_inputs(self):
+        for target in service.TARGETS:
+            root = f"c64-keyboard-bridge-0.1.0-{target}"
+            suffix = ".exe" if "windows" in target else ""
+            binaries = {name + suffix: (target + name).encode() for name in service.BINARIES}
+            provenance = {"schema": 2, "version": "0.1.0", "project_revision": self.revision,
+                          "working_tree_modified": False, "project_source_sha256": self.source_hash,
+                          "binary_target": target, "signing": "unsigned",
+                          "executables": {name: hashlib.sha256(data).hexdigest() for name, data in binaries.items()}}
+            marker = b"KBCFGv1\0" + bytes((1, 64)) + bytes(34) + bytes((12,)) + b"C64-Ultimate" + bytes(7)
+            prgs = {name: b"\x01\x08fixture-only" + marker for name in ("KEYBRIDGE.PRG", "NETWORKTEST.PRG")}
+            prg_manifest = {"schema": 1, "cc65_revision": "555282497c3ecf8b313d87d5973093af19c35bd5",
+                            "c64_source_sha256": self.c64_hash,
+                            "files": {name: hashlib.sha256(data).hexdigest() for name, data in prgs.items()}}
+            provenance["prgs"] = prg_manifest
+            files = {**binaries, "build-provenance.json": json.dumps(provenance).encode(),
+                     "c64/prg-manifest.json": json.dumps(prg_manifest).encode(),
+                     **{"c64/" + name: data for name, data in prgs.items()}}
+            assets = []
+            if "apple" in target:
+                files[service.APP + "/Contents/Resources/c64bridge.icns"] = b"icon fixture"
+                files[service.APP + "/Contents/Info.plist"] = plistlib.dumps({"CFBundleIdentifier": service.APP_ID,
+                    "CFBundleExecutable": service.BINARIES[1], "CFBundleShortVersionString": "0.1.0"})
+                for name, data in binaries.items():
+                    files[service.APP + "/Contents/MacOS/" + name] = data
+                for name, data in list(files.items()):
+                    if not name.startswith(service.APP + "/") and name not in binaries:
+                        files[service.APP + "/Contents/Resources/" + name] = data
+                write_tar(self.inputs / (root + ".tar.gz"), files, root, 0o755)
+                for extension in (".dmg", ".metadata.json"):
+                    (self.inputs / (root + extension)).write_bytes(b"unsigned fixture")
+                assets = [root + extension for extension in (".tar.gz", ".dmg", ".metadata.json")]
+            elif "windows" in target:
+                with zipfile.ZipFile(self.inputs / (root + ".zip"), "w") as archive:
+                    for name, data in files.items():
+                        archive.writestr(root + "/" + name, data)
+                (self.inputs / (root + "-setup.exe")).write_bytes(b"installer fixture")
+                assets = [root + ".zip", root + "-setup.exe"]
+            else:
+                write_tar(self.inputs / (root + ".tar.gz"), files, root, 0o755)
+                installer = "c64-keyboard-bridge_0.1.0_" + ("arm64" if target.startswith("aarch64") else "amd64") + ".deb"
+                (self.inputs / installer).write_bytes(b"deb fixture")
+                assets = [root + ".tar.gz", installer]
+            self.manifest("SHA256SUMS-" + target, assets)
+        source_root = "c64-keyboard-bridge-0.1.0-source"
+        provenance = {"version": "0.1.0", "project_revision": self.revision, "working_tree_modified": False,
+                      "project_source_sha256": self.source_hash}
+        write_tar(self.inputs / (source_root + ".tar.gz"),
+                  {**self.source, "build-provenance.json": json.dumps(provenance).encode()}, source_root)
+        self.manifest("SHA256SUMS-source", [source_root + ".tar.gz"])
+
+    def fake_mac(self, *args, **_kwargs):
+        args = [str(value) for value in args]
+        tool = Path(args[0]).name
+        if tool == "security":
+            return completed(f'  1) {service.FINGERPRINT} "{service.IDENTITY}"\n'.encode())
+        if tool == "codesign" and "--display" in args:
+            target = Path(args[-1])
+            identifier = service.APP_ID if target.name.endswith(".app") else service.APP_ID + (".gui" if target.name.endswith("-gui") else ".cli")
+            return completed(stderr=f"Identifier={identifier}\nTeamIdentifier={service.TEAM}\nflags=0x10000(runtime)\n".encode())
+        if tool == "ditto" or tool == "hdiutil":
+            Path(args[-1]).write_bytes(b"signed fixture")
+        if "notarytool" in args:
+            return completed(json.dumps(RECEIPT).encode())
+        return completed()
+
+    def promoted(self):
+        output = self.root / "promoted"
+        with patch.object(service, "run", side_effect=self.fake_mac), patch.dict(os.environ, {}, clear=True):
+            service.promote_macos(self.inputs, output, self.identity, profile="fixture-profile")
+        path = output / "promotion.metadata.json"
+        receipt = json.loads(path.read_text())
+        receipt["credential_cleanup"] = "succeeded"
+        path.write_text(json.dumps(receipt))
+        service.checksum_manifest(output)
+        return output
+
+    def test_exact_commit_five_platform_ci_and_source_hashes(self):
+        with patch.dict(os.environ, {}, clear=True):
+            resolved = service.resolve_release("v0.1.0", 123, self.github, self.repo)
+        self.assertEqual(resolved["revision"], self.revision)
+        self.assertEqual(service.verify_inputs(self.inputs, self.identity, self.repo), self.source_hash)
+
+    def test_ci_requires_all_native_jobs_and_rejects_pr_or_wrong_commit(self):
+        for mutate in (lambda: self.github.run.update(event="pull_request"),
+                       lambda: self.github.run.update(head_sha="f" * 40),
+                       lambda: self.github.jobs.pop()):
+            github = FakeGitHub(self.revision)
+            self.github = github
+            mutate()
+            with self.assertRaises(service.ReleaseError):
+                service.validate_run(github.run, github.jobs, {"id": 42}, github.repository, self.revision)
+
+    def test_release_requires_main_dispatch_and_version_tag(self):
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/other",
+                                     "GITHUB_EVENT_NAME": "workflow_dispatch"}, clear=True):
+            with self.assertRaisesRegex(service.ReleaseError, "main"):
+                service.resolve_release("v0.1.0", 123, self.github, self.repo)
+        for tag in ("--help", "v0.2.0", "v0.1.0\nsecret", "v0.1.0^{}"):
+            with self.assertRaises(service.ReleaseError):
+                service.resolve_release(tag, 123, self.github, self.repo)
+
+    def test_untagged_development_identity_is_local_only_and_never_a_release_tag(self):
+        with patch.dict(os.environ, {}, clear=True):
+            identity = service.resolve_development(self.revision, 123, self.github, self.repo)
+            self.assertEqual(identity["tag"], "unreleased-v0.1.0")
+            with self.assertRaises(service.ReleaseError):
+                service.resolve_release(identity["tag"], 123, self.github, self.repo)
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True):
+            with self.assertRaisesRegex(service.ReleaseError, "local-only"):
+                service.resolve_development(self.revision, 123, self.github, self.repo)
+
+    def test_published_release_is_never_replaced(self):
+        self.github.existing = {"draft": False}
+        with self.assertRaisesRegex(service.ReleaseError, "never"):
+            service.resolve_release("v0.1.0", 123, self.github, self.repo)
+
+    def test_source_bytes_must_match_git_even_with_updated_archive_checksum(self):
+        source = "c64-keyboard-bridge-0.1.0-source"
+        path = self.inputs / (source + ".tar.gz")
+        with tarfile.open(path) as archive:
+            provenance = archive.extractfile(source + "/build-provenance.json").read()
+        write_tar(path, {**self.source, "README.md": b"tampered", "build-provenance.json": provenance}, source)
+        self.manifest("SHA256SUMS-source", [path.name])
+        with self.assertRaisesRegex(service.ReleaseError, "exact tagged"):
+            service.verify_inputs(self.inputs, self.identity, self.repo)
+
+    def test_configured_prg_is_rejected_even_when_platform_checksum_is_updated(self):
+        root = "c64-keyboard-bridge-0.1.0-aarch64-apple-darwin"
+        path = self.inputs / (root + ".tar.gz")
+        with tarfile.open(path) as archive:
+            files = {member.name[len(root)+1:]: archive.extractfile(member).read()
+                     for member in archive if member.isfile()}
+        name = "c64/KEYBRIDGE.PRG"
+        data = bytearray(files[name])
+        data[data.index(b"KBCFGv1\0") + 10] = 1
+        files[name] = bytes(data)
+        files[service.APP + "/Contents/Resources/" + name] = bytes(data)
+        write_tar(path, files, root)
+        self.manifest("SHA256SUMS-aarch64-apple-darwin", [root + extension for extension in (".tar.gz", ".dmg", ".metadata.json")])
+        with self.assertRaisesRegex(service.ReleaseError, "configured"):
+            service.verify_inputs(self.inputs, self.identity, self.repo)
+
+    def test_malicious_archive_paths_links_duplicates_and_modes(self):
+        for name, kind, mode in (("root/../../escape", tarfile.REGTYPE, 0o644),
+                                 ("/root/absolute", tarfile.REGTYPE, 0o644),
+                                 ("root/symlink", tarfile.SYMTYPE, 0o644),
+                                 ("root/hardlink", tarfile.LNKTYPE, 0o644),
+                                 ("root/fifo", tarfile.FIFOTYPE, 0o644),
+                                 ("root/root-command", tarfile.REGTYPE, 0o4755),
+                                 ("root/.env", tarfile.REGTYPE, 0o600),
+                                 ("root/AuthKey.p8", tarfile.REGTYPE, 0o600)):
+            path = self.root / "malicious.tar.gz"
+            with tarfile.open(path, "w:gz") as archive:
+                member = tarfile.TarInfo(name)
+                member.type, member.mode, member.linkname = kind, mode, "../../escape"
+                archive.addfile(member)
+            with tarfile.open(path) as archive, self.assertRaises(service.ReleaseError):
+                service.archive_members(archive, "root")
+        with tarfile.open(path, "w:gz") as archive:
+            for _ in range(2):
+                archive.addfile(tarfile.TarInfo("root/duplicate"))
+        with tarfile.open(path) as archive, self.assertRaises(service.ReleaseError):
+            service.archive_members(archive, "root")
+        self.assertFalse((self.root / "escape").exists())
+
+    def test_artifact_wrappers_are_flattened_and_collisions_rejected(self):
+        for collide in (False, True):
+            destination = self.root / ("collision-inputs" if collide else "fetched-inputs")
+            def downloaded(*args, **_kwargs):
+                stage = Path(args[args.index("--dir") + 1])
+                for wrapper in {"release-" + target for target in service.TARGETS} | {"release-source"}:
+                    folder = stage / wrapper
+                    folder.mkdir()
+                    (folder / (wrapper + ".tar.gz")).write_bytes(b"fixture")
+                    if collide:
+                        (folder / "duplicate.tar.gz").write_bytes(b"collision")
+                return completed()
+            with patch.object(service, "run", side_effect=downloaded):
+                if collide:
+                    with self.assertRaisesRegex(service.ReleaseError, "colliding"):
+                        service.fetch_artifacts(self.github, 123, destination)
+                    self.assertFalse(destination.exists())
+                else:
+                    service.fetch_artifacts(self.github, 123, destination)
+                    self.assertEqual(len(list(destination.iterdir())), 6)
+                    self.assertTrue(all(path.is_file() for path in destination.iterdir()))
+
+    def test_zip_private_paths_links_duplicates_and_resource_limits(self):
+        for name, mode in (("root/../escape", 0o100644), ("root/.env", 0o100600),
+                           ("root/key.p8", 0o100600), ("root/link", 0o120777),
+                           ("root/setuid", 0o104755)):
+            path = self.root / "bad.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                member = zipfile.ZipInfo(name)
+                member.external_attr = mode << 16
+                archive.writestr(member, b"fixture")
+            with zipfile.ZipFile(path) as archive, self.assertRaises(service.ReleaseError):
+                service.zip_members(archive, "root")
+        member = zipfile.ZipInfo("root/oversized")
+        member.file_size = service.MAX_BYTES + 1
+        class Oversized:
+            def infolist(self):
+                return [member]
+        with self.assertRaisesRegex(service.ReleaseError, "resource"):
+            service.zip_members(Oversized(), "root")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("root/file", b"fixture")
+            archive.writestr("root/./file", b"fixture")
+        with zipfile.ZipFile(path) as archive, self.assertRaises(service.ReleaseError):
+            service.zip_members(archive, "root")
+
+    def test_unexpected_bundle_executables_and_cross_target_receipts_are_rejected(self):
+        root = "c64-keyboard-bridge-0.1.0-aarch64-apple-darwin"
+        path = self.inputs / (root + ".tar.gz")
+        with tarfile.open(path) as archive:
+            files = {member.name[len(root)+1:]: archive.extractfile(member).read()
+                     for member in archive if member.isfile()}
+        files[service.APP + "/Contents/MacOS/unreviewed"] = b"unexpected executable"
+        write_tar(path, files, root)
+        with tarfile.open(path) as archive, self.assertRaisesRegex(service.ReleaseError, "unexpected"):
+            service.validate_bundle_members(archive, root)
+        self.build_inputs()
+        output = self.promoted()
+        receipt_path = output / "promotion.metadata.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["targets"][service.TARGETS[0]]["files"] = receipt["targets"][service.TARGETS[1]]["files"]
+        receipt_path.write_text(json.dumps(receipt))
+        service.checksum_manifest(output)
+        with self.assertRaisesRegex(service.ReleaseError, "exact architecture"):
+            service.verify_final(output, self.identity)
+
+    def test_resource_limit_checked_before_extraction(self):
+        path = self.root / "oversized.tar.gz"
+        with tarfile.open(path, "w:gz") as archive:
+            member = tarfile.TarInfo("root/huge")
+            member.size = service.MAX_BYTES + 1
+            # Test member metadata directly, without allocating a multi-gigabyte fixture.
+            with self.assertRaises(service.ReleaseError):
+                service.archive_members([member], "root")
+
+    def test_signing_uses_approved_certificate_and_never_executes_package(self):
+        calls = []
+        def recording(*args, **kwargs):
+            calls.append(tuple(str(arg) for arg in args))
+            return self.fake_mac(*args, **kwargs)
+        with patch.object(service, "run", side_effect=recording), patch.dict(os.environ, {}, clear=True):
+            service.promote_macos(self.inputs, self.root / "checked", self.identity, profile="fixture")
+        self.assertTrue(any("notarytool" in args for args in calls))
+        self.assertTrue(all(Path(args[0]).name in {"security", "codesign", "ditto", "hdiutil", "spctl", "xcrun", "lipo"}
+                            for args in calls))
+        with self.assertRaisesRegex(service.ReleaseError, "approved"):
+            service.validate_identity(fingerprint="0" * 40)
+
+    def test_rejected_and_pending_notarization_block_promotion(self):
+        for status in ("Invalid", "In Progress", "Rejected", None):
+            with patch.object(service, "run", return_value=completed(json.dumps({**RECEIPT, "status": status}).encode())):
+                with self.assertRaisesRegex(service.ReleaseError, "publication"):
+                    service.notarize(self.root / "fixture.zip", None, "fixture")
+
+    def test_app_then_archive_then_dmg_notary_order_and_cleanup_gate(self):
+        calls = []
+        def recording(*args, **kwargs):
+            calls.append(tuple(str(arg) for arg in args))
+            return self.fake_mac(*args, **kwargs)
+        output = self.root / "ordering"
+        with patch.object(service, "run", side_effect=recording), patch.dict(os.environ, {}, clear=True):
+            service.promote_macos(self.inputs, output, self.identity, profile="fixture")
+        with self.assertRaisesRegex(service.ReleaseError, "cleanup"):
+            service.verify_final(output, self.identity)
+        submit = [i for i, args in enumerate(calls) if "notarytool" in args]
+        stapled_app = [i for i, args in enumerate(calls) if "stapler" in args and "staple" in args and args[-1].endswith(".app")]
+        dmgs = [i for i, args in enumerate(calls) if Path(args[0]).name == "hdiutil"]
+        for n in range(2):
+            self.assertLess(submit[2*n], stapled_app[n])
+            self.assertLess(stapled_app[n], dmgs[n])
+            self.assertLess(dmgs[n], submit[2*n+1])
+
+    def test_signed_only_local_artifacts_cannot_be_public(self):
+        output = self.root / "signed-only"
+        with patch.object(service, "run", side_effect=self.fake_mac), patch.dict(os.environ, {}, clear=True):
+            service.promote_macos(self.inputs, output, self.identity, signed_only=True)
+        receipt_path = output / "promotion.metadata.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["credential_cleanup"] = "succeeded"
+        receipt_path.write_text(json.dumps(receipt))
+        service.checksum_manifest(output)
+        with self.assertRaisesRegex(service.ReleaseError, "notarized"):
+            service.verify_final(output, self.identity)
+
+    def test_final_inventory_and_checksum_mismatch(self):
+        promoted = self.promoted()
+        final = self.root / "final"
+        service.assemble_final(self.inputs, promoted, final, self.identity)
+        self.assertEqual(len(service.verify_final(final, self.identity)), 14)
+        (final / "c64-keyboard-bridge_0.1.0_amd64.deb").write_bytes(b"tampered")
+        with self.assertRaisesRegex(service.ReleaseError, "checksum"):
+            service.verify_final(final, self.identity)
+
+    def test_partial_upload_leaves_draft_and_never_publishes(self):
+        promoted = self.promoted()
+        final = self.root / "upload-final"
+        service.assemble_final(self.inputs, promoted, final, self.identity)
+        self.github.existing = {"draft": True, "assets": []}
+        calls = []
+        def failure(*args, **_kwargs):
+            calls.append(tuple(str(arg) for arg in args))
+            if "upload" in args:
+                raise service.ReleaseError("Fixture upload failed")
+            return completed()
+        with patch.object(service, "run", side_effect=failure), self.assertRaises(service.ReleaseError):
+            service.upload_draft(final, self.identity, self.github, publish=True)
+        self.assertFalse(any("--draft=false" in args for args in calls))
+        self.assertTrue(self.github.existing["draft"])
+
+    def test_download_mismatch_prevents_publication_and_success_stays_draft(self):
+        promoted = self.promoted()
+        final = self.root / "download-final"
+        service.assemble_final(self.inputs, promoted, final, self.identity)
+        self.github.existing = {"draft": True, "assets": []}
+        for tamper in (True, False):
+            calls = []
+            def recording(*args, **_kwargs):
+                calls.append(tuple(str(arg) for arg in args))
+                if "download" in args:
+                    destination = Path(args[args.index("--dir") + 1])
+                    for path in final.iterdir():
+                        (destination / path.name).write_bytes(path.read_bytes())
+                    if tamper:
+                        (destination / "c64-keyboard-bridge_0.1.0_amd64.deb").write_bytes(b"tampered")
+                return completed()
+            with patch.object(service, "run", side_effect=recording):
+                if tamper:
+                    with self.assertRaises(service.ReleaseError):
+                        service.upload_draft(final, self.identity, self.github, publish=True)
+                else:
+                    self.assertTrue(service.upload_draft(final, self.identity, self.github)["draft"])
+            self.assertFalse(any("--draft=false" in args for args in calls))
+
+
+class CredentialTests(unittest.TestCase):
+    def test_sensitive_process_output_and_environment_are_never_exposed(self):
+        with patch.dict(os.environ, {"MACOS_CERTIFICATE_PASSWORD": SENTINEL, "GH_TOKEN": SENTINEL}):
+            with patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 1)) as child:
+                with self.assertRaises(service.ReleaseError) as result:
+                    service.run("codesign", "fixture")
+                self.assertNotIn(SENTINEL, str(result.exception))
+                self.assertNotIn("MACOS_CERTIFICATE_PASSWORD", child.call_args.kwargs["env"])
+                self.assertNotIn("GH_TOKEN", child.call_args.kwargs["env"])
+        with patch.object(service.subprocess, "run", side_effect=subprocess.TimeoutExpired(SENTINEL, 10)):
+            with self.assertRaises(service.ReleaseError) as result:
+                service.run("fixture")
+            self.assertNotIn(SENTINEL, str(result.exception))
+
+    def test_credentials_private_stdin_only_and_cleanup_on_success_failure_cancel(self):
+        environment = {"MACOS_CERTIFICATE_P12_BASE64": base64.b64encode(b"fixture certificate").decode(),
+                       "MACOS_CERTIFICATE_PASSWORD": SENTINEL,
+                       "APPLE_NOTARY_KEY_P8_BASE64": base64.b64encode(b"-----BEGIN PRIVATE KEY-----\nfixture\n").decode()}
+        for failure in (None, "operation", "cancel"):
+            with tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "c64-keyboard-bridge-signing"
+                calls = []
+                def recording(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    if args[:2] == ("/usr/bin/security", "-i"):
+                        command = shlex.split(kwargs["input"].decode())
+                        if command[0] == "create-keychain":
+                            Path(command[-1]).write_bytes(b"temporary fixture keychain")
+                        if command[0] == "import":
+                            self.assertNotIn("-A", command)
+                            self.assertIn("-x", command)
+                    if args[:2] == ("/usr/bin/security", "delete-keychain"):
+                        Path(args[-1]).unlink()
+                    return completed()
+                with patch.object(service, "run", side_effect=recording), patch.dict(os.environ, {}, clear=True):
+                    try:
+                        with service.signing_credentials(directory, environment):
+                            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+                            self.assertEqual((directory / "notary.p8").stat().st_mode & 0o777, 0o600)
+                            if failure == "operation":
+                                raise service.ReleaseError("Fixture operation failed")
+                            if failure == "cancel":
+                                raise KeyboardInterrupt()
+                    except (service.ReleaseError, KeyboardInterrupt):
+                        self.assertIsNotNone(failure)
+                self.assertFalse(directory.exists())
+                self.assertTrue(all(SENTINEL not in str(args) for args, _kwargs in calls))
+                self.assertTrue(any(SENTINEL in kwargs.get("input", b"").decode() for _args, kwargs in calls))
+
+    def test_cleanup_failure_is_retained_and_blocks_promotion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "c64-keyboard-bridge-signing"
+            directory.mkdir()
+            (directory / "release.keychain-db").write_bytes(b"fixture")
+            with patch.object(service, "run", side_effect=service.ReleaseError("cleanup fixture")):
+                with self.assertRaisesRegex(service.ReleaseError, "publication"):
+                    service.cleanup_credentials(directory)
+            self.assertFalse(directory.exists())
+
+    def test_invalid_credentials_cleanup_without_plaintext_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "c64-keyboard-bridge-signing"
+            with self.assertRaises(service.ReleaseError):
+                with service.signing_credentials(directory, {"MACOS_CERTIFICATE_P12_BASE64": "not-base64"}):
+                    self.fail("Invalid credentials accepted")
+            self.assertFalse(directory.exists())
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_cli_unexpected_parse_failure_is_sanitized(self):
+        # The entrypoint's broad handler is exercised in a subprocess without a live API call.
+        driver = "import runpy,sys;sys.path.insert(0,'scripts');import release_service;release_service.resolve_release=lambda *a,**k: (_ for _ in ()).throw(Exception('" + SENTINEL + "'));sys.argv=['release.py','validate','--tag','v0.1.0','--ci-run','123','--inputs','unused'];runpy.run_path('scripts/release.py',run_name='__main__')"
+        result = subprocess.run([sys.executable, "-c", driver], cwd=service.ROOT, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(SENTINEL.encode(), result.stdout + result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_keychain_parser_quotes_one_token_and_bounds_input(self):
+        password = "punctuation single' double\" slash\\ dollar$ ; spaces"
+        with patch.object(service, "run", return_value=completed()) as recording:
+            service.security_command("import", "fixture.p12", "-P", password)
+        command = recording.call_args.kwargs["input"].decode()
+        self.assertEqual(shlex.split(command), ["import", "fixture.p12", "-P", password])
+        self.assertIn('"-P" "punctuation', command)
+        for value in ("bad\ncommand", "bad\rcommand", "bad\0command", "x" * 4096):
+            with self.assertRaises(service.ReleaseError):
+                service.security_command("import", "-P", value)
+
+    def test_github_missing_release_uses_bounded_scrubbed_runner(self):
+        github = service.GitHub(FakeGitHub.repository)
+        with patch.object(service, "run", side_effect=[completed(stderr=b"HTTP 404", returncode=1), completed(b"[]")]) as tools:
+            self.assertIsNone(github.release("v0.1.0"))
+            self.assertTrue(tools.call_args_list[0].kwargs["allow_nonzero"])
+
+    def test_provision_helper_requires_protected_environment_and_pipes_secrets(self):
+        helper = runpy.run_path(str(service.ROOT / "scripts/release-secrets.py"))
+        provision = helper["provision"]
+        class Protection:
+            def __init__(self, _repo):
+                pass
+            def api(self, path):
+                if path.endswith("deployment-branch-policies"):
+                    return {"branch_policies": [{"name": "main", "type": "branch"}]}
+                return {"can_admins_bypass": False, "deployment_branch_policy": {"custom_branch_policies": True},
+                        "protection_rules": [{"type": "required_reviewers", "prevent_self_review": False,
+                                              "reviewers": [{"reviewer": {"login": "batuhanoktem"}}]}]}
+        calls = []
+        def recording(*args, **kwargs):
+            calls.append((args, kwargs))
+            return completed()
+        with patch.dict(provision.__globals__, {"GitHub": Protection, "run": recording}):
+            provision(FakeGitHub.repository, "macos-release", b"p12", SENTINEL, b"p8", "ABCDEFGHIJ", RECEIPT["id"])
+        self.assertEqual(sum("secret" in args for args, _kwargs in calls), 3)
+        self.assertTrue(all(SENTINEL not in str(args) for args, _kwargs in calls))
+        self.assertTrue(any(kwargs.get("input") == SENTINEL.encode() for _args, kwargs in calls))
+        with self.assertRaises(service.ReleaseError):
+            provision(FakeGitHub.repository, "unprotected", b"p12", SENTINEL, b"p8", "ID", "UUID")
+        calls.clear()
+        with patch.dict(provision.__globals__, {"GitHub": Protection, "run": recording}):
+            with self.assertRaisesRegex(service.ReleaseError, "48KB"):
+                provision(FakeGitHub.repository, "macos-release", b"x" * 37000, SENTINEL, b"p8", "ID", "UUID")
+        self.assertEqual(calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

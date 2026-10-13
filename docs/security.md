@@ -16,8 +16,10 @@ Bridge-owned output is released on pause, session failure, disconnect, and host 
 
 The C64 client suspends forwarding on ambiguous matrix rectangles or controller interference. These precautions can reject legitimate rollover combinations. Commodore+RUN/STOP held for one second is a reserved local exit chord. RESTORE has no ordinary matrix transition; an abrupt warm start or reset bypasses local cleanup and relies on the host watchdog. Full behavioral acceptance is covered by [hardware testing](hardware-testing.md).
 
-There is no host keyboard capture, keylogger, GUI, or password-bearing CLI argument. Default logs omit key text and authentication tokens. Diagnostic reports contain device and network metadata, so review them before sharing.
+There is no host keyboard capture, keylogger or password-bearing CLI argument. The optional GUI uses the same guarded host services. Default logs omit key text and authentication tokens. Diagnostic reports contain device and network metadata, so review them before sharing.
 
 The retained session `diagnostics` object contains typed reasons, counters, phases, host timings and cleanup outcomes. It excludes credentials, peer addresses, device-provided text, key identities and matrix bytes. Only one failure record is retained in memory. The surrounding status and doctor reports still include their existing device/network metadata and must be reviewed before sharing. A successful cleanup outcome means bridge-owned native releases succeeded or no keys were owned; it does not prove delivery to a particular application.
 
 `LOG_LEVEL=debug` records physical C64 key identities, worker decisions and accepted Windows native key events, including repeat. These traces can reveal text typed through the bridge. Keep them private and review them before sharing; credentials and Unicode action content are not logged by these traces.
+
+Signing and notarization credentials are separate from C64 REST passwords and pairing tokens. Only the approved release environment can supply Apple credentials to its signing job; ordinary CI and PR checks remain unsigned. See [secure release preparation](secure-releases.md).
