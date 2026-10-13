@@ -50,7 +50,9 @@ SHIFT LOCK uses the observed Shift matrix state and cannot be mapped independent
 
 ## Passwords and diagnostics
 
-**Remember password** is opt-in and uses macOS Keychain, Windows Credential Manager or Linux Secret Service. The private settings file stores a credential reference rather than a password. An unavailable or locked store leaves the supplied password in memory and reports the failure; there is no plaintext fallback. **Forget saved password** reports deletion failure rather than claiming success.
+**Remember password** is opt-in and uses macOS Keychain, Windows Credential Manager or Linux Secret Service. The private settings file stores a credential reference rather than a password. Credential requests run separately from networking and input cleanup. While the store is responding, connection checks and hosting remain available using the session password; a delayed store response never claims that saving or deletion succeeded. An unavailable or locked store leaves the supplied password in memory and reports the failure; there is no plaintext fallback. **Forget saved password** reports deletion failure rather than claiming success.
+
+If Linux Secret Service was unavailable on the first credential request, start or unlock the password store and reopen the companion before retrying Remember. Session-only connection remains available without a working password store.
 
 **Diagnostics** shows current phase, failure counters, retained session failure and cleanup outcome, plus a bounded activity history. Exported diagnostics omit passwords, pairing/control tokens, addresses, key identities, matrices and peer-supplied text. Permission checks identify whether the companion or CLI is the posting process. On macOS, grant Device Control and Data Access (Accessibility on older versions) to the process actually sending events; authorizing a terminal for CLI use does not authorize the app automatically. Failed asynchronous actions show a persistent error above the current page, with the activity history retaining the operation's result.
 
@@ -66,6 +68,6 @@ Existing CLI hardware observations do not establish native GUI input acceptance,
 
 ## Identity and documentation
 
-The public app ID is `com.flameliongames.c64keyboardbridge`. Existing state directories and saved credential references remain compatible. macOS may require renewed posting, Local Network or Keychain authorization after replacing an older app; check the current GUI process rather than relying on an earlier CLI grant.
+The public app ID is `com.flameliongames.c64keyboardbridge`. This namespace starts with fresh state and credential references; older data remains untouched and is not imported. macOS may require renewed posting, Local Network or Keychain authorization after replacing an older app; check the current GUI process rather than relying on an earlier CLI grant.
 
 See the [screenshot gallery](screenshots.md), [device compatibility](device-compatibility.md) and [builds and release verification](build-and-release.md). Older acceptance records retain the command names and hashes actually tested at the time.

@@ -2,7 +2,10 @@
 use crate::{
     config,
     model::*,
-    secrets::{MemorySecretStore, OsSecretStore, SecretStore},
+    secrets::{
+        CredentialFailure, CredentialOperation, CredentialValue, CredentialWorker,
+        MemorySecretStore, OsSecretStore,
+    },
 };
 use anyhow::{Result, bail};
 use bridge_core::MappingDocument;
@@ -278,13 +281,32 @@ struct PendingTestPreparation {
     task: tokio::task::JoinHandle<Result<Box<dyn bridge_core::KeyboardBackend>>>,
     gate_epoch: u64,
 }
+enum CredentialPurpose {
+    Restore,
+    Remember(bool),
+    Forget,
+    RemoveLocalData,
+}
+struct PendingCredential {
+    response: tokio::sync::oneshot::Receiver<Result<CredentialValue, CredentialFailure>>,
+    purpose: CredentialPurpose,
+    credential_id: String,
+    password_epoch: u64,
+    settings_epoch: u64,
+    deadline: Instant,
+    timed_out: bool,
+}
 struct Actor {
     state_dir: PathBuf,
     env_override: Option<PathBuf>,
     smoke: bool,
     settings: GuiSettings,
     password: Option<String>,
-    store: Box<dyn SecretStore>,
+    store: CredentialWorker,
+    pending_credential: Option<PendingCredential>,
+    credential_timeout: Duration,
+    password_epoch: u64,
+    settings_epoch: u64,
     owned: Option<ManagedRuntime>,
     snapshot: GuiSnapshot,
     focused: bool,
@@ -319,11 +341,15 @@ impl Actor {
             smoke,
             settings: GuiSettings::default(),
             password: None,
-            store: if smoke {
+            store: CredentialWorker::new(if smoke {
                 Box::<MemorySecretStore>::default()
             } else {
                 Box::new(OsSecretStore)
-            },
+            }),
+            pending_credential: None,
+            credential_timeout: Duration::from_secs(10),
+            password_epoch: 0,
+            settings_epoch: 0,
             owned: None,
             snapshot: GuiSnapshot::default(),
             focused: true,
@@ -377,14 +403,147 @@ impl Actor {
         self.publish();
     }
     fn restore_password(&mut self) {
-        if self.settings.remember_password {
-            match self.store.get(&self.settings.credential_id) {
-                Ok(value) => self.password = value,
-                Err(_) => {
-                    self.error("Saved password is locked or unavailable; enter a session password")
+        if self.settings.remember_password
+            && self
+                .begin_credential(
+                    CredentialPurpose::Restore,
+                    CredentialOperation::Get {
+                        id: self.settings.credential_id.clone(),
+                    },
+                )
+                .is_err()
+        {
+            self.error("Saved password is locked or unavailable; enter a session password");
+        }
+    }
+    fn begin_credential(
+        &mut self,
+        purpose: CredentialPurpose,
+        operation: CredentialOperation,
+    ) -> Result<()> {
+        if self.pending_credential.is_some() {
+            bail!("An OS credential operation is still pending; unlock or dismiss its dialog");
+        }
+        let response = self.store.request(operation)?;
+        self.pending_credential = Some(PendingCredential {
+            response,
+            purpose,
+            credential_id: self.settings.credential_id.clone(),
+            password_epoch: self.password_epoch,
+            settings_epoch: self.settings_epoch,
+            deadline: Instant::now() + self.credential_timeout,
+            timed_out: false,
+        });
+        self.snapshot.credential_pending = true;
+        Ok(())
+    }
+    fn poll_credentials(&mut self) {
+        let Some(pending) = self.pending_credential.as_mut() else {
+            return;
+        };
+        let result = match pending.response.try_recv() {
+            Ok(value) => value,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                if !pending.timed_out && Instant::now() >= pending.deadline {
+                    pending.timed_out = true;
+                    self.error("OS credential store has not responded. Unlock or dismiss its dialog; the password remains in this session. Save/delete outcome is unconfirmed, and connection controls remain available");
+                }
+                return;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Err(CredentialFailure::Unavailable)
+            }
+        };
+        let pending = self.pending_credential.take().unwrap();
+        self.snapshot.credential_pending = false;
+        if pending.credential_id != self.settings.credential_id {
+            self.note("Obsolete credential result ignored; current local settings were preserved");
+            return;
+        }
+        let value = match result {
+            Ok(value) => value,
+            Err(CredentialFailure::Panicked) => {
+                self.error("OS credential API panicked; credentials were not confirmed. Connection controls remain available with a session password");
+                return;
+            }
+            Err(CredentialFailure::Unavailable) => {
+                self.error(match pending.purpose {
+                    CredentialPurpose::Restore => "Saved password is locked or unavailable; enter a session password",
+                    CredentialPurpose::Remember(true) => "Password could not be saved in the OS store; it remains in this session only. Any previously saved password is unchanged or unconfirmed",
+                    _ => "Credential deletion failed or is unconfirmed; the saved password may still exist. Local data and session password were preserved",
+                });
+                return;
+            }
+        };
+        match pending.purpose {
+            CredentialPurpose::Restore => {
+                if let CredentialValue::Password(password) = value {
+                    if pending.password_epoch == self.password_epoch
+                        && self.settings.remember_password
+                    {
+                        let changed = self.password != password;
+                        self.password = password;
+                        self.snapshot.settings_pending |= changed
+                            && (self.owned.is_some()
+                                || self.snapshot.status.as_ref().is_some_and(|s| s.running));
+                        self.note(if self.password.is_some() {
+                            "Saved password restored; apply settings if hosting was already started"
+                        } else {
+                            "No saved password was found in the OS store; enter a session password"
+                        });
+                    } else {
+                        self.note("Earlier saved-password result ignored; the current session password was preserved");
+                    }
+                }
+            }
+            CredentialPurpose::Remember(remember) => {
+                if pending.password_epoch != self.password_epoch {
+                    self.error("Earlier credential operation completed for a previous session password. Current settings were preserved; use Forget saved password before saving the new value");
+                    return;
+                }
+                self.finish_credential_setting(remember, false);
+            }
+            CredentialPurpose::Forget => {
+                let forgotten = pending.password_epoch == self.password_epoch;
+                if forgotten {
+                    self.password = None;
+                    self.password_epoch = self.password_epoch.wrapping_add(1);
+                }
+                self.finish_credential_setting(false, forgotten);
+            }
+            CredentialPurpose::RemoveLocalData => {
+                if pending.settings_epoch != self.settings_epoch
+                    || pending.password_epoch != self.password_epoch
+                    || self.owned.is_some()
+                    || self.state_dir.join("runtime.json").exists()
+                {
+                    self.finish_credential_setting(false, false);
+                    self.error("Saved credential was deleted, but local-data removal was cancelled by changed settings or hosting. Current files were preserved");
+                } else {
+                    self.finish_credential_setting(false, true);
+                    if self.remove_local_data().is_err() {
+                        self.error("Saved credential was deleted, but some local files could not be removed; review Settings and retry");
+                    }
                 }
             }
         }
+    }
+    fn finish_credential_setting(&mut self, remember_password: bool, password_forgotten: bool) {
+        self.settings.remember_password = remember_password;
+        self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        if config::save_settings(&self.state_dir, &self.settings).is_err() {
+            self.error("OS credential operation completed, but its settings record could not be saved; review Settings before restarting");
+        } else {
+            self.note(if remember_password {
+                "Password saved in the OS credential store"
+            } else {
+                "Stored password removed"
+            });
+        }
+        self.event(GuiEvent::CredentialChanged {
+            remember_password,
+            password_forgotten,
+        });
     }
     fn event(&mut self, event: GuiEvent) {
         if self.events.try_send(event).is_err() {
@@ -588,6 +747,11 @@ impl Actor {
         self.cancel_test_preparation();
         self.join_cancelled_test_preparations().await;
         if self.stop_owned().await.is_ok() {
+            // Closing the result receiver prevents an OS prompt's eventual
+            // answer from changing settings after Quit. The dedicated owner
+            // may finish the already authorized call; its outcome is unknown.
+            self.pending_credential = None;
+            self.snapshot.credential_pending = false;
             self.snapshot.quit_ready = true;
             self.note("Desktop stopped; external CLI sessions are unchanged");
             self.publish();
@@ -685,6 +849,7 @@ impl Actor {
         }
     }
     async fn tick(&mut self) {
+        self.poll_credentials();
         self.poll_test_preparation().await;
         if self.overflowed {
             let _ = self.pause().await;
@@ -749,9 +914,10 @@ impl Actor {
             };
             self.permit.close();
             match result {
-                Ok(_) => {
-                    self.note("Input test accepted 11 pairs; visual delivery remains user-observed")
-                }
+                Ok(report) => self.note(&format!(
+                    "Input test accepted {} pairs; visual delivery remains user-observed",
+                    report.accepted_pairs
+                )),
                 Err(error) => {
                     self.error(&format!("Input stayed disabled: {}", display_error(&error)))
                 }
@@ -925,29 +1091,40 @@ impl Actor {
             Some(password)
         };
         settings.to_config(&self.state_dir, next_password.as_deref())?;
-        let mut store_failure = false;
-        if settings.remember_password {
+        let requested_remember = settings.remember_password;
+        let operation = if self.pending_credential.is_some() {
+            None
+        } else if requested_remember {
             let password = next_password.clone().unwrap_or_else(|| {
                 settings
                     .to_config(&self.state_dir, None)
                     .map(|c| c.password.expose().to_owned())
                     .unwrap_or_default()
             });
-            if self.store.set(&settings.credential_id, &password).is_err() {
-                settings.remember_password = self.settings.remember_password;
-                store_failure = true;
-            }
-        } else if self.settings.remember_password
-            && self.store.delete(&settings.credential_id).is_err()
-        {
-            bail!("Stored password deletion failed");
-        }
+            Some(CredentialOperation::Set {
+                id: settings.credential_id.clone(),
+                password,
+            })
+        } else if self.settings.remember_password {
+            Some(CredentialOperation::Delete {
+                id: settings.credential_id.clone(),
+            })
+        } else {
+            None
+        };
+        // Persist only confirmed credential state. Waiting for OS consent must
+        // neither disable connection controls nor imply a secret was saved.
+        settings.remember_password = self.settings.remember_password;
         let mut previous = self.settings.clone();
         previous.remember_password = settings.remember_password;
         let changed = previous != settings || self.password != next_password;
         config::save_settings(&self.state_dir, &settings)?;
         if changed {
             self.cancel_test_for_configuration_change();
+            self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        }
+        if self.password != next_password {
+            self.password_epoch = self.password_epoch.wrapping_add(1);
         }
         self.settings = settings;
         self.password = next_password;
@@ -956,10 +1133,17 @@ impl Actor {
             && (self.owned.is_some() || self.snapshot.status.as_ref().is_some_and(|s| s.running));
         self.event(GuiEvent::SettingsLoaded(self.settings.clone()));
         self.probe_backend();
-        if store_failure {
-            self.error(
-                "Password could not be saved in the OS store; it remains in this session only",
-            );
+        if let Some(operation) = operation {
+            if self
+                .begin_credential(CredentialPurpose::Remember(requested_remember), operation)
+                .is_err()
+            {
+                self.error("OS credential store unavailable; settings were saved and the password remains in this session only");
+            } else {
+                self.note("Settings applied; OS credential storage is pending. Unlock or dismiss its dialog. Connection controls remain available and the password is usable in this session");
+            }
+        } else if self.pending_credential.is_some() {
+            self.note("Settings applied for this session; an earlier OS credential operation is still pending. No duplicate save was queued");
         } else {
             self.note("Settings saved; passwords are excluded from the settings file");
         }
@@ -988,6 +1172,10 @@ impl Actor {
         let changed = settings != self.settings || next_password != self.password;
         if changed {
             self.cancel_test_for_configuration_change();
+            self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        }
+        if next_password != self.password {
+            self.password_epoch = self.password_epoch.wrapping_add(1);
         }
         self.snapshot.settings_pending |= changed
             && (self.owned.is_some()
@@ -1151,12 +1339,15 @@ impl Actor {
                 }
             }
             GuiAction::ForgetPassword => {
-                self.store.delete(&self.settings.credential_id)?;
-                self.settings.remember_password = false;
-                config::save_settings(&self.state_dir, &self.settings)?;
-                self.password = None;
-                self.event(GuiEvent::SettingsLoaded(self.settings.clone()));
-                self.note("Stored password removed");
+                self.begin_credential(
+                    CredentialPurpose::Forget,
+                    CredentialOperation::Delete {
+                        id: self.settings.credential_id.clone(),
+                    },
+                )?;
+                self.note(
+                    "Password deletion pending in the OS credential store; it is not yet confirmed",
+                );
             }
             GuiAction::ImportProfile(path) => {
                 let text = config::read_regular(&path, false)?;
@@ -1179,6 +1370,7 @@ impl Actor {
                 self.settings.layout = document.layout.clone();
                 self.settings.profile = document.profile.clone();
                 self.settings.mappings_file = path.to_string_lossy().into_owned();
+                self.settings_epoch = self.settings_epoch.wrapping_add(1);
                 self.snapshot.settings_pending =
                     restart || self.snapshot.status.as_ref().is_some_and(|s| s.running);
                 config::save_settings(&self.state_dir, &self.settings)?;
@@ -1336,49 +1528,13 @@ impl Actor {
                 {
                     bail!("Stop all hosting and confirm local-data removal first");
                 }
-                self.store.delete(&self.settings.credential_id)?;
-                self.password = None;
-                self.countdown = None;
-                for name in [
-                    "gui-settings.toml",
-                    "pairing.key",
-                    "pairing.new",
-                    "hardware-evidence.json",
-                    "hardware-failure.json",
-                ] {
-                    let path = self.state_dir.join(name);
-                    if path.exists() {
-                        std::fs::remove_file(path)?;
-                    }
-                }
-                let profiles = self.state_dir.join("profiles");
-                if profiles.exists() {
-                    pairing::prepare_directory(&profiles)?;
-                    for file in std::fs::read_dir(&profiles)? {
-                        let path = file?.path();
-                        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                        if path.extension().is_some_and(|v| v == "toml")
-                            && name.len() == 32
-                            && name.bytes().all(|b| b.is_ascii_hexdigit())
-                        {
-                            std::fs::remove_file(path)?;
-                        }
-                    }
-                }
-                self.settings = GuiSettings {
-                    env_file: String::new(),
-                    credential_id: config::random_id()?,
-                    ..Default::default()
-                };
-                config::save_settings(&self.state_dir, &self.settings)?;
-                self.snapshot = GuiSnapshot {
-                    tray_available: self.safety.tray,
-                    ..Default::default()
-                };
-                self.history.clear();
-                self.probe_backend();
-                self.event(GuiEvent::LocalDataReset(self.settings.clone()));
-                self.note("Local bridge data reset; imported .env files and exported profiles were preserved");
+                self.begin_credential(
+                    CredentialPurpose::RemoveLocalData,
+                    CredentialOperation::Delete {
+                        id: self.settings.credential_id.clone(),
+                    },
+                )?;
+                self.note("Local-data removal is waiting for confirmed OS credential deletion; files are preserved until it completes");
             }
             GuiAction::Quit => {
                 let _ = self.quit.send(true);
@@ -1387,6 +1543,55 @@ impl Actor {
                 unreachable!("Configured operations are resolved above")
             }
         }
+        Ok(())
+    }
+    fn remove_local_data(&mut self) -> Result<()> {
+        self.password = None;
+        self.password_epoch = self.password_epoch.wrapping_add(1);
+        self.settings_epoch = self.settings_epoch.wrapping_add(1);
+        self.countdown = None;
+        for name in [
+            "gui-settings.toml",
+            "pairing.key",
+            "pairing.new",
+            "hardware-evidence.json",
+            "hardware-failure.json",
+        ] {
+            let path = self.state_dir.join(name);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        let profiles = self.state_dir.join("profiles");
+        if profiles.exists() {
+            pairing::prepare_directory(&profiles)?;
+            for file in std::fs::read_dir(&profiles)? {
+                let path = file?.path();
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if path.extension().is_some_and(|v| v == "toml")
+                    && name.len() == 32
+                    && name.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    std::fs::remove_file(path)?;
+                }
+            }
+        }
+        self.settings = GuiSettings {
+            env_file: String::new(),
+            credential_id: config::random_id()?,
+            ..Default::default()
+        };
+        config::save_settings(&self.state_dir, &self.settings)?;
+        self.snapshot = GuiSnapshot {
+            tray_available: self.safety.tray,
+            ..Default::default()
+        };
+        self.history.clear();
+        self.probe_backend();
+        self.event(GuiEvent::LocalDataReset(self.settings.clone()));
+        self.note(
+            "Local bridge data reset; imported .env files and exported profiles were preserved",
+        );
         Ok(())
     }
     async fn open_external(&mut self, target: ExternalTarget) -> Result<bool> {

@@ -202,6 +202,7 @@ pub struct GuiSnapshot {
     pub tray_available: bool,
     pub tray_command_ack: Option<TrayCommandAck>,
     pub test_authorization_pending: bool,
+    pub credential_pending: bool,
 }
 // Password-bearing commands deliberately have no Debug or Serialize implementation.
 #[derive(Clone)]
@@ -277,6 +278,10 @@ pub enum GuiEvent {
     Snapshot(Box<GuiSnapshot>),
     SettingsLoaded(GuiSettings),
     FormAccepted(GuiSettings),
+    CredentialChanged {
+        remember_password: bool,
+        password_forgotten: bool,
+    },
     ProfileLoaded {
         document: MappingDocument,
         path: PathBuf,

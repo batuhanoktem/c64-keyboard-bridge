@@ -25,5 +25,7 @@ User-visible changes are collected here. Unreleased changes do not imply that a 
 
 - Per-key C64 debounce and queued-release ordering prevent the previously observed missed or duplicated quick taps.
 - Held-key pause/resume and traffic-loss recovery preserve release ownership and require held ordinary keys to be released before typing again.
+- Password-store operations run outside the networking runtime, preventing a Linux settings-save crash and keeping connection and cleanup controls responsive during delayed credential requests.
+- Packaged notices and resources retain their contents without inheriting executable permissions from upstream sources.
 
 Prepared [0.1.0 release notes](docs/release-notes-0.1.0.md) describe acceptance limits. Record a release date and version section here only when that version is published.

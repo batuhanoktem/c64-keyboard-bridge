@@ -221,6 +221,19 @@ impl BridgeApp {
             GuiEvent::ProfileLoaded { document, path } => {
                 self.editor.load(document.clone(), path.clone())
             }
+            GuiEvent::CredentialChanged {
+                remember_password,
+                password_forgotten,
+            } => {
+                self.settings.remember_password = *remember_password;
+                self.accepted_settings.remember_password = *remember_password;
+                if *password_forgotten {
+                    if self.password == self.accepted_password {
+                        self.password.clear();
+                    }
+                    self.accepted_password.clear();
+                }
+            }
             GuiEvent::ProfileDraftLoaded { text, path } => {
                 self.editor.load_raw(text.clone(), path.clone());
             }
@@ -366,6 +379,10 @@ impl BridgeApp {
         }
         if !snapshot.message.is_empty() {
             ui.label(&snapshot.message);
+            ui.add_space(6.0);
+        }
+        if snapshot.credential_pending {
+            ui.label("The operating system password store is still responding. You can start hosting or check the device using the password in this session. Remember, Forget and local-data removal are unavailable until the request finishes.");
             ui.add_space(6.0);
         }
         if !self.platform.supports_backend(&self.settings.backend) {
@@ -704,7 +721,7 @@ impl BridgeApp {
                     ui.add(egui::DragValue::new(&mut self.settings.bridge_port).range(1..=65535));
                     ui.end_row();
                 });
-            self.credentials(ui, actions);
+            self.credentials(ui, snapshot, actions);
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
@@ -818,7 +835,12 @@ impl BridgeApp {
     pub fn form_has_changes(&self) -> bool {
         self.settings != self.accepted_settings || self.password != self.accepted_password
     }
-    fn credentials(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+    fn credentials(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &GuiSnapshot,
+        actions: &mut Vec<GuiAction>,
+    ) {
         ui.label("Network password");
         ui.add_sized(
             [350.0, ui.spacing().interact_size.y],
@@ -826,14 +848,21 @@ impl BridgeApp {
                 .password(true)
                 .hint_text("Empty: use saved credential or imported environment"),
         );
-        ui.checkbox(
-            &mut self.settings.remember_password,
-            "Remember in the operating system credential store",
-        );
+        ui.add_enabled_ui(!snapshot.credential_pending, |ui| {
+            ui.checkbox(
+                &mut self.settings.remember_password,
+                "Remember in the operating system credential store",
+            );
+        });
         ui.small("The password stays in memory unless Remember is selected and settings are explicitly saved or applied. No plaintext fallback.");
         ui.small("An imported .env path must exist. Desktop launchers do not inherit your terminal's environment.");
-        if ui.button("Forget saved password").clicked() {
-            self.password.clear();
+        if ui
+            .add_enabled(
+                !snapshot.credential_pending,
+                egui::Button::new("Forget saved password"),
+            )
+            .clicked()
+        {
             actions.push(GuiAction::ForgetPassword);
         }
     }
@@ -1027,7 +1056,7 @@ impl BridgeApp {
         );
         presentation::card(ui, |ui| {
             ui.heading("Credentials");
-            self.credentials(ui, actions);
+            self.credentials(ui, snapshot, actions);
             ui.small(self.platform.credential_store());
         });
         ui.add_space(12.0);
@@ -1140,7 +1169,7 @@ impl BridgeApp {
         });
         if ui
             .add_enabled(
-                !snapshot.busy && snapshot.phase == GuiPhase::Idle,
+                !snapshot.busy && !snapshot.credential_pending && snapshot.phase == GuiPhase::Idle,
                 egui::Button::new("Reset local bridge data…"),
             )
             .clicked()
@@ -1215,6 +1244,15 @@ mod tests {
         app: &mut BridgeApp,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, Vec<GuiAction>) {
+        render_snapshot(context, app, events, &GuiSnapshot::default())
+    }
+
+    fn render_snapshot(
+        context: &egui::Context,
+        app: &mut BridgeApp,
+        events: Vec<egui::Event>,
+        snapshot: &GuiSnapshot,
+    ) -> (egui::FullOutput, Vec<GuiAction>) {
         let mut actions = Vec::new();
         let mut output = context.run_ui(
             egui::RawInput {
@@ -1225,10 +1263,64 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |ui| actions = app.render(ui, &GuiSnapshot::default()),
+            |ui| actions = app.render(ui, snapshot),
         );
         output.textures_delta.clear();
         (output, actions)
+    }
+
+    #[test]
+    fn credential_acknowledgment_preserves_newer_connection_and_password_drafts() {
+        let mut app = BridgeApp::new(GuiSettings::default());
+        app.accepted_password = "SAVED_SECRET_SENTINEL".into();
+        app.password = "NEW_DRAFT_SECRET_SENTINEL".into();
+        app.settings.device_host = "unsaved-device.invalid".into();
+        app.on_event(&GuiEvent::CredentialChanged {
+            remember_password: false,
+            password_forgotten: true,
+        });
+        assert_eq!(app.password, "NEW_DRAFT_SECRET_SENTINEL");
+        assert!(app.accepted_password.is_empty());
+        assert_eq!(app.settings.device_host, "unsaved-device.invalid");
+        assert!(app.form_has_changes());
+        app.password = "CONFIRMED_SECRET_SENTINEL".into();
+        app.accepted_password = app.password.clone();
+        app.on_event(&GuiEvent::CredentialChanged {
+            remember_password: false,
+            password_forgotten: true,
+        });
+        assert!(app.password.is_empty());
+    }
+
+    #[test]
+    fn waiting_credential_store_keeps_connection_buttons_clickable() {
+        for label in ["Start host", "Device information", "Forget saved password"] {
+            let context = egui::Context::default();
+            let mut app = BridgeApp::new(GuiSettings::default());
+            app.password = "SESSION_SECRET_SENTINEL".into();
+            let snapshot = GuiSnapshot {
+                credential_pending: true,
+                ..Default::default()
+            };
+            let mut output = None;
+            for _ in 0..3 {
+                let (frame, actions) = render_snapshot(&context, &mut app, vec![], &snapshot);
+                assert!(actions.is_empty());
+                output = Some(frame);
+            }
+            let position = text_center(&output.unwrap(), label);
+            let (_, actions) =
+                render_snapshot(&context, &mut app, pointer_click(position), &snapshot);
+            if label == "Forget saved password" {
+                assert!(actions.is_empty());
+                assert_eq!(app.password, "SESSION_SECRET_SENTINEL");
+            } else {
+                assert_eq!(actions.len(), 1);
+                assert!(
+                    matches!(&actions[0], GuiAction::Configured { password, .. } if password == "SESSION_SECRET_SENTINEL")
+                );
+            }
+        }
     }
 
     fn text_center(output: &egui::FullOutput, label: &str) -> egui::Pos2 {

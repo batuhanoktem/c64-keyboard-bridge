@@ -1,4 +1,5 @@
 use super::*;
+use crate::secrets::SecretStore;
 
 #[test]
 fn trusted_external_targets_use_argument_vectors_and_platform_specific_openers() {
@@ -381,6 +382,383 @@ fn cleanup(actor: Actor) {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+async fn finish_credentials(actor: &mut Actor) {
+    let until = Instant::now() + Duration::from_secs(2);
+    while actor.pending_credential.is_some() {
+        actor.poll_credentials();
+        assert!(
+            Instant::now() < until,
+            "credential fixture did not complete"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+struct CredentialGate {
+    ready: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    entered: Arc<AtomicBool>,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+    value: Arc<Mutex<Option<String>>>,
+}
+impl CredentialGate {
+    fn release(&self) {
+        *self.ready.0.lock().unwrap() = true;
+        self.ready.1.notify_all();
+    }
+    async fn wait_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !self.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+impl Drop for CredentialGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+struct DelayedCredentialStore {
+    ready: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    entered: Arc<AtomicBool>,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+    value: Arc<Mutex<Option<String>>>,
+}
+impl DelayedCredentialStore {
+    fn wait(&self, name: &'static str) {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        self.calls.lock().unwrap().push(name);
+        self.entered.store(true, Ordering::Release);
+        let mut ready = self.ready.0.lock().unwrap();
+        while !*ready {
+            ready = self.ready.1.wait(ready).unwrap();
+        }
+    }
+}
+impl SecretStore for DelayedCredentialStore {
+    fn get(&mut self, _: &str) -> Result<Option<String>> {
+        self.wait("get");
+        Ok(self.value.lock().unwrap().clone())
+    }
+    fn set(&mut self, _: &str, password: &str) -> Result<()> {
+        self.wait("set");
+        *self.value.lock().unwrap() = Some(password.into());
+        Ok(())
+    }
+    fn delete(&mut self, _: &str) -> Result<()> {
+        self.wait("delete");
+        *self.value.lock().unwrap() = None;
+        Ok(())
+    }
+}
+fn delayed_credentials(value: Option<String>) -> (CredentialWorker, CredentialGate) {
+    let gate = CredentialGate {
+        ready: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+        entered: Arc::new(AtomicBool::new(false)),
+        calls: Arc::new(Mutex::new(Vec::new())),
+        value: Arc::new(Mutex::new(value)),
+    };
+    let worker = CredentialWorker::new(Box::new(DelayedCredentialStore {
+        ready: gate.ready.clone(),
+        entered: gate.entered.clone(),
+        calls: gate.calls.clone(),
+        value: gate.value.clone(),
+    }));
+    (worker, gate)
+}
+
+#[tokio::test]
+async fn slow_secret_save_leaves_session_settings_usable_and_discards_stale_confirmation() {
+    let (mut actor, events) = actor();
+    let (worker, gate) = delayed_credentials(None);
+    actor.store = worker;
+    let mut settings = actor.settings.clone();
+    settings.remember_password = true;
+    actor
+        .action(GuiAction::SaveSettings {
+            settings,
+            password: "FIRST_SECRET_SENTINEL".into(),
+        })
+        .await
+        .unwrap();
+    gate.wait_entered().await;
+    assert!(actor.snapshot.credential_pending);
+    assert!(!actor.snapshot.busy);
+    assert!(!actor.settings.remember_password);
+    assert_eq!(actor.password.as_deref(), Some("FIRST_SECRET_SENTINEL"));
+    let mut next = actor.settings.clone();
+    next.remember_password = true;
+    next.device_port = 1234;
+    actor
+        .action(GuiAction::ApplySettings {
+            settings: next,
+            password: "SECOND_SECRET_SENTINEL".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(actor.settings.device_port, 1234);
+    assert_eq!(actor.password.as_deref(), Some("SECOND_SECRET_SENTINEL"));
+    assert_eq!(*gate.calls.lock().unwrap(), ["set"]);
+    actor.pending_credential.as_mut().unwrap().deadline = Instant::now();
+    actor.poll_credentials();
+    assert!(actor.snapshot.message.contains("unconfirmed"));
+    assert!(actor.snapshot.credential_pending);
+    assert!(actor.action(GuiAction::ForgetPassword).await.is_err());
+    actor.action(GuiAction::Doctor).await.unwrap();
+    assert!(!actor.snapshot.checks.is_empty());
+    gate.release();
+    finish_credentials(&mut actor).await;
+    assert!(!actor.settings.remember_password);
+    assert_eq!(actor.password.as_deref(), Some("SECOND_SECRET_SENTINEL"));
+    assert_eq!(
+        gate.value.lock().unwrap().as_deref(),
+        Some("FIRST_SECRET_SENTINEL")
+    );
+    assert!(actor.snapshot.message.contains("previous session password"));
+    let saved = config::read_regular(&actor.state_dir.join("gui-settings.toml"), true).unwrap();
+    assert!(!saved.contains("SECRET_SENTINEL"));
+    for event in events.try_iter() {
+        assert!(!format!("{event:?}").contains("SECRET_SENTINEL"));
+    }
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn late_password_restore_never_replaces_an_entered_session_password() {
+    let (mut actor, _events) = actor();
+    let (worker, gate) = delayed_credentials(Some("OLD_SECRET_SENTINEL".into()));
+    actor.store = worker;
+    actor.settings.remember_password = true;
+    actor.restore_password();
+    gate.wait_entered().await;
+    actor
+        .use_form(actor.settings.clone(), "NEW_SECRET_SENTINEL".into())
+        .unwrap();
+    gate.release();
+    finish_credentials(&mut actor).await;
+    assert_eq!(actor.password.as_deref(), Some("NEW_SECRET_SENTINEL"));
+    assert!(actor.snapshot.message.contains("result ignored"));
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn late_forget_confirmation_preserves_a_newer_session_password() {
+    let (mut actor, events) = actor();
+    let (worker, gate) = delayed_credentials(Some("OLD_FORGET_SECRET_SENTINEL".into()));
+    actor.store = worker;
+    actor.password = Some("OLD_FORGET_SECRET_SENTINEL".into());
+    actor.settings.remember_password = true;
+    config::save_settings(&actor.state_dir, &actor.settings).unwrap();
+    actor.action(GuiAction::ForgetPassword).await.unwrap();
+    gate.wait_entered().await;
+    actor
+        .use_form(actor.settings.clone(), "NEW_SESSION_SECRET_SENTINEL".into())
+        .unwrap();
+    gate.release();
+    finish_credentials(&mut actor).await;
+    assert_eq!(
+        actor.password.as_deref(),
+        Some("NEW_SESSION_SECRET_SENTINEL")
+    );
+    assert!(!actor.settings.remember_password);
+    assert!(gate.value.lock().unwrap().is_none());
+    assert!(
+        !config::load_settings(&actor.state_dir, None)
+            .unwrap()
+            .remember_password
+    );
+    assert!(events.try_iter().any(|event| matches!(
+        event,
+        GuiEvent::CredentialChanged {
+            remember_password: false,
+            password_forgotten: false
+        }
+    )));
+    cleanup(actor);
+}
+
+async fn wait_snapshot(
+    latest: &Arc<Mutex<Option<GuiSnapshot>>>,
+    predicate: impl Fn(&GuiSnapshot) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if latest.lock().unwrap().as_ref().is_some_and(&predicate) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pending_secret_prompt_keeps_pause_stop_start_and_quit_responsive() {
+    use bridge_protocol::{Frame, Message, PhysicalKey};
+    use tokio::io::AsyncWriteExt;
+    let (mut actor, events) = actor();
+    actor.start(false, false).await.unwrap();
+    actor.owned.as_mut().unwrap().ready().await.unwrap();
+    let mut client = authenticated_client(&mut actor).await;
+    actor.action(GuiAction::Enable).await.unwrap();
+    client
+        .write_all(
+            &Frame {
+                sequence: 2,
+                message: Message::KeyDown {
+                    key: PhysicalKey::A,
+                    modifiers: 0,
+                },
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while control::send(&actor.state_dir, "status")
+            .await
+            .unwrap()
+            .status
+            .events
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (worker, gate) = delayed_credentials(None);
+    actor.store = worker;
+    let mut settings = actor.settings.clone();
+    settings.remember_password = true;
+    let (commands, receiver) = async_mpsc::channel(4);
+    let (safety, safety_rx) = watch::channel(SafetyState::default());
+    let handle = ServiceHandle {
+        commands,
+        events,
+        latest: actor.latest.clone(),
+        quit: actor.quit.clone(),
+        thread: None,
+        safety,
+        permit: actor.permit.clone(),
+    };
+    let latest = actor.latest.clone();
+    let directory = actor.state_dir.clone();
+    let quit_rx = actor.quit.subscribe();
+    let task = tokio::spawn(async move {
+        actor.run(receiver, quit_rx, safety_rx).await;
+        actor
+    });
+    handle
+        .send(GuiAction::SaveSettings {
+            settings,
+            password: "PENDING_SECRET_SENTINEL".into(),
+        })
+        .unwrap();
+    gate.wait_entered().await;
+    wait_snapshot(&latest, |snapshot| {
+        snapshot.credential_pending && !snapshot.busy
+    })
+    .await;
+    handle.send(GuiAction::Pause).unwrap();
+    wait_snapshot(&latest, |snapshot| {
+        snapshot.status.as_ref().is_some_and(|s| !s.enabled)
+    })
+    .await;
+    assert!(!handle.permit.allow.load(Ordering::Acquire));
+    assert!(control::send(&directory, "status").await.unwrap().ok);
+    handle.send(GuiAction::Stop).unwrap();
+    wait_snapshot(&latest, |snapshot| snapshot.phase == GuiPhase::Idle).await;
+    assert!(!directory.join("runtime.json").exists());
+    handle
+        .send(GuiAction::Start {
+            deploy: false,
+            allow_reset: false,
+        })
+        .unwrap();
+    wait_snapshot(&latest, |snapshot| snapshot.phase == GuiPhase::Running).await;
+    assert!(
+        !latest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+    handle.send(GuiAction::Quit).unwrap();
+    let actor = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(actor.snapshot.quit_ready);
+    assert!(!actor.snapshot.credential_pending);
+    assert!(!actor.settings.remember_password);
+    assert!(!directory.join("runtime.json").exists());
+    assert_eq!(*gate.calls.lock().unwrap(), ["set"]);
+    gate.release();
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn local_removal_waits_for_delete_and_preserves_files_if_hosting_starts() {
+    let (mut actor, _events) = actor();
+    let (worker, gate) = delayed_credentials(Some("DELETE_SECRET_SENTINEL".into()));
+    actor.store = worker;
+    actor.settings.remember_password = true;
+    config::save_settings(&actor.state_dir, &actor.settings).unwrap();
+    actor
+        .action(GuiAction::RemoveLocalData { confirmed: true })
+        .await
+        .unwrap();
+    gate.wait_entered().await;
+    assert!(actor.state_dir.join("gui-settings.toml").exists());
+    actor.start(false, false).await.unwrap();
+    actor.owned.as_mut().unwrap().ready().await.unwrap();
+    gate.release();
+    finish_credentials(&mut actor).await;
+    assert!(actor.owned.is_some());
+    assert!(!actor.settings.remember_password);
+    assert!(actor.state_dir.join("gui-settings.toml").exists());
+    assert!(actor.snapshot.message.contains("removal was cancelled"));
+    actor.stop_owned().await.unwrap();
+    cleanup(actor);
+}
+
+#[tokio::test]
+async fn partial_local_removal_keeps_confirmed_credential_deletion_visible() {
+    let (mut actor, events) = actor();
+    actor.settings.remember_password = true;
+    actor.password = Some("REMOVAL_SECRET_SENTINEL".into());
+    config::save_settings(&actor.state_dir, &actor.settings).unwrap();
+    // An unexpected directory at this owned file path makes remove_file fail
+    // without needing platform-specific permission changes or root behavior.
+    std::fs::create_dir(actor.state_dir.join("pairing.key")).unwrap();
+    actor
+        .action(GuiAction::RemoveLocalData { confirmed: true })
+        .await
+        .unwrap();
+    finish_credentials(&mut actor).await;
+    assert!(!actor.settings.remember_password);
+    assert!(actor.password.is_none());
+    assert!(actor.state_dir.join("pairing.key").is_dir());
+    assert!(actor.snapshot.message.contains("some local files"));
+    assert!(events.try_iter().any(|event| matches!(
+        event,
+        GuiEvent::CredentialChanged {
+            remember_password: false,
+            password_forgotten: true
+        }
+    )));
+    cleanup(actor);
+}
+
 async fn authenticated_client(actor: &mut Actor) -> tokio::net::TcpStream {
     use bridge_protocol::{Frame, MatrixState, Message};
     use tokio::io::AsyncWriteExt;
@@ -670,28 +1048,32 @@ async fn smoke_guards_reject_disruptive_requests_before_contacting_devices() {
     cleanup(actor);
 }
 
-#[test]
-fn failed_secret_save_keeps_new_value_in_memory_without_plaintext_settings() {
+#[tokio::test]
+async fn failed_secret_save_keeps_new_value_in_memory_without_plaintext_settings() {
     let (mut actor, events) = actor();
-    actor.store = Box::new(MemorySecretStore {
+    actor.store = CredentialWorker::new(Box::new(MemorySecretStore {
         fail_set: true,
         ..Default::default()
-    });
+    }));
     let mut settings = actor.settings.clone();
     settings.remember_password = true;
     let sentinel = "SECRET_SENTINEL$password";
     actor.save_form(settings, sentinel.into()).unwrap();
+    finish_credentials(&mut actor).await;
     assert_eq!(actor.password.as_deref(), Some(sentinel));
     assert!(!actor.settings.remember_password);
     let file = config::read_regular(&actor.state_dir.join("gui-settings.toml"), true).unwrap();
     assert!(!file.contains(sentinel));
-    assert!(
-        actor
-            .store
-            .get(&actor.settings.credential_id)
-            .unwrap()
-            .is_none()
-    );
+    let stored = actor
+        .store
+        .request(CredentialOperation::Get {
+            id: actor.settings.credential_id.clone(),
+        })
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(stored, CredentialValue::Password(None)));
     for event in events.try_iter() {
         assert!(!format!("{event:?}").contains(sentinel));
     }
@@ -703,13 +1085,15 @@ async fn failed_secret_delete_does_not_claim_password_was_forgotten() {
     let (mut actor, _events) = actor();
     actor.settings.remember_password = true;
     actor.password = Some("SECRET_SENTINEL_old".into());
-    actor.store = Box::new(MemorySecretStore {
+    actor.store = CredentialWorker::new(Box::new(MemorySecretStore {
         value: actor.password.clone(),
         fail_delete: true,
         ..Default::default()
-    });
+    }));
     config::save_settings(&actor.state_dir, &actor.settings).unwrap();
-    assert!(actor.action(GuiAction::ForgetPassword).await.is_err());
+    actor.action(GuiAction::ForgetPassword).await.unwrap();
+    finish_credentials(&mut actor).await;
+    assert!(actor.snapshot.message.contains("deletion failed"));
     assert!(actor.settings.remember_password);
     assert!(actor.password.is_some());
     assert!(
@@ -916,6 +1300,7 @@ async fn explicit_local_data_reset_preserves_imports_and_rejects_stale_forms() {
         .action(GuiAction::RemoveLocalData { confirmed: true })
         .await
         .unwrap();
+    finish_credentials(&mut actor).await;
     assert!(!profile.exists());
     assert!(!actor.state_dir.join("pairing.key").exists());
     assert!(imported.exists());
@@ -935,17 +1320,17 @@ async fn explicit_local_data_reset_preserves_imports_and_rejects_stale_forms() {
 async fn failed_credential_reset_preserves_private_files_and_running_start_is_protected() {
     let (mut actor, _events) = actor();
     config::save_settings(&actor.state_dir, &actor.settings).unwrap();
-    actor.store = Box::new(MemorySecretStore {
+    actor.store = CredentialWorker::new(Box::new(MemorySecretStore {
         fail_delete: true,
         ..Default::default()
-    });
+    }));
     let before = config::read_regular(&actor.state_dir.join("gui-settings.toml"), true).unwrap();
-    assert!(
-        actor
-            .action(GuiAction::RemoveLocalData { confirmed: true })
-            .await
-            .is_err()
-    );
+    actor
+        .action(GuiAction::RemoveLocalData { confirmed: true })
+        .await
+        .unwrap();
+    finish_credentials(&mut actor).await;
+    assert!(actor.snapshot.message.contains("deletion failed"));
     assert_eq!(
         before,
         config::read_regular(&actor.state_dir.join("gui-settings.toml"), true).unwrap()
@@ -962,16 +1347,17 @@ async fn failed_credential_reset_preserves_private_files_and_running_start_is_pr
     cleanup(actor);
 }
 
-#[test]
-fn locked_saved_credentials_do_not_leak_or_silently_fall_back_to_plaintext() {
+#[tokio::test]
+async fn locked_saved_credentials_do_not_leak_or_silently_fall_back_to_plaintext() {
     let (mut actor, events) = actor();
     actor.settings.remember_password = true;
-    actor.store = Box::new(MemorySecretStore {
+    actor.store = CredentialWorker::new(Box::new(MemorySecretStore {
         value: Some("LOCKED_SENTINEL_SECRET".into()),
         fail_get: true,
         ..Default::default()
-    });
+    }));
     actor.restore_password();
+    finish_credentials(&mut actor).await;
     assert!(actor.password.is_none());
     assert!(actor.settings.remember_password);
     assert!(actor.snapshot.message.contains("locked or unavailable"));
