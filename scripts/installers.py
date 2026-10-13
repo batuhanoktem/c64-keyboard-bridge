@@ -19,6 +19,21 @@ def run(*args, **kwargs):
     return subprocess.run([str(arg) for arg in args], check=True, **kwargs)
 
 
+def normalize_payload_permissions(payload, executable_paths=()):
+    """Data never inherits upstream executable bits; only named frontends can execute."""
+    executable_paths = set(executable_paths)
+    for path in [payload, *payload.rglob("*")]:
+        if path.is_symlink():
+            raise ValueError("Binary payload contains an unsupported symbolic link")
+        if path.is_dir():
+            path.chmod(0o755)
+        elif path.is_file():
+            relative = path.relative_to(payload).as_posix()
+            path.chmod(0o755 if relative in executable_paths else 0o644)
+        else:
+            raise ValueError("Binary payload contains an unsupported special entry")
+
+
 def macos_bundle(payload, version, minimum):
     app = payload / APP_NAME
     executables = app / "Contents/MacOS"
@@ -47,6 +62,8 @@ def macos_bundle(payload, version, minimum):
         "NSHumanReadableCopyright": "GPL-3.0-only; C64 Keyboard Bridge contributors",
     }
     (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info, sort_keys=True))
+    normalize_payload_permissions(app, {"Contents/MacOS/" + name for name in
+                                       ("c64-keyboard-bridge", "c64-keyboard-bridge-gui")})
     return app
 
 
@@ -107,6 +124,7 @@ def windows_installer(payload, output, version):
     notices = payload / "third-party/nsis"
     notices.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / "installers/nsis-notices/COPYING", notices / "COPYING")
+    normalize_payload_permissions(payload, ("c64-keyboard-bridge.exe", "c64-keyboard-bridge-gui.exe"))
     with tempfile.TemporaryDirectory(prefix="c64-keyboard-bridge-nsis-", dir=ROOT / "target/package-staging") as temporary:
         manifest = Path(temporary) / "uninstall-files.nsh"
         lines = []
@@ -130,6 +148,7 @@ def linux_deb(payload, output, version, architecture):
         stage = Path(temporary)
         library = stage / "usr/lib/c64-keyboard-bridge"
         shutil.copytree(payload, library)
+        normalize_payload_permissions(library, ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"))
         executable = stage / "usr/bin"
         executable.mkdir(parents=True)
         for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui"):
@@ -144,6 +163,8 @@ def linux_deb(payload, output, version, architecture):
         scalable = stage / "usr/share/icons/hicolor/scalable/apps"
         scalable.mkdir(parents=True)
         shutil.copy2(ROOT / "assets/c64-keyboard-bridge.svg", scalable / "com.flameliongames.c64keyboardbridge.svg")
+        for directory in (desktop, icons, scalable):
+            normalize_payload_permissions(directory)
         control = stage / "DEBIAN"
         control.mkdir()
         size = sum(path.stat().st_size for path in stage.rglob('*') if path.is_file()) // 1024

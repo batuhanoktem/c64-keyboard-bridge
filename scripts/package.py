@@ -370,6 +370,8 @@ def main() -> None:
             copy_file(ROOT / "assets/c64-keyboard-bridge.png", binary / "assets/c64-keyboard-bridge.png")
             copy_file(ROOT / "assets/c64-keyboard-bridge.svg", binary / "assets/c64-keyboard-bridge.svg")
             (binary / "build-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+            INSTALLERS["normalize_payload_permissions"](binary,
+                {name + suffix for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui")})
             app = None
             if macos_minimum:
                 app = INSTALLERS["macos_bundle"](binary, version, macos_minimum)
