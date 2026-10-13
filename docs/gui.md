@@ -15,7 +15,7 @@ Installing a Linux package does not grant `/dev/uinput` access, load modules or 
 
 Uninstall removes program files and shortcuts and preserves private settings, pairing state and OS-vault credentials. Use **Forget saved password** to remove the credential deliberately. **Reset local bridge data** separately confirms removal of saved GUI settings, pairing state, GUI-owned profiles and saved credentials while hosting is stopped. It preserves imported `.env` files and external/exported profiles and requires fresh C64 pairing/deployment afterward.
 
-The renamed commands are `c64-keyboard-bridge` and `c64-keyboard-bridge-gui`; no `c64bridge` alias is installed. On Windows, uninstall an older **C64 Keyboard Bridge** package through its existing uninstaller before installing this renamed build. This preserves settings and removes only that package’s recorded files. The new installer does not delete an unrelated `c64bridge` executable, including one installed by the separate C64 Bridge project.
+The renamed commands are `c64-keyboard-bridge` and `c64-keyboard-bridge-gui`; no `c64bridge` alias is installed. On Windows, uninstall an older **C64 Keyboard Bridge** package through its existing uninstaller before installing this renamed build. This preserves settings and removes only that package’s recorded files. The new installer does not delete an unrelated `c64bridge` executable, owned by another installation.
 
 ## macOS setup
 
@@ -58,7 +58,7 @@ The export path defaults to `c64bridge-diagnostics.json` inside the selected pri
 
 ## Signing and acceptance
 
-Ordinary CI builds unsigned packages. The protected release pipeline signs and notarizes both Mac architectures after the repository owner approves access to its environment secrets. The signing key is temporarily imported into an isolated runner Keychain and removed before artifact promotion completes. Keys are never included in source or application packages. Windows installers remain unsigned until a Windows certificate is supplied. See [secure release preparation](secure-releases.md) for credential provisioning, verification and the draft/publication gate. Local signed-only development packages are labelled separately and do not satisfy the public Mac release gate.
+Ordinary CI builds unsigned packages. The protected release pipeline signs and notarizes both Mac architectures after the repository owner approves access to its environment secrets. The signing key is temporarily imported into an isolated runner Keychain and removed before artifact promotion completes. Keys are never included in source or application packages. Windows installers remain unsigned until a Windows certificate is supplied. See [builds and release verification](build-and-release.md) for verification and the draft/publication gate. Local signed-only development packages are labelled separately and do not satisfy the public Mac release gate.
 
 GUI rendering smoke tests use recording services and private graphical fixtures. They do not exercise native input-source APIs. Separate read-only macOS regressions cover service/worker layout queries through the CLI main-queue broker (`bridge-host` example `macos-layout-probe`) and actual GUI service initialization and Doctor (`bridge-gui` example `macos-service-probe`). These native checks request no permission, access no credential store, contact no C64 and post no input, covering the background-service path that recording-only smoke omits.
 
@@ -68,4 +68,4 @@ Existing CLI hardware observations do not establish native GUI input acceptance,
 
 The public app ID is `com.flameliongames.c64keyboardbridge`. Existing state directories and saved credential references remain compatible. macOS may require renewed posting, Local Network or Keychain authorization after replacing an older app; check the current GUI process rather than relying on an earlier CLI grant.
 
-See the [screenshot gallery](screenshots.md), [device compatibility](device-compatibility.md) and [future store distribution](store-distribution.md). Older acceptance records retain the command names and hashes actually tested at the time.
+See the [screenshot gallery](screenshots.md), [device compatibility](device-compatibility.md) and [builds and release verification](build-and-release.md). Older acceptance records retain the command names and hashes actually tested at the time.

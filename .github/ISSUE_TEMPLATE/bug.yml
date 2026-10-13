@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a reproducible application, protocol or platform problem.
+body:
+  - type: markdown
+    attributes:
+      value: Use Security → Report a vulnerability for security issues. Exclude passwords, tokens, addresses, raw key traces and personal paths.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Platform and backend
+      description: Include OS, architecture, desktop/session type, backend, host layout and device firmware if relevant. No machine names or addresses are needed.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction and expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Prefer a reviewed diagnostic export. Clearly distinguish recording tests, emulator checks and physical observations.

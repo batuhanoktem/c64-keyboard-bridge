@@ -46,9 +46,29 @@ class PackagingTests(unittest.TestCase):
                      "installers/windows/c64bridge.nsi", "installers/linux/com.flameliongames.c64keyboardbridge.desktop"]:
             self.assertIn(name, names)
         self.assertTrue(any(name.startswith("crates/bridge-gui/") for name in names))
+        for name in ("CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", "docs/build-and-release.md",
+                     ".github/ISSUE_TEMPLATE/bug.yml", ".github/PULL_REQUEST_TEMPLATE.md"):
+            self.assertIn(name, names)
         self.assertFalse(any(name == ".env" or name.startswith("target/")
                              or Path(name).name in {"pairing-token", "runtime.json", "gui-runtime.json", "gui-settings.toml"}
                              for name in names))
+
+    def test_retired_maintainer_guides_cannot_reenter_packages(self):
+        function = PACKAGE["source_files"]
+        original = function.__globals__["ROOT"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            (fixture / "docs").mkdir()
+            for name in ("secure-releases.md", "store-distribution.md", "build-and-release.md"):
+                (fixture / "docs" / name).write_text("synthetic documentation fixture")
+            try:
+                function.__globals__["ROOT"] = fixture
+                names = {path.relative_to(fixture).as_posix() for path in function()}
+            finally:
+                function.__globals__["ROOT"] = original
+            self.assertIn("docs/build-and-release.md", names)
+            self.assertNotIn("docs/secure-releases.md", names)
+            self.assertNotIn("docs/store-distribution.md", names)
 
     def test_macos_bundle_contains_both_frontends_and_resources(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -24,7 +24,8 @@ REVISION = PRGS["CC65_REVISION"]
 SUPPORTED_TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu",
                      "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc")
 ROOT_FILES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE",
-              "THIRD_PARTY_NOTICES.md", ".env.example", ".gitignore")
+              "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", ".env.example", ".gitignore")
+PRIVATE_MAINTAINER_DOCS = {"docs/secure-releases.md", "docs/store-distribution.md"}
 SOURCE_FOLDERS = {
     "crates": {".rs", ".toml", ".md"},
     "c64": {".c", ".h", ".s", ".md", ".py", ".sh", ".cfg", ".txt"},
@@ -93,6 +94,8 @@ def source_files() -> list[Path]:
     for folder, extensions in SOURCE_FOLDERS.items():
         for path in (ROOT / folder).rglob("*"):
             relative = path.relative_to(ROOT)
+            if relative.as_posix() in PRIVATE_MAINTAINER_DOCS:
+                continue
             if any(part in {"build", "target", ".git", "__pycache__", "node_modules"} for part in relative.parts):
                 continue
             if (path.is_file() and not path.is_symlink()
@@ -350,7 +353,7 @@ def main() -> None:
                 INSTALLERS["macos_sign_binaries"](binary, INSTALLERS["SIGNING_IDENTITY"])
                 provenance["executables"] = {name: hash_file(binary / name)
                                             for name in ("c64-keyboard-bridge", "c64-keyboard-bridge-gui")}
-            for name in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", ".env.example"):
+            for name in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", ".env.example"):
                 copy_file(ROOT / name, binary / name)
             for path in files:
                 relative = path.relative_to(ROOT)

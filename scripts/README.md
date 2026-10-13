@@ -67,7 +67,7 @@ python3 scripts/cli-smoke.py --binary target/release/c64-keyboard-bridge
 
 Native packaging produces an `.app` plus DMG on each Mac architecture, a per-user NSIS installer on Windows x64 and an Ubuntu 24.04+ DEB on each Linux architecture. Windows packaging downloads the checksum-pinned official NSIS 3.13 portable compiler under `target/tools/` and checks `v3.13` before execution. Its Zlib runtime notices accompany the installer. Linux requires `dpkg-deb`; packages have no maintainer scripts, uinput permission changes or automatic startup. `installer-smoke.py target/dist` mounts DMGs read-only, silently installs/uninstalls NSIS on the ephemeral CI user, or installs/purges DEBs under a private dpkg root, checking that both frontends and resources match the portable package.
 
-Ordinary CI does not use signing keys. The protected, approved release workflow is documented in [secure releases](../docs/secure-releases.md). Explicit local development signing uses the already provisioned Keychain identity without exporting it:
+Ordinary CI does not use signing keys. The protected, approved release workflow is documented in [builds and release verification](../docs/build-and-release.md). Explicit local development signing uses the already provisioned Keychain identity without exporting it:
 
 ```sh
 scripts/package.sh --binary-only --sign-macos --output target/dist-signed
@@ -89,7 +89,7 @@ Packaging sets `MACOSX_DEPLOYMENT_TARGET` to at least 10.15 for Intel and 11.0 f
 
 The source archive uses an explicit project-source allowlist, excluding private `.env`, runtime state, generated objects and configured PRGs. It includes complete Cargo-vendored dependencies and `.cargo/config.toml`, plus the exact cc65 source tree and a source hash manifest. With build tools already installed, the included sources allow dependency builds without fetching crates or cc65. Rebuilding a source archive uses its included cc65 tree and verifies its original source files before compiling.
 
-CI runs native jobs on macOS ARM64/x86_64, Linux ARM64/x86_64 and Windows x86_64. All GitHub actions are pinned to full commit SHAs. Artifacts are compiled and synthetically checked; native input delivery and physical C64 operation still require the acceptance tests. The ordinary CI workflow never publishes releases. The separate approved release workflow consumes exact tagged-commit artifacts, signs and notarizes both Mac architectures, and prepares a draft by default. Publication requires its explicit `publish` selection and successful final verification; see [secure releases](../docs/secure-releases.md).
+CI runs native jobs on macOS ARM64/x86_64, Linux ARM64/x86_64 and Windows x86_64. All GitHub actions are pinned to full commit SHAs. Artifacts are compiled and synthetically checked; native input delivery and physical C64 operation still require the acceptance tests. The ordinary CI workflow never publishes releases. The separate approved release workflow consumes exact tagged-commit artifacts, signs and notarizes both Mac architectures, and prepares a draft by default. Publication requires its explicit `publish` selection and successful final verification; see [builds and release verification](../docs/build-and-release.md).
 
 ## Isolated desktop GUI check
 

@@ -100,4 +100,4 @@ The fake host forces loopback, the recording backend, and no device contact or d
 
 Read [mappings](docs/mappings.md), [protocol](docs/protocol.md), [architecture and firmware evidence](docs/architecture.md), [security](docs/security.md), [troubleshooting](docs/troubleshooting.md), and [hardware acceptance tests](docs/hardware-testing.md) for the practical limits and validation procedure.
 
-See [device compatibility](docs/device-compatibility.md), [secure release preparation](docs/secure-releases.md) and [future store distribution](docs/store-distribution.md).
+See [device compatibility](docs/device-compatibility.md), [builds and release verification](docs/build-and-release.md), [contributing](CONTRIBUTING.md) and [the changelog](CHANGELOG.md).

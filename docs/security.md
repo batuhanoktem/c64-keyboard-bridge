@@ -22,4 +22,4 @@ The retained session `diagnostics` object contains typed reasons, counters, phas
 
 `LOG_LEVEL=debug` records physical C64 key identities, worker decisions and accepted Windows native key events, including repeat. These traces can reveal text typed through the bridge. Keep them private and review them before sharing; credentials and Unicode action content are not logged by these traces.
 
-Signing and notarization credentials are separate from C64 REST passwords and pairing tokens. Only the approved release environment can supply Apple credentials to its signing job; ordinary CI and PR checks remain unsigned. See [secure release preparation](secure-releases.md).
+Signing and notarization credentials are separate from C64 REST passwords and pairing tokens. Only the approved release environment can supply Apple credentials to its signing job; ordinary CI and PR checks remain unsigned. See [builds and release verification](build-and-release.md).
