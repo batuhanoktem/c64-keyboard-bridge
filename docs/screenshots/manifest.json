@@ -50,6 +50,19 @@
       "native_input": false
     },
     {
+      "file": "macos-password-store-waiting.png",
+      "platform": "macOS ARM64",
+      "origin": "actual GUI, isolated recording fixture, simulated password-store delay",
+      "theme": "light",
+      "width": 2400,
+      "height": 1992,
+      "sha256": "668e567751cc7951b763c92f09890ec414701998d385cd5d701559cc41a72665",
+      "capture_revision": "792633a385dc5e2f6d3537ff629edc6b29608d18",
+      "simulated_credential_pending": true,
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
       "file": "macos-dark.png",
       "platform": "macOS ARM64",
       "origin": "actual GUI, isolated recording fixture",
@@ -140,6 +153,20 @@
       "height": 1100,
       "sha256": "843731a5348c0f3f09f703a5ac345068e213f2ef7fde589a505a99bb2bd97645",
       "capture_revision": "020fb9dbf40ab07c7026c69e28359d38dea6afe3",
+      "hardware_contacted": false,
+      "native_input": false
+    },
+    {
+      "file": "ubuntu-password-store-waiting.png",
+      "platform": "Ubuntu",
+      "origin": "actual GUI, native Wayland, isolated recording services, simulated password-store delay",
+      "theme": "light",
+      "width": 1200,
+      "height": 1100,
+      "sha256": "c622d9ff4d54efa5e73abfb4e82724032eb47b6c8d214cea2cec2e5a1cd53af1",
+      "capture_revision": "b0f378da13e6a1114f7eb4987ed155c25fba4633",
+      "application_source_revision": "792633a385dc5e2f6d3537ff629edc6b29608d18",
+      "simulated_credential_pending": true,
       "hardware_contacted": false,
       "native_input": false
     }

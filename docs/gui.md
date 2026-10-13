@@ -52,6 +52,12 @@ SHIFT LOCK uses the observed Shift matrix state and cannot be mapped independent
 
 **Remember password** is opt-in and uses macOS Keychain, Windows Credential Manager or Linux Secret Service. The private settings file stores a credential reference rather than a password. Credential requests run separately from networking and input cleanup. While the store is responding, connection checks and hosting remain available using the session password; a delayed store response never claims that saving or deletion succeeded. An unavailable or locked store leaves the supplied password in memory and reports the failure; there is no plaintext fallback. **Forget saved password** reports deletion failure rather than claiming success.
 
+On macOS, Windows and Linux, the waiting state keeps **Start host** and **Device information** available while Remember and Forget are disabled. These examples show the actual macOS and Ubuntu GUIs with a simulated password-store delay, empty credentials and recording services; they do not access an OS password store or contact a device.
+
+![Password-store waiting state in the actual macOS GUI, with a simulated delay and connection controls available](screenshots/macos-password-store-waiting.png)
+
+![Password-store waiting state in the actual Ubuntu Wayland GUI, with a simulated delay and connection controls available](screenshots/ubuntu-password-store-waiting.png)
+
 If Linux Secret Service was unavailable on the first credential request, start or unlock the password store and reopen the companion before retrying Remember. Session-only connection remains available without a working password store.
 
 **Diagnostics** shows current phase, failure counters, retained session failure and cleanup outcome, plus a bounded activity history. Exported diagnostics omit passwords, pairing/control tokens, addresses, key identities, matrices and peer-supplied text. Permission checks identify whether the companion or CLI is the posting process. On macOS, grant Device Control and Data Access (Accessibility on older versions) to the process actually sending events; authorizing a terminal for CLI use does not authorize the app automatically. Failed asynchronous actions show a persistent error above the current page, with the activity history retaining the operation's result.
