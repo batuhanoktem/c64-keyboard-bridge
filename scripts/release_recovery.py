@@ -177,7 +177,9 @@ def download_public_promotion(github, proof, destination, identity):
                     and proof["artifact_size"] <= service.MAX_BYTES and isinstance(proof.get("artifact_sha256"), str)
                     and re.fullmatch(r"[a-f0-9]{64}", proof["artifact_sha256"]), "Public promotion download identity is malformed")
     token = os.environ.get("GH_TOKEN", "")
-    service.require(re.fullmatch(r"[A-Za-z0-9_]+", token) is not None, "Scoped GitHub upload token is missing or malformed")
+    # RFC 6750 section 2.1 permits bearer punctuation; curl configuration syntax stays excluded.
+    service.require(0 < len(token) <= 8192 and re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is not None,
+                    "Scoped GitHub upload token is missing or malformed")
     version = service.run("curl", "--disable", "--version").stdout
     match = re.match(rb"curl ([0-9]+)\.([0-9]+)\.([0-9]+)", version)
     service.require(match is not None and tuple(int(part) for part in match.groups()) >= (8, 4, 0),

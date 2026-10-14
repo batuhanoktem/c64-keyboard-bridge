@@ -293,6 +293,52 @@ class RecoveryFixture(unittest.TestCase):
             recovery.download_public_promotion(self.github, {"artifact_id": 91, "artifact_size": 1, "artifact_sha256": "a" * 64},
                                                self.root / "old-curl", self.identity)
 
+    def test_bearer_punctuation_and_jwt_tokens_use_stdin_only_without_config_injection(self):
+        proof = self.proof()
+        tokens = ("ghs_scoped-fixture-token/with+valid.punctuation~",
+                  "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJmaXh0dXJlIn0.signature-_", "token.with~valid+/padding==", "x" * 8192)
+        for index, token in enumerate(tokens):
+            calls = []
+            def recording(*args, **kwargs):
+                arguments = tuple(str(value) for value in args)
+                calls.append(arguments)
+                self.assertNotIn(token, " ".join(arguments))
+                if "--version" in arguments:
+                    return fixtures.completed(stdout=b"curl 8.7.1 fixture\n")
+                self.assertEqual(kwargs["input"], ('header = "Authorization: Bearer ' + token
+                    + '"\nheader = "Accept: application/vnd.github+json"\n').encode())
+                self.assertNotIn("--location-trusted", arguments)
+                self.assertNotIn("--verbose", arguments)
+                Path(arguments[arguments.index("--output") + 1]).write_bytes(self.outer.read_bytes())
+                return fixtures.completed()
+            destination = self.root / ("punctuated-token-" + str(index))
+            with self.environment({"GH_TOKEN": token}), patch.object(service, "run", side_effect=recording):
+                recovery.download_public_promotion(self.github, proof, destination, self.identity)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual({path.name for path in destination.iterdir()}, recovery.promoted_names(self.identity))
+
+    def test_missing_oversized_and_config_injection_bearer_tokens_fail_before_curl_without_value_leaks(self):
+        proof = self.proof()
+        tokens = ("", "x" * 8193, "token\x00", "token\x01", "token\t", "token\n", "token\r", 'token"',
+                  "token\\", "token with space", "token=interior", "=padding-only", "token:colon", "token\u00e9",
+                  'fixture\"\nheader = \"Authorization: injected', 'fixture\nurl = \"https://example.invalid/\"')
+        for index, token in enumerate(tokens):
+            destination = self.root / ("invalid-token-" + str(index))
+            # A plain fixture mapping also covers NUL, which real OS environments reject.
+            with patch.object(recovery.os, "environ", {"GH_TOKEN": token}), patch.object(service, "run") as run:
+                with self.assertRaises(service.ReleaseError) as caught:
+                    recovery.download_public_promotion(self.github, proof, destination, self.identity)
+            self.assertEqual(str(caught.exception), "Scoped GitHub upload token is missing or malformed")
+            if token:
+                self.assertNotIn(token, str(caught.exception))
+            run.assert_not_called()
+            self.assertFalse(destination.exists())
+        with self.environment(), patch.dict(os.environ):
+            os.environ.pop("GH_TOKEN", None)
+            with patch.object(service, "run") as run, self.assertRaisesRegex(service.ReleaseError, "missing or malformed"):
+                recovery.download_public_promotion(self.github, proof, self.root / "missing-token", self.identity)
+            run.assert_not_called()
+
     def test_native_signature_staple_and_leaf_checks_cover_both_frontends_without_signing(self):
         with patch.object(recovery.platform, "system", return_value="Darwin"), patch.object(service, "run", side_effect=self.recording):
             checks = recovery.verify_public_macos(self.promoted, self.identity)
