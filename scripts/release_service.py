@@ -17,6 +17,7 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import time
 import tomllib
 import uuid
 from urllib.parse import quote, unquote, urlsplit
@@ -116,6 +117,9 @@ def tool_diagnostic(arguments, operation=None, exit_code=None, role=None, stderr
                            if any(marker in stderr for marker in markers)), None)
             if reason is not None:
                 fields.append("reason=" + reason)
+    elif tool == "xcrun" and operation in {"staple", "validate-staple"}:
+        if isinstance(role, str) and role in {"app-bundle", "dmg"}:
+            fields.append("role=" + role)
     return " (" + ", ".join(fields) + ")"
 
 
@@ -769,16 +773,39 @@ def notarize(path, credentials, profile=None):
         arguments += ["--key", credentials["api_path"], "--key-id", key_id, "--issuer", issuer]
     response = json_output(run(*arguments, timeout=1900))
     require(response.get("status") == "Accepted", "Apple has not accepted notarization; publication is blocked")
+    receipt = {"status": "Accepted", "submission_id": response.get("id", "")}
+    validate_accepted_notarization(receipt)
+    return {"status": "Accepted", "submission_id": str(uuid.UUID(receipt["submission_id"]))}
+
+
+def validate_accepted_notarization(receipt):
+    require(isinstance(receipt, dict) and set(receipt) == {"status", "submission_id"}
+            and receipt.get("status") == "Accepted", "Accepted notarization is required before stapling")
     try:
-        submission = str(uuid.UUID(response.get("id", "")))
+        uuid.UUID(receipt.get("submission_id", ""))
     except (ValueError, TypeError, AttributeError):
         raise ReleaseError("Notarization acceptance receipt is invalid") from None
-    return {"status": "Accepted", "submission_id": submission}
 
 
-def staple(path):
-    run("xcrun", "stapler", "staple", path)
-    run("xcrun", "stapler", "validate", path)
+def staple(path, receipt, diagnostic_role):
+    """Retry only EX_NOHOST ticket delivery after Apple's valid acceptance receipt."""
+    validate_accepted_notarization(receipt)
+    require(isinstance(diagnostic_role, str) and diagnostic_role in {"app-bundle", "dmg"},
+            "Stapling target role is invalid")
+    command = ("xcrun", "stapler", "staple", path)
+    for attempt in range(3):
+        result = run(*command, timeout=120, allow_nonzero=True, diagnostic_role=diagnostic_role)
+        if result.returncode == 0:
+            break
+        if result.returncode == 68 and attempt < 2:
+            time.sleep((15, 30)[attempt])
+            continue
+        message = "Release tool failed; raw output was suppressed" + tool_diagnostic(
+            command, exit_code=result.returncode, role=diagnostic_role)
+        if result.returncode == 68:
+            message += "; reason=staple-ticket-unavailable; publication is blocked"
+        raise ReleaseError(message)
+    run("xcrun", "stapler", "validate", path, timeout=120, diagnostic_role=diagnostic_role)
 
 
 def verify_portable_macos(archive_path, destination, root, notarized):
@@ -790,7 +817,7 @@ def verify_portable_macos(archive_path, destination, root, notarized):
         run("/usr/bin/codesign", "--verify", "--strict", app / "Contents/MacOS" / name)
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
     if notarized:
-        run("xcrun", "stapler", "validate", app)
+        run("xcrun", "stapler", "validate", app, diagnostic_role="app-bundle")
 
 
 def promote_macos(inputs, output, identity, credentials=None, profile=None, signed_only=False):
@@ -838,7 +865,7 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
                 notary_zip = stage / (target + "-notary.zip")
                 run("/usr/bin/ditto", "-c", "-k", "--keepParent", payload, notary_zip)
                 record["payload"] = notarize(notary_zip, credentials, profile)
-                staple(app)
+                staple(app, record["payload"], "app-bundle")
                 record["app_stapled"] = True
                 run("/usr/sbin/spctl", "--assess", "--type", "execute", app)
             provenance["signing"] = evidence["signing"]
@@ -867,7 +894,7 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
             run("/usr/bin/codesign", "--verify", "--strict", dmg)
             if not signed_only:
                 record["dmg"] = notarize(dmg, credentials, profile)
-                staple(dmg)
+                staple(dmg, record["dmg"], "dmg")
                 record["dmg_stapled"] = True
                 run("/usr/sbin/spctl", "--assess", "--type", "open", "--context", "context:primary-signature", dmg)
             record["files"] = {archive_path.name: sha256(archive_path), dmg.name: sha256(dmg)}

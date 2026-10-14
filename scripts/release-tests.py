@@ -809,6 +809,122 @@ class ReleaseFixture(unittest.TestCase):
         self.assertIs(self.github.existing["prerelease"], False)
 
 
+class StapleTests(unittest.TestCase):
+    receipt = {"status": "Accepted", "submission_id": RECEIPT["id"]}
+
+    def test_ticket_delivery_retry_validates_after_success_without_resubmitting(self):
+        for statuses, delays in (([68, 0], [15]), ([68, 68, 0], [15, 30]), ([0], [])):
+            calls = []
+            status_iter = iter(statuses)
+            def recording(*args, **kwargs):
+                calls.append((args, kwargs))
+                return completed(returncode=next(status_iter)) if args[2] == "staple" else completed()
+            with self.subTest(statuses=statuses), patch.object(service, "run", side_effect=recording), \
+                    patch.object(service.time, "sleep") as sleeper:
+                service.staple(Path("fixture.app"), self.receipt, "app-bundle")
+            self.assertEqual([call.args[0] for call in sleeper.call_args_list], delays)
+            self.assertEqual([args[:3] for args, _kwargs in calls],
+                             [("xcrun", "stapler", "staple")] * len(statuses) + [("xcrun", "stapler", "validate")])
+            self.assertTrue(all(kwargs["timeout"] == 120 and kwargs["diagnostic_role"] == "app-bundle"
+                                for _args, kwargs in calls))
+            self.assertTrue(all(kwargs["allow_nonzero"] for _args, kwargs in calls[:-1]))
+            self.assertNotIn("allow_nonzero", calls[-1][1])
+
+    def test_exhausted_ticket_delivery_is_bounded_and_blocks_validation(self):
+        with patch.object(service, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 68)) as runner, \
+                patch.object(service.time, "sleep") as sleeper, \
+                self.assertRaisesRegex(service.ReleaseError, "staple-ticket-unavailable") as error:
+            service.staple(Path("/private/" + SENTINEL), self.receipt, "dmg")
+        self.assertEqual(runner.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleeper.call_args_list], [15, 30])
+        self.assertTrue(all(call.args[2] == "staple" for call in runner.call_args_list))
+        self.assertNotIn(SENTINEL, str(error.exception))
+
+    def test_other_staple_errors_and_timeouts_never_retry_or_validate(self):
+        for status in (65, 66, 73, 77):
+            with self.subTest(status=status), patch.object(service, "run", return_value=completed(returncode=status)) as runner, \
+                    patch.object(service.time, "sleep") as sleeper, self.assertRaises(service.ReleaseError):
+                service.staple(Path("fixture.app"), self.receipt, "app-bundle")
+            self.assertEqual(runner.call_count, 1)
+            self.assertEqual(runner.call_args.args[2], "staple")
+            sleeper.assert_not_called()
+        with patch.object(service, "run", side_effect=service.ReleaseError("Release tool could not complete; raw output was suppressed")) as runner, \
+                patch.object(service.time, "sleep") as sleeper, self.assertRaises(service.ReleaseError):
+            service.staple(Path("fixture.app"), self.receipt, "app-bundle")
+        self.assertEqual(runner.call_count, 1)
+        sleeper.assert_not_called()
+
+    def test_validation_failure_is_strict_and_never_retried(self):
+        calls = []
+        def recording(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[2] == "validate":
+                raise service.ReleaseError("Fixture staple validation failure")
+            return completed()
+        with patch.object(service, "run", side_effect=recording), patch.object(service.time, "sleep") as sleeper, \
+                self.assertRaisesRegex(service.ReleaseError, "validation"):
+            service.staple(Path("fixture.dmg"), self.receipt, "dmg")
+        self.assertEqual([args[2] for args, _kwargs in calls], ["staple", "validate"])
+        self.assertNotIn("allow_nonzero", calls[-1][1])
+        sleeper.assert_not_called()
+
+    def test_invalid_acceptance_or_role_blocks_every_process_and_wait(self):
+        invalid = (None, {}, {"status": "In Progress", "submission_id": RECEIPT["id"]},
+                   {"status": "Rejected", "submission_id": RECEIPT["id"]},
+                   {"status": "Accepted", "submission_id": SENTINEL},
+                   {"status": "Accepted", "submission_id": None},
+                   {**self.receipt, "peer_text": SENTINEL})
+        for receipt in invalid:
+            with self.subTest(receipt=receipt), patch.object(service, "run") as runner, \
+                    patch.object(service.time, "sleep") as sleeper, self.assertRaises(service.ReleaseError) as error:
+                service.staple(Path("fixture.app"), receipt, "app-bundle")
+            runner.assert_not_called()
+            sleeper.assert_not_called()
+            self.assertNotIn(SENTINEL, str(error.exception))
+        with patch.object(service, "run") as runner, self.assertRaises(service.ReleaseError) as error:
+            service.staple(Path("fixture.app"), self.receipt, SENTINEL)
+        runner.assert_not_called()
+        self.assertNotIn(SENTINEL, str(error.exception))
+
+    def test_rejected_notarization_never_reaches_stapling(self):
+        with patch.object(service, "run", return_value=completed(json.dumps({**RECEIPT, "status": "Rejected"}).encode())) as runner, \
+                patch.object(service, "staple") as stapler, self.assertRaisesRegex(service.ReleaseError, "not accepted"):
+            receipt = service.notarize(Path("fixture.zip"), None, "fixture")
+            service.staple(Path("fixture.app"), receipt, "app-bundle")
+        self.assertEqual(runner.call_count, 1)
+        stapler.assert_not_called()
+
+    def test_cancel_during_ticket_wait_restores_scope_and_scrubs_credentials_without_public_receipt(self):
+        fixture = ReleaseFixture("test_signing_uses_approved_certificate_and_never_executes_package")
+        fixture.setUp()
+        credentials_test = CredentialTests("test_fixture_environment_preserves_os_process_launch_state")
+        directory = fixture.root / "c64-keyboard-bridge-signing"
+        prior = ["/fixture/original.keychain-db"]
+        scope, _calls, security_runner = credentials_test.keychain_scope_fixture(prior)
+        calls = []
+        def recording(*args, **kwargs):
+            calls.append(args[:3])
+            if args[:3] == ("xcrun", "stapler", "staple"):
+                return completed(SENTINEL.encode(), SENTINEL.encode(), 68)
+            if args[:2] == ("/usr/bin/security", "-i") or args[:2] in {
+                    ("/usr/bin/security", "list-keychains"), ("/usr/bin/security", "delete-keychain")}:
+                return security_runner(*args, **kwargs)
+            return fixture.fake_mac(*args, **kwargs)
+        output = fixture.root / "cancelled-ticket-promotion"
+        try:
+            with patch.object(service, "run", side_effect=recording), fixture_environment(), \
+                    patch.object(service.time, "sleep", side_effect=KeyboardInterrupt()), self.assertRaises(KeyboardInterrupt):
+                with service.signing_credentials(directory, credentials_test.signing_fixture_environment()) as credentials:
+                    service.promote_macos(fixture.inputs, output, fixture.identity, credentials, profile="fixture")
+            self.assertEqual(scope, prior)
+            self.assertFalse(directory.exists())
+            self.assertFalse((output / "promotion.metadata.json").exists())
+            self.assertFalse(list(output.glob("*.dmg")))
+            self.assertFalse(any(args == ("xcrun", "stapler", "validate") for args in calls))
+        finally:
+            fixture.tearDown()
+
+
 class CredentialTests(unittest.TestCase):
     def keychain_scope_fixture(self, prior, controls=None):
         controls = {} if controls is None else controls
@@ -994,6 +1110,20 @@ class CredentialTests(unittest.TestCase):
             self.assertIn("reason=" + reason, str(failure.exception))
             self.assertNotIn(SENTINEL, str(failure.exception))
             self.assertNotIn(message.decode(), str(failure.exception))
+
+    def test_stapler_diagnostics_allow_only_fixed_app_and_dmg_roles(self):
+        for verb, operation in (("staple", "staple"), ("validate", "validate-staple")):
+            for role in ("app-bundle", "dmg", "portable-cli", SENTINEL, [SENTINEL]):
+                with self.subTest(verb=verb, role=role), \
+                        patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 68)):
+                    with self.assertRaises(service.ReleaseError) as failure:
+                        service.run("xcrun", "stapler", verb, "/private/" + SENTINEL, diagnostic_role=role)
+                expected = f"Release tool failed; raw output was suppressed (tool=xcrun, operation={operation}, exit_code=68"
+                if isinstance(role, str) and role in {"app-bundle", "dmg"}:
+                    expected += ", role=" + role
+                self.assertEqual(str(failure.exception), expected + ")")
+                self.assertNotIn(SENTINEL, str(failure.exception))
+                self.assertNotIn("/private/", str(failure.exception))
 
     def test_codesign_unknown_output_and_invalid_roles_are_suppressed(self):
         for role in (SENTINEL, {"secret": SENTINEL}, [SENTINEL], None):
