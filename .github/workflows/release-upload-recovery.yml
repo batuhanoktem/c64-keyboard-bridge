@@ -1,0 +1,71 @@
+name: Recover verified release upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable version tag
+        required: true
+        type: string
+      ci_run_id:
+        description: Successful Native checks run for that exact tagged commit
+        required: true
+        type: string
+      promotion_run_id:
+        description: Approved protected release run with successful signing, cleanup and public asset upload
+        required: true
+        type: string
+      publish:
+        description: Explicitly publish after recovered upload and download verification
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: protected-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  upload:
+    name: Verify public promotion and recover upload without Apple credentials
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Run credential-free release and upload recovery fixtures
+        run: |
+          python3 scripts/release-tests.py
+          python3 scripts/release-recovery-tests.py
+      - name: Verify approved public promotion, recover upload and verify downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          PROMOTION_RUN_ID: ${{ inputs.promotion_run_id }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          publish=()
+          if [[ "$PUBLISH" == "true" ]]; then publish=(--publish); fi
+          python3 scripts/release-recovery.py --tag "$RELEASE_TAG" --ci-run "$CI_RUN_ID" --promotion-run "$PROMOTION_RUN_ID" --record target/recovery.metadata.json "${publish[@]}"
+      - name: Retain only the bounded public recovery verification record
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: verified-release-upload-recovery
+          path: target/recovery.metadata.json
+          if-no-files-found: error
+          retention-days: 14

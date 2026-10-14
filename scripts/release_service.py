@@ -388,7 +388,8 @@ class GitHub:
         self.repository = repository
 
     def api(self, suffix):
-        return json_output(run("gh", "api", f"repos/{self.repository}/{suffix}"))
+        endpoint = f"repos/{self.repository}" + ("/" + suffix if suffix else "")
+        return json_output(run("gh", "api", endpoint))
 
     @staticmethod
     def release_record(value):

@@ -33,6 +33,7 @@ fi
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/cli-smoke.py" --binary "$binary"
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/package-tests.py"
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/release-tests.py"
+"$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/release-recovery-tests.py"
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/gui-smoke-tests.py"
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/c64-screenshots-tests.py"
 if [[ "$(uname -s)" == "Darwin" ]]; then
