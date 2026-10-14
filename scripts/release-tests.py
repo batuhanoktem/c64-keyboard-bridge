@@ -684,6 +684,78 @@ class CredentialTests(unittest.TestCase):
                 service.run("fixture")
             self.assertNotIn(SENTINEL, str(result.exception))
 
+    def test_known_tool_failure_reports_only_fixed_phase_and_integer_status(self):
+        cases = (("codesign", "--force", "sign"), ("codesign", "--verify", "verify"),
+                 ("hdiutil", "create", "create-dmg"), ("gh", "api", "api"),
+                 ("security", "find-identity", "find-identity"), ("lipo", "-verify_arch", "verify-architecture"))
+        for tool, verb, operation in cases:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(tool=tool, verb=verb), redirect_stdout(stdout), redirect_stderr(stderr), \
+                    patch.dict(os.environ, {"MACOS_CERTIFICATE_PASSWORD": SENTINEL, "GH_TOKEN": SENTINEL}), \
+                    patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 17)):
+                with self.assertRaises(service.ReleaseError) as failure:
+                    service.run("/private/" + SENTINEL + "/" + tool, verb, SENTINEL, input=SENTINEL.encode(),
+                                env={"PRIVATE_VALUE": SENTINEL}, diagnostic_operation=SENTINEL)
+            message = str(failure.exception)
+            self.assertEqual(message, "Release tool failed; raw output was suppressed "
+                             f"(tool={tool}, operation={operation}, exit_code=17)")
+            self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+            self.assertNotIn(SENTINEL, message)
+
+    def test_unknown_tools_operations_and_noninteger_status_never_reach_diagnostics(self):
+        for executable, verb, status in ((SENTINEL, SENTINEL, 9), ("/private/" + SENTINEL, "--force", 9),
+                                         ("codesign", SENTINEL, 9), ("codesign", "--verify", SENTINEL)):
+            with self.subTest(executable=executable, status=status), \
+                    patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), status)):
+                with self.assertRaises(service.ReleaseError) as failure:
+                    service.run(executable, verb, SENTINEL, diagnostic_operation=SENTINEL)
+            self.assertNotIn(SENTINEL, str(failure.exception))
+            self.assertNotIn("/private/", str(failure.exception))
+            if Path(executable).name != "codesign":
+                self.assertEqual(str(failure.exception), "Release tool failed; raw output was suppressed")
+            if status == SENTINEL:
+                self.assertNotIn("exit_code", str(failure.exception))
+
+    def test_notary_and_staple_failures_have_distinct_safe_phases(self):
+        for arguments, operation in ((('notarytool', 'submit'), 'submit-notarization'),
+                                     (('stapler', 'staple'), 'staple'), (('stapler', 'validate'), 'validate-staple')):
+            with self.subTest(operation=operation), \
+                    patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 3)):
+                with self.assertRaises(service.ReleaseError) as failure:
+                    service.run("xcrun", *arguments, SENTINEL, "--key-id", SENTINEL)
+            self.assertIn("operation=" + operation, str(failure.exception))
+            self.assertIn("exit_code=3", str(failure.exception))
+            self.assertNotIn(SENTINEL, str(failure.exception))
+
+    def test_timeout_and_launch_errors_suppress_exception_details_and_have_no_exit_code(self):
+        for error in (subprocess.TimeoutExpired(SENTINEL, 10, output=SENTINEL.encode(), stderr=SENTINEL.encode()),
+                      OSError(SENTINEL)):
+            for executable in ("codesign", SENTINEL):
+                with self.subTest(executable=executable, error=type(error).__name__), \
+                        patch.object(service.subprocess, "run", side_effect=error):
+                    with self.assertRaises(service.ReleaseError) as failure:
+                        service.run(executable, "--verify", SENTINEL)
+                expected = "Release tool could not complete; raw output was suppressed"
+                if executable == "codesign":
+                    expected += " (tool=codesign, operation=verify)"
+                self.assertEqual(str(failure.exception), expected)
+                self.assertNotIn(SENTINEL, str(failure.exception))
+                self.assertNotIn("exit_code", str(failure.exception))
+
+    def test_success_and_explicit_nonzero_return_keep_existing_behavior(self):
+        for status, allowed in ((0, False), (17, True)):
+            result = completed(b"ordinary result", b"ordinary stderr", status)
+            with patch.object(service.subprocess, "run", return_value=result):
+                self.assertIs(service.run("codesign", "--verify", allow_nonzero=allowed), result)
+
+    def test_keychain_stdin_failure_names_only_the_allowlisted_operation(self):
+        with patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 11)):
+            with self.assertRaises(service.ReleaseError) as failure:
+                service.security_command("import", SENTINEL, "-P", SENTINEL)
+        self.assertEqual(str(failure.exception), "Release tool failed; raw output was suppressed "
+                         "(tool=security, operation=import, exit_code=11)")
+        self.assertNotIn(SENTINEL, str(failure.exception))
+
     def test_credentials_private_stdin_only_and_cleanup_on_success_failure_cancel(self):
         environment = {"MACOS_CERTIFICATE_P12_BASE64": base64.b64encode(b"fixture certificate").decode(),
                        "MACOS_CERTIFICATE_PASSWORD": SENTINEL,

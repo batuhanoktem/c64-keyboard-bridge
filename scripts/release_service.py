@@ -53,7 +53,40 @@ def require(condition, message):
         raise ReleaseError(message)
 
 
-def run(*arguments, input=None, timeout=300, cwd=None, env=None, allow_nonzero=False):
+TOOL_OPERATIONS = {
+    "git": {("rev-parse",): "resolve", ("merge-base",): "ancestry", ("ls-tree",): "inventory", ("show",): "read-blob"},
+    "gh": {("api",): "api", ("run", "download"): "download-ci", ("release", "create"): "create-draft",
+           ("release", "edit"): "edit-release", ("release", "upload"): "upload-assets",
+           ("release", "download"): "download-release", ("release", "delete-asset"): "remove-draft-asset"},
+    "security": {("find-identity",): "find-identity", ("delete-keychain",): "delete-keychain"},
+    "codesign": {("--force",): "sign", ("--verify",): "verify", ("--display",): "inspect"},
+    "ditto": {("-c",): "archive"},
+    "hdiutil": {("create",): "create-dmg"},
+    "spctl": {("--assess",): "assess"},
+    "xcrun": {("notarytool", "submit"): "submit-notarization", ("stapler", "staple"): "staple",
+              ("stapler", "validate"): "validate-staple"},
+    "lipo": {("-verify_arch",): "verify-architecture"},
+}
+KEYCHAIN_OPERATIONS = {"create-keychain", "set-keychain-settings", "unlock-keychain", "import", "set-key-partition-list"}
+
+
+def tool_diagnostic(arguments, operation=None, exit_code=None):
+    """Only fixed tool/operation labels and an integer status can reach a diagnostic."""
+    tool = Path(str(arguments[0])).name if arguments else ""
+    if tool not in TOOL_OPERATIONS:
+        return ""
+    if not (tool == "security" and isinstance(operation, str) and operation in KEYCHAIN_OPERATIONS):
+        operation = next((label for prefix, label in TOOL_OPERATIONS[tool].items()
+                          if tuple(arguments[1:1 + len(prefix)]) == prefix), None)
+    fields = ["tool=" + tool]
+    if operation is not None:
+        fields.append("operation=" + operation)
+    if type(exit_code) is int:
+        fields.append("exit_code=" + str(exit_code))
+    return " (" + ", ".join(fields) + ")"
+
+
+def run(*arguments, input=None, timeout=300, cwd=None, env=None, allow_nonzero=False, diagnostic_operation=None):
     """Never expose subprocess arguments, output, raw exceptions or credentials."""
     try:
         child_env = dict(os.environ if env is None else env)
@@ -66,8 +99,10 @@ def run(*arguments, input=None, timeout=300, cwd=None, env=None, allow_nonzero=F
                                 stderr=subprocess.PIPE, check=False, timeout=timeout, cwd=cwd,
                                 env=child_env)
     except (OSError, subprocess.SubprocessError):
-        raise ReleaseError("Release tool could not complete; raw output was suppressed") from None
-    require(allow_nonzero or result.returncode == 0, "Release tool failed; raw output was suppressed")
+        raise ReleaseError("Release tool could not complete; raw output was suppressed"
+                           + tool_diagnostic(arguments, diagnostic_operation)) from None
+    require(allow_nonzero or result.returncode == 0, "Release tool failed; raw output was suppressed"
+            + tool_diagnostic(arguments, diagnostic_operation, result.returncode))
     return result
 
 
@@ -481,7 +516,7 @@ def security_command(*arguments):
                        for arg in arguments) + "\n"
     require(len(command.encode()) < 4096 and len(arguments) <= 32,
             "Credential command exceeds the Keychain importer's limits")
-    result = run("/usr/bin/security", "-i", input=command.encode())
+    result = run("/usr/bin/security", "-i", input=command.encode(), diagnostic_operation=arguments[0])
     require(b"security:" not in result.stderr, "Temporary Keychain operation failed; details suppressed")
     return result
 
