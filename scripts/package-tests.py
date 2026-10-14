@@ -34,6 +34,9 @@ class PackagingTests(unittest.TestCase):
                 self.assertRegex(entry['firmware'][field], r'^[0-9]+(?:\.[0-9]+)*$')
             self.assertIn(entry['template_prg'], ('KEYBRIDGE.PRG', 'NETWORKTEST.PRG'))
             self.assertRegex(entry['template_prg_sha256'], r'^[0-9a-f]{64}$')
+            if entry['template_prg'] == 'KEYBRIDGE.PRG':
+                self.assertEqual(entry['input_backend'], 'recording')
+                self.assertIsInstance(entry['forwarding_enabled'], bool)
         else:
             self.assertFalse(entry['origin'].startswith('physical'))
             if entry['platform'] != 'C64':
@@ -83,6 +86,23 @@ class PackagingTests(unittest.TestCase):
                 del incomplete['firmware']
                 with self.assertRaises(KeyError):
                     self.assert_screenshot_provenance(incomplete)
+
+    def test_enabled_client_capture_distinguishes_recording_from_native_input(self):
+        manifest = json.loads((ROOT / 'docs/screenshots/manifest.json').read_text())
+        clients = [entry for entry in manifest['screenshots']
+                   if entry['hardware_contacted'] and entry['template_prg'] == 'KEYBRIDGE.PRG']
+        self.assertEqual({entry['forwarding_enabled'] for entry in clients}, {False, True})
+        for entry in clients:
+            self.assert_screenshot_provenance(entry)
+            for candidate in (dict(entry, input_backend='auto'), dict(entry, forwarding_enabled='true'),
+                              dict(entry, native_input=True)):
+                with self.subTest(file=entry['file'], candidate=candidate):
+                    with self.assertRaises(AssertionError):
+                        self.assert_screenshot_provenance(candidate)
+            incomplete = dict(entry)
+            del incomplete['forwarding_enabled']
+            with self.assertRaises(KeyError):
+                self.assert_screenshot_provenance(incomplete)
 
     def test_source_allowlist_contains_gui_build_inputs_and_no_private_state(self):
         names = {path.relative_to(ROOT).as_posix() for path in PACKAGE["source_files"]()}

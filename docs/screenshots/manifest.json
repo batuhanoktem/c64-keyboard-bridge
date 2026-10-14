@@ -261,7 +261,9 @@
         "core": "1.49"
       },
       "template_prg": "KEYBRIDGE.PRG",
-      "template_prg_sha256": "4e8c278667aa352dc9ccbf7e255b6fa69edf104ba7bfeddb024792963bc92018"
+      "template_prg_sha256": "4e8c278667aa352dc9ccbf7e255b6fa69edf104ba7bfeddb024792963bc92018",
+      "input_backend": "recording",
+      "forwarding_enabled": false
     },
     {
       "file": "c64-probe-success.png",
@@ -282,6 +284,28 @@
       },
       "template_prg": "NETWORKTEST.PRG",
       "template_prg_sha256": "fa69d90a49c47a841262fcd7c7a611b3dfafee0d0583845e2123e1d8a9beaf6e"
+    },
+    {
+      "file": "c64-keyboard-input-enabled.png",
+      "platform": "C64",
+      "origin": "physical C64 Ultimate, Ethernet video stream",
+      "width": 384,
+      "height": 240,
+      "sha256": "8a7d8e2ddf8e343e1b9193d122cc4ba6b4d27ffcfedb9bda9452e35b1eeaf81b",
+      "capture_revision": "cdb4d290ceaa0c8c4eda847f0e8d6aa6713b6ba0",
+      "hardware_contacted": true,
+      "native_input": false,
+      "video_standard": "NTSC",
+      "firmware": {
+        "product": "C64 Ultimate",
+        "version": "1.1.0",
+        "fpga": "122",
+        "core": "1.49"
+      },
+      "template_prg": "KEYBRIDGE.PRG",
+      "template_prg_sha256": "4e8c278667aa352dc9ccbf7e255b6fa69edf104ba7bfeddb024792963bc92018",
+      "input_backend": "recording",
+      "forwarding_enabled": true
     }
   ]
 }

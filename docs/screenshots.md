@@ -86,9 +86,13 @@ Dark theme, selected only for this capture without changing the system theme:
 
 ## Physical C64 Ultimate
 
-The keyboard client authenticated successfully with input disabled throughout capture. This image comes from a physical C64 Ultimate's Ethernet video stream and preserves its original NTSC 384 × 240 pixel proportions. The device runs firmware 1.1.0, FPGA 122 and core 1.49; the image manifest records the exact client template. Physical probe and native input acceptance are separate checks.
+The keyboard client authenticated successfully with forwarding disabled for the first capture. This image comes from a physical C64 Ultimate's Ethernet video stream and preserves its original NTSC 384 × 240 pixel proportions. The device runs firmware 1.1.0, FPGA 122 and core 1.49; the image manifest records the exact client template. These client captures use a recording host backend and do not post native keyboard events.
 
 ![Keyboard client on a physical C64 Ultimate, showing CONNECTED: INPUT DISABLED](screenshots/c64-keyboard-connected.png)
+
+The second capture shows **CONNECTED: INPUT ENABLED** after enabling forwarding to the recording backend. The host records events without sending keys to any desktop application. The visible **02, no data: 11** is the normal idle socket-read status when no bytes are waiting, not a connection failure.
+
+![Keyboard client on a physical C64 Ultimate, showing CONNECTED: INPUT ENABLED with a recording host and normal idle-read status](screenshots/c64-keyboard-input-enabled.png)
 
 The networking probe shows **PASS: TCP/BINARY/ACK/IDLE/CLOSE** on the same physical device, captured through its Ethernet video stream at the original NTSC 384 × 240 dimensions. Host evidence confirmed receipt of 32 binary bytes, a NUL-containing acknowledgment and the idle-read phase; peer closure was observed on the C64 screen. This capture establishes that probe run, without asserting native keyboard input acceptance.
 
