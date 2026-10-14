@@ -34,6 +34,7 @@ fi
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/package-tests.py"
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/release-tests.py"
 "$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/gui-smoke-tests.py"
+"$C64_KEYBOARD_BRIDGE_PYTHON" "$C64_KEYBOARD_BRIDGE_ROOT/scripts/c64-screenshots-tests.py"
 if [[ "$(uname -s)" == "Darwin" ]]; then
     # Native, read-only service/worker queries. Headless runners may report an
     # unknown source, but must never assert, retain cancelled work, or hang.
