@@ -2,6 +2,7 @@
 """Deterministic protected-release tests; no signing key, Apple account or live release is used."""
 import base64
 from contextlib import redirect_stderr, redirect_stdout
+import gzip
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import plistlib
 import runpy
 import shlex
+import stat
 import subprocess
 import sys
 import tarfile
@@ -236,6 +238,109 @@ class ReleaseFixture(unittest.TestCase):
         self.assertEqual(resolved["revision"], self.revision)
         self.assertEqual(service.verify_inputs(self.inputs, self.identity, self.repo), self.source_hash)
 
+    def test_archive_verification_uses_private_regular_staging_and_closes_every_file(self):
+        original = service.tempfile.TemporaryFile
+        staged = []
+        def recording(*args, **kwargs):
+            stream = original(*args, **kwargs)
+            info = os.fstat(stream.fileno())
+            self.assertTrue(stat.S_ISREG(info.st_mode))
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(info.st_mode) & 0o077, 0)
+            staged.append(stream)
+            return stream
+        with patch.object(service.tempfile, "TemporaryFile", side_effect=recording):
+            self.assertEqual(service.verify_inputs(self.inputs, self.identity, self.repo), self.source_hash)
+        self.assertEqual(len(staged), 5)
+        self.assertTrue(all(stream.closed for stream in staged))
+
+    def test_archive_decompression_is_forward_only_bounded_and_supports_backward_tar_reads(self):
+        path = self.root / "forward-only.tar.gz"
+        write_tar(path, {"first": b"first", "second": b"second"}, "root")
+        original = service.gzip.open
+        reads = []
+        class ForwardOnly:
+            def __init__(self, stream):
+                self.stream = stream
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+            def read(self, count):
+                reads.append(count)
+                return self.stream.read(count)
+            def seek(self, *_args):
+                raise AssertionError("Compressed input must never be rewound")
+        with patch.object(service.gzip, "open", side_effect=lambda *a, **kw: ForwardOnly(original(*a, **kw))):
+            with service.bounded_tar(path) as archive:
+                service.archive_members(archive, "root")
+                self.assertEqual(service.read_member(archive, "root/second"), b"second")
+                self.assertEqual(service.read_member(archive, "root/first"), b"first")
+        self.assertTrue(reads)
+        self.assertTrue(all(0 < count <= 1024 * 1024 for count in reads))
+
+    def test_archive_decompression_limit_covers_padding_and_concatenated_gzip_members(self):
+        path = self.root / "limited.tar.gz"
+        write_tar(path, {"file": b"fixture"}, "root")
+        size = len(gzip.decompress(path.read_bytes()))
+        with patch.object(service, "MAX_BYTES", size), service.bounded_tar(path) as archive:
+            self.assertEqual(service.read_member(archive, "root/file"), b"fixture")
+        original = service.tempfile.TemporaryFile
+        written = []
+        class RecordingFile:
+            def __init__(self):
+                self.stream = original(mode="w+b")
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                self.stream.close()
+            def write(self, block):
+                written.append(len(block))
+                return self.stream.write(block)
+        path.write_bytes(path.read_bytes() + gzip.compress(b"hidden trailing padding"))
+        with patch.object(service, "MAX_BYTES", size), patch.object(service.tempfile, "TemporaryFile", side_effect=lambda **kw: RecordingFile()):
+            with self.assertRaisesRegex(service.ReleaseError, "decompression limit"):
+                with service.bounded_tar(path):
+                    self.fail("Oversized decompression must not yield a TAR reader")
+        self.assertLessEqual(sum(written), size)
+
+    def test_malformed_gzip_and_tar_are_sanitized_and_staging_is_closed(self):
+        path = self.root / (SENTINEL + ".tar.gz")
+        write_tar(path, {"file": b"fixture"}, "root")
+        valid = path.read_bytes()
+        invalid = (SENTINEL.encode(), valid[:-1], valid[:-8] + bytes(8), gzip.compress(SENTINEL.encode()))
+        original = service.tempfile.TemporaryFile
+        staged = []
+        def recording(*args, **kwargs):
+            stream = original(*args, **kwargs)
+            staged.append(stream)
+            return stream
+        for data in invalid:
+            path.write_bytes(data)
+            with patch.object(service.tempfile, "TemporaryFile", side_effect=recording):
+                with self.assertRaises(service.ReleaseError) as caught:
+                    with service.bounded_tar(path):
+                        self.fail("Malformed input must not yield a TAR reader")
+            self.assertEqual(str(caught.exception), "Release archive is malformed or unreadable")
+            self.assertNotIn(SENTINEL, str(caught.exception))
+            self.assertTrue(staged[-1].closed)
+
+    def test_archive_staging_is_closed_on_failed_validation_and_cancellation(self):
+        path = self.root / "cleanup.tar.gz"
+        write_tar(path, {"file": b"fixture"}, "root")
+        original = service.tempfile.TemporaryFile
+        staged = []
+        def recording(*args, **kwargs):
+            stream = original(*args, **kwargs)
+            staged.append(stream)
+            return stream
+        for failure in (service.ReleaseError("Fixture validation failed"), KeyboardInterrupt()):
+            with patch.object(service.tempfile, "TemporaryFile", side_effect=recording), self.assertRaises(type(failure)):
+                with service.bounded_tar(path):
+                    raise failure
+            self.assertTrue(staged[-1].closed)
+
     def test_ci_requires_all_native_jobs_and_rejects_pr_or_wrong_commit(self):
         for mutate in (lambda: self.github.run.update(event="pull_request"),
                        lambda: self.github.run.update(head_sha="f" * 40),
@@ -310,12 +415,12 @@ class ReleaseFixture(unittest.TestCase):
                 member = tarfile.TarInfo(name)
                 member.type, member.mode, member.linkname = kind, mode, "../../escape"
                 archive.addfile(member)
-            with tarfile.open(path) as archive, self.assertRaises(service.ReleaseError):
+            with service.bounded_tar(path) as archive, self.assertRaises(service.ReleaseError):
                 service.archive_members(archive, "root")
         with tarfile.open(path, "w:gz") as archive:
             for _ in range(2):
                 archive.addfile(tarfile.TarInfo("root/duplicate"))
-        with tarfile.open(path) as archive, self.assertRaises(service.ReleaseError):
+        with service.bounded_tar(path) as archive, self.assertRaises(service.ReleaseError):
             service.archive_members(archive, "root")
         self.assertFalse((self.root / "escape").exists())
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import gzip
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import tomllib
 import uuid
 from urllib.parse import quote, unquote, urlsplit
 import zipfile
+import zlib
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = "C64 Keyboard Bridge.app"
@@ -151,6 +153,24 @@ def archive_members(archive, root):
         names.add(path.as_posix())
         members.append(member)
     return members
+
+
+@contextmanager
+def bounded_tar(path):
+    """Decompress once to a private regular file; validation never seeks through gzip."""
+    try:
+        with tempfile.TemporaryFile(prefix="release-tar-", mode="w+b") as staged:
+            with gzip.open(path, "rb") as compressed:
+                total = 0
+                while block := compressed.read(min(1024 * 1024, MAX_BYTES - total + 1)):
+                    total += len(block)
+                    require(total <= MAX_BYTES, "Release archive exceeds its decompression limit")
+                    staged.write(block)
+            staged.seek(0)
+            with tarfile.open(fileobj=staged, mode="r:") as archive:
+                yield archive
+    except (OSError, EOFError, tarfile.TarError, zlib.error):
+        raise ReleaseError("Release archive is malformed or unreadable") from None
 
 
 def read_member(archive, name, maximum=16 * 1024**2):
@@ -469,7 +489,7 @@ def verify_inputs(directory, identity, cwd=ROOT):
                     require(hashlib.sha256(read_zip(archive, root + "/" + name)).hexdigest() == digest,
                             "Windows executable does not match provenance")
         else:
-            with tarfile.open(directory / (root + ".tar.gz"), "r:gz") as archive:
+            with bounded_tar(directory / (root + ".tar.gz")) as archive:
                 archive_members(archive, root)
                 if "apple" in target:
                     validate_bundle_members(archive, root)
@@ -480,7 +500,7 @@ def verify_inputs(directory, identity, cwd=ROOT):
                     require(hashlib.sha256(read_member(archive, root + "/" + name, 512 * 1024**2)).hexdigest() == digest,
                             "Executable does not match provenance")
     source_root = f"c64-keyboard-bridge-{version}-source"
-    with tarfile.open(directory / (source_root + ".tar.gz"), "r:gz") as archive:
+    with bounded_tar(directory / (source_root + ".tar.gz")) as archive:
         archive_members(archive, source_root)
         source = archive_json(archive, source_root + "/build-provenance.json")
         hashes.add(validate_provenance(source, identity))
