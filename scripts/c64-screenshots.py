@@ -43,6 +43,9 @@ def capture_command(emulator, directory, image, standard):
 
 
 def capture(emulator, prgs, output, standard, manifest):
+    load_paths = [(prgs / (name + '.PRG')).as_posix() for name, _ in SCREENS]
+    if any(character in path for path in load_paths for character in ('"', '\r', '\n')):
+        raise ValueError('PRG directory cannot contain monitor command delimiters')
     images = [output / (label + '.png') for _, label in SCREENS]
     if any(path.exists() for path in [*images, output / 'capture.json']):
         raise FileExistsError('Capture output exists; choose a fresh output directory to preserve evidence')
@@ -59,11 +62,8 @@ def capture(emulator, prgs, output, standard, manifest):
         environment.update({'XDG_CONFIG_HOME': str(directory / 'config'),
                             'XDG_DATA_HOME': str(directory / 'data'),
                             'XDG_CACHE_HOME': str(directory / 'cache')})
-        for (name, label), image in zip(SCREENS, images):
+        for (name, label), image, load_path in zip(SCREENS, images, load_paths):
             commands = directory / 'capture.mon'
-            load_path = (prgs / (name + '.PRG')).as_posix()
-            if any(character in load_path for character in ('"', '\r', '\n')):
-                raise ValueError('PRG directory cannot contain monitor command delimiters')
             commands.write_text(f'load "{load_path}" 0\ng 080d\n')
             result = subprocess.run(capture_command(emulator, directory, image, standard),
                                     cwd=directory, env=environment,

@@ -139,8 +139,14 @@ class CaptureTests(unittest.TestCase):
     def test_monitor_command_delimiters_cannot_change_the_program(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'invalid"\nquit'
-            with self.assertRaisesRegex(ValueError, 'delimiters'):
-                self.capture(root)
+            with patch.object(subprocess, 'run') as run, \
+                    patch.object(tempfile, 'TemporaryDirectory') as private:
+                with self.assertRaisesRegex(ValueError, 'delimiters'):
+                    CAPTURE['capture']('fixture-vice', root / 'unconfigured-prgs', root / 'screens',
+                                       'pal', self.manifest)
+                run.assert_not_called()
+                private.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 if __name__ == '__main__':
