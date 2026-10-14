@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
+import posixpath
 import re
 import secrets
 import shutil
@@ -17,6 +18,7 @@ import tarfile
 import tempfile
 import tomllib
 import uuid
+from urllib.parse import quote, unquote, urlsplit
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -752,23 +754,112 @@ def assemble_final(inputs, promoted, destination, identity):
     verify_final(destination, identity)
 
 
-def upload_draft(directory, identity, github, publish=False):
-    entries = verify_final(directory, identity)
-    existing = github.release(identity["tag"])
-    require(existing is None or existing.get("draft") is True, "Published releases must never be overwritten")
-    if existing is None:
-        run("gh", "release", "create", identity["tag"], "--repo", github.repository,
-            "--verify-tag", "--draft", "--generate-notes", "--title", identity["tag"])
-    # Remove only stale draft assets. Each operation may be partial; the release remains a draft.
+def release_notes(identity, cwd=ROOT):
+    """Read prepared notes and resolve repository links against the exact release commit."""
+    version, revision, tag, repository = (identity.get(name, "") for name in
+                                          ("version", "revision", "tag", "repository"))
+    require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None
+            and re.fullmatch(r"[a-f0-9]{40}", revision) is not None and tag == "v" + version
+            and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is not None,
+            "Release notes identity is invalid")
+    name = f"docs/release-notes-{version}.md"
+    tree = run("git", "ls-tree", "-rz", "--full-tree", revision, cwd=cwd).stdout
+    files = set()
+    try:
+        for entry in tree.split(b"\0"):
+            if entry:
+                metadata, path = entry.split(b"\t", 1)
+                mode, kind, _object = metadata.split(b" ")
+                if mode in {b"100644", b"100755"} and kind == b"blob":
+                    files.add(path.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise ReleaseError("Release notes repository inventory is malformed") from None
+    require(name in files, "Prepared release notes are missing from the exact release commit")
+    content = run("git", "show", f"{revision}:{name}", cwd=cwd).stdout
+    require(0 < len(content) <= 65536, "Prepared release notes are empty or oversized")
+    try:
+        body = content.decode("utf-8")
+    except UnicodeError:
+        raise ReleaseError("Prepared release notes are not UTF-8") from None
+    require(bool(body.strip()) and "\0" not in body, "Prepared release notes are empty or malformed")
+
+    def destination(value, image=False):
+        angled = value.startswith("<") and value.endswith(">")
+        target = value[1:-1] if angled else value
+        try:
+            parsed = urlsplit(target)
+            path = unquote(parsed.path, errors="strict")
+        except (ValueError, UnicodeError):
+            raise ReleaseError("Prepared release notes contain an invalid link") from None
+        if parsed.scheme:
+            require(parsed.scheme in {"https", "http", "mailto"}, "Prepared release notes contain an unsupported link")
+            return value
+        require(not parsed.netloc and not any(ord(character) < 32 for character in target)
+                and "\\" not in path, "Prepared release notes contain an invalid repository link")
+        if not path:
+            require(not parsed.query and bool(parsed.fragment), "Prepared release notes contain an empty link")
+            return value
+        normalized = posixpath.normpath(path.lstrip("/") if path.startswith("/")
+                                        else posixpath.join("docs", path))
+        require(normalized in files, "Prepared release notes link does not name a file in the exact release commit")
+        base = (f"https://raw.githubusercontent.com/{repository}/{quote(tag, safe='')}" if image
+                else f"https://github.com/{repository}/blob/{quote(tag, safe='')}")
+        resolved = base + "/" + quote(normalized, safe="/")
+        if parsed.query:
+            resolved += "?" + parsed.query
+        if parsed.fragment:
+            resolved += "#" + parsed.fragment
+        return "<" + resolved + ">" if angled else resolved
+
+    # Prepared notes use ordinary Markdown links and images. Preserve their labels,
+    # optional titles, external URLs and fragment-only navigation.
+    inline = re.compile(r'(?P<open>!?\[[^\]\n]*\]\()(?P<target><[^>\n]+>|[^ \t\n)]+)'
+                        r'(?P<title>[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^\)\n]*\)))?(?P<close>\))')
+    body = inline.sub(lambda match: match["open"] + destination(match["target"], match["open"].startswith("!"))
+                      + (match["title"] or "") + match["close"], body)
+    image_references = {match.group(1).strip().casefold() for match in re.finditer(r'!\[[^\]\n]*\]\[([^\]\n]+)\]', body)}
+    references = re.compile(r'^(?P<open>[ ]{0,3}\[(?P<label>[^\]\n]+)\]:[ \t]*)'
+                            r'(?P<target><[^>\n]+>|[^ \t\n]+)(?P<tail>[^\n]*)$', re.MULTILINE)
+    body = references.sub(lambda match: match["open"] + destination(match["target"],
+                          match["label"].strip().casefold() in image_references) + match["tail"], body)
+    require(len(body.encode("utf-8")) <= 65536, "Resolved release notes exceed GitHub's body limit")
+    return body
+
+
+def verify_draft_body(github, identity, body):
     existing = github.release(identity["tag"])
     require(existing is not None and existing.get("draft") is True, "Release must remain a draft while uploading")
+    require(existing.get("body") == body and existing.get("prerelease") is False,
+            "Release body or prerelease status differs from the prepared notes; publication is blocked")
+    return existing
+
+
+def upload_draft(directory, identity, github, publish=False, cwd=ROOT):
+    entries = verify_final(directory, identity)
+    body = release_notes(identity, cwd)
+    existing = github.release(identity["tag"])
+    require(existing is None or existing.get("draft") is True, "Published releases must never be overwritten")
+    with tempfile.TemporaryDirectory(prefix="release-notes-") as temporary:
+        notes_file = Path(temporary) / "release-notes.md"
+        notes_file.write_text(body, encoding="utf-8", newline="")
+        if existing is None:
+            run("gh", "release", "create", identity["tag"], "--repo", github.repository,
+                "--verify-tag", "--draft", "--prerelease=false", "--notes-file", notes_file, "--title", identity["tag"])
+        else:
+            existing = github.release(identity["tag"])
+            require(existing is not None and existing.get("draft") is True,
+                    "Release was published before the prepared draft notes could be applied")
+            run("gh", "release", "edit", identity["tag"], "--repo", github.repository,
+                "--prerelease=false", "--notes-file", notes_file)
+    # Remove only stale draft assets. Each operation may be partial; the release remains a draft.
+    existing = verify_draft_body(github, identity, body)
     expected = set(entries) | {"SHA256SUMS"}
     for asset in existing.get("assets", []):
         if asset["name"] not in expected:
             run("gh", "release", "delete-asset", identity["tag"], safe_name(asset["name"]),
                 "--yes", "--repo", github.repository)
     for filename in sorted(expected):
-        require(github.release(identity["tag"]).get("draft") is True, "Release was published during upload")
+        verify_draft_body(github, identity, body)
         run("gh", "release", "upload", identity["tag"], Path(directory) / filename,
             "--clobber", "--repo", github.repository, timeout=600)
     with tempfile.TemporaryDirectory(prefix="release-download-") as temporary:
@@ -777,7 +868,7 @@ def upload_draft(directory, identity, github, publish=False):
         downloaded = verify_final(temporary, identity)
         require(downloaded == entries and {p.name for p in Path(temporary).iterdir()} == expected,
                 "Uploaded release inventory or checksums disagree; publication is blocked")
-    require(github.release(identity["tag"]).get("draft") is True, "Release changed during final verification")
+    verify_draft_body(github, identity, body)
     if publish:
         run("gh", "release", "edit", identity["tag"], "--draft=false", "--repo", github.repository)
     return {"draft": not publish, "verified_assets": len(expected)}

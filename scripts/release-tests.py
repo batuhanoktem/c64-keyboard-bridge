@@ -79,7 +79,11 @@ class ReleaseFixture(unittest.TestCase):
         self.source = {"Cargo.toml": b'[workspace.package]\nversion="0.1.0"\n',
                        "README.md": b"release fixture\n", "c64/Makefile": b"fixture build input\n",
                        "c64/src/fixture.c": b"fixture C source\n", "docs/screenshots/demo.json": b'{"fixture":true}\n',
-                       "docs/screenshots/demo.png": b"png fixture"}
+                       "docs/screenshots/demo.png": b"png fixture", "docs/platforms.md": b"# Platforms\n",
+                       "docs/release-notes-0.1.0.md": b'# Version 0.1.0\n\nFirst release; Windows is unsigned.\n'
+                       b'[platforms](platforms.md#gnome-wayland) and [readme](../README.md).\n'
+                       b'![fixture](screenshots/demo.png)\n',
+                       "docs/release-notes-0.2.0.md": b"Wrong version notes; never upload.\n"}
         for name, data in self.source.items():
             path = self.repo / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,6 +199,30 @@ class ReleaseFixture(unittest.TestCase):
         path.write_text(json.dumps(receipt))
         service.checksum_manifest(output)
         return output
+
+    def fixture_upload(self, final, calls, fail_upload=False, tamper_download=False, tamper_body=False):
+        original_run = service.run
+        def recording(*args, **kwargs):
+            calls.append(tuple(str(arg) for arg in args))
+            if args[0] == "git":
+                return original_run(*args, **kwargs)
+            if "--notes-file" in args:
+                body = Path(args[args.index("--notes-file") + 1]).read_text(encoding="utf-8")
+                if self.github.existing is None:
+                    self.github.existing = {"draft": True, "assets": []}
+                self.github.existing.update(body=body, prerelease=False)
+            if "upload" in args and fail_upload:
+                raise service.ReleaseError("Fixture upload failed")
+            if "download" in args:
+                destination = Path(args[args.index("--dir") + 1])
+                for path in final.iterdir():
+                    (destination / path.name).write_bytes(path.read_bytes())
+                if tamper_download:
+                    (destination / "c64-keyboard-bridge_0.1.0_amd64.deb").write_bytes(b"tampered")
+                if tamper_body:
+                    self.github.existing["body"] = "Changed outside the verified upload."
+            return completed()
+        return recording
 
     def test_exact_commit_five_platform_ci_and_source_hashes(self):
         with fixture_environment():
@@ -484,13 +512,9 @@ class ReleaseFixture(unittest.TestCase):
         service.assemble_final(self.inputs, promoted, final, self.identity)
         self.github.existing = {"draft": True, "assets": []}
         calls = []
-        def failure(*args, **_kwargs):
-            calls.append(tuple(str(arg) for arg in args))
-            if "upload" in args:
-                raise service.ReleaseError("Fixture upload failed")
-            return completed()
-        with patch.object(service, "run", side_effect=failure), self.assertRaises(service.ReleaseError):
-            service.upload_draft(final, self.identity, self.github, publish=True)
+        with patch.object(service, "run", side_effect=self.fixture_upload(final, calls, fail_upload=True)), \
+                self.assertRaisesRegex(service.ReleaseError, "Fixture upload failed"):
+            service.upload_draft(final, self.identity, self.github, publish=True, cwd=self.repo)
         self.assertFalse(any("--draft=false" in args for args in calls))
         self.assertTrue(self.github.existing["draft"])
 
@@ -501,22 +525,138 @@ class ReleaseFixture(unittest.TestCase):
         self.github.existing = {"draft": True, "assets": []}
         for tamper in (True, False):
             calls = []
-            def recording(*args, **_kwargs):
-                calls.append(tuple(str(arg) for arg in args))
-                if "download" in args:
-                    destination = Path(args[args.index("--dir") + 1])
-                    for path in final.iterdir():
-                        (destination / path.name).write_bytes(path.read_bytes())
-                    if tamper:
-                        (destination / "c64-keyboard-bridge_0.1.0_amd64.deb").write_bytes(b"tampered")
-                return completed()
-            with patch.object(service, "run", side_effect=recording):
+            with patch.object(service, "run", side_effect=self.fixture_upload(final, calls, tamper_download=tamper)):
                 if tamper:
                     with self.assertRaises(service.ReleaseError):
-                        service.upload_draft(final, self.identity, self.github, publish=True)
+                        service.upload_draft(final, self.identity, self.github, publish=True, cwd=self.repo)
                 else:
-                    self.assertTrue(service.upload_draft(final, self.identity, self.github)["draft"])
+                    self.assertTrue(service.upload_draft(final, self.identity, self.github, cwd=self.repo)["draft"])
             self.assertFalse(any("--draft=false" in args for args in calls))
+
+    def test_prepared_notes_select_exact_tagged_version_and_ignore_working_tree(self):
+        expected = service.release_notes(self.identity, self.repo)
+        self.assertIn("First release; Windows is unsigned.", expected)
+        self.assertNotIn("Wrong version", expected)
+        (self.repo / "docs/release-notes-0.1.0.md").write_text("Uncommitted wrong notes.")
+        (self.repo / "docs/platforms.md").unlink()
+        self.assertEqual(service.release_notes(self.identity, self.repo), expected)
+
+    def test_prepared_notes_normalize_document_images_and_reference_links(self):
+        body = (b'# Release\n[platforms](platforms.md#gnome-wayland "Platform guide")\n'
+                b'![fixture](screenshots/demo.png)\n[space](<../README.md#overview>)\n'
+                b'[external](https://example.invalid/guide#part) [mail](mailto:fixture@example.invalid)\n'
+                b'[self](#release)\n[guide][manual]\n![capture][picture]\n'
+                b'[manual]: platforms.md#gnome-wayland "Platform guide"\n'
+                b'[picture]: screenshots/demo.png\n')
+        original_run = service.run
+        def notes(*args, **kwargs):
+            if args[:2] == ("git", "show"):
+                return completed(body)
+            return original_run(*args, **kwargs)
+        with patch.object(service, "run", side_effect=notes):
+            resolved = service.release_notes(self.identity, self.repo)
+        base = "https://github.com/" + self.github.repository + "/blob/v0.1.0/"
+        raw = "https://raw.githubusercontent.com/" + self.github.repository + "/v0.1.0/"
+        self.assertIn(f'({base}docs/platforms.md#gnome-wayland "Platform guide")', resolved)
+        self.assertIn(f'![fixture]({raw}docs/screenshots/demo.png)', resolved)
+        self.assertIn(f'(<{base}README.md#overview>)', resolved)
+        self.assertIn(f'[manual]: {base}docs/platforms.md#gnome-wayland "Platform guide"', resolved)
+        self.assertIn(f'[picture]: {raw}docs/screenshots/demo.png', resolved)
+        for unchanged in ('https://example.invalid/guide#part', 'mailto:fixture@example.invalid', '[self](#release)'):
+            self.assertIn(unchanged, resolved)
+
+    def test_missing_or_invalid_prepared_notes_block_draft_creation(self):
+        final = self.root / "missing-notes-final"
+        service.assemble_final(self.inputs, self.promoted(), final, self.identity)
+        original_run = service.run
+        for corrupt in ("missing", "empty", "oversized", "utf8", "missing-link", "escape", "symlink", "unsafe"):
+            calls = []
+            def failure(*args, **kwargs):
+                calls.append(tuple(str(arg) for arg in args))
+                if args[:2] == ("git", "ls-tree") and corrupt == "missing":
+                    return completed()
+                if args[:2] == ("git", "ls-tree") and corrupt == "symlink":
+                    tree = original_run(*args, **kwargs).stdout
+                    return completed(tree + b"120000 blob " + b"0" * 40 + b"\toutside-link\0")
+                if args[:2] == ("git", "show"):
+                    value = {"empty": b" \n", "oversized": b"x" * 65537, "utf8": b"\xff",
+                             "missing-link": b"[missing](unknown.md)", "escape": b"[escape](../../README.md)",
+                             "symlink": b"[link](../outside-link)", "unsafe": b"[unsafe](javascript:alert)"}
+                    return completed(value[corrupt])
+                return original_run(*args, **kwargs)
+            with self.subTest(corrupt=corrupt), patch.object(service, "run", side_effect=failure), \
+                    self.assertRaises(service.ReleaseError):
+                service.upload_draft(final, self.identity, self.github, publish=True, cwd=self.repo)
+            self.assertFalse(any(args[0] == "gh" for args in calls))
+
+    def test_new_and_existing_drafts_receive_exact_prepared_body(self):
+        final = self.root / "notes-final"
+        service.assemble_final(self.inputs, self.promoted(), final, self.identity)
+        expected = service.release_notes(self.identity, self.repo)
+        for existing in (False, True):
+            self.github.existing = {"draft": True, "prerelease": True, "body": "old notes", "assets": []} if existing else None
+            calls = []
+            with patch.object(service, "run", side_effect=self.fixture_upload(final, calls)):
+                result = service.upload_draft(final, self.identity, self.github, cwd=self.repo)
+            self.assertTrue(result["draft"])
+            self.assertEqual(self.github.existing["body"], expected)
+            self.assertIs(self.github.existing["prerelease"], False)
+            notes_command = next(args for args in calls if "--notes-file" in args)
+            self.assertEqual(notes_command[2], "edit" if existing else "create")
+            self.assertIn("--prerelease=false", notes_command)
+            if existing:
+                self.assertNotIn("--draft", notes_command)
+            self.assertNotIn("--generate-notes", notes_command)
+            self.assertFalse(Path(notes_command[notes_command.index("--notes-file") + 1]).exists())
+            self.assertFalse(any("--draft=false" in args for args in calls))
+
+    def test_changed_body_after_upload_download_blocks_publication(self):
+        final = self.root / "changed-notes-final"
+        service.assemble_final(self.inputs, self.promoted(), final, self.identity)
+        calls = []
+        with patch.object(service, "run", side_effect=self.fixture_upload(final, calls, tamper_body=True)), \
+                self.assertRaisesRegex(service.ReleaseError, "body"):
+            service.upload_draft(final, self.identity, self.github, publish=True, cwd=self.repo)
+        self.assertTrue(any("download" in args for args in calls))
+        self.assertFalse(any("--draft=false" in args for args in calls))
+        self.assertTrue(self.github.existing["draft"])
+
+    def test_body_mismatch_before_upload_blocks_assets_and_publication(self):
+        final = self.root / "rejected-notes-final"
+        service.assemble_final(self.inputs, self.promoted(), final, self.identity)
+        calls = []
+        recording = self.fixture_upload(final, calls)
+        def ignored_body(*args, **kwargs):
+            result = recording(*args, **kwargs)
+            if "--notes-file" in args:
+                self.github.existing["body"] = "Server did not retain the expected body."
+            return result
+        with patch.object(service, "run", side_effect=ignored_body), self.assertRaisesRegex(service.ReleaseError, "body"):
+            service.upload_draft(final, self.identity, self.github, publish=True, cwd=self.repo)
+        self.assertFalse(any("upload" in args or "--draft=false" in args for args in calls))
+
+    def test_draft_published_before_notes_update_is_never_reopened(self):
+        final = self.root / "published-during-notes-final"
+        service.assemble_final(self.inputs, self.promoted(), final, self.identity)
+        calls = []
+        states = [{"draft": True, "assets": [], "body": "old notes"}, {"draft": False, "assets": []}]
+        with patch.object(self.github, "release", side_effect=states), \
+                patch.object(service, "run", side_effect=self.fixture_upload(final, calls)), \
+                self.assertRaisesRegex(service.ReleaseError, "published before"):
+            service.upload_draft(final, self.identity, self.github, publish=True, cwd=self.repo)
+        self.assertFalse(any(args[0] == "gh" for args in calls))
+
+    def test_verified_body_and_assets_allow_explicit_normal_publication(self):
+        final = self.root / "published-with-notes-final"
+        service.assemble_final(self.inputs, self.promoted(), final, self.identity)
+        calls = []
+        with patch.object(service, "run", side_effect=self.fixture_upload(final, calls)):
+            result = service.upload_draft(final, self.identity, self.github, publish=True, cwd=self.repo)
+        self.assertFalse(result["draft"])
+        download = next(index for index, args in enumerate(calls) if "download" in args)
+        publication = next(index for index, args in enumerate(calls) if "--draft=false" in args)
+        self.assertLess(download, publication)
+        self.assertIs(self.github.existing["prerelease"], False)
 
 
 class CredentialTests(unittest.TestCase):
