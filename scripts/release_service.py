@@ -390,15 +390,52 @@ class GitHub:
     def api(self, suffix):
         return json_output(run("gh", "api", f"repos/{self.repository}/{suffix}"))
 
+    @staticmethod
+    def release_record(value):
+        require(isinstance(value, dict) and type(value.get("id")) is int and 0 < value["id"] <= 2**63 - 1
+                and isinstance(value.get("tag_name"), str) and 0 < len(value["tag_name"]) <= 256
+                and not any(ord(character) < 32 or ord(character) == 127 for character in value["tag_name"])
+                and type(value.get("draft")) is bool and type(value.get("prerelease")) is bool,
+                "Release API returned an invalid release record; details suppressed")
+        return value
+
     def release(self, tag):
+        require(isinstance(tag, str) and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) is not None,
+                "Release lookup requires a valid version tag")
         result = run("gh", "api", f"repos/{self.repository}/releases/tags/{tag}", allow_nonzero=True)
-        if result.returncode:
-            # An authenticated listing distinguishes a genuinely absent release from access/network errors.
-            releases = self.api("releases?per_page=100")
-            require(not any(item.get("tag_name") == tag for item in releases),
-                    "Existing release could not be inspected")
+        value = json_output(result)
+        if result.returncode == 0:
+            record = self.release_record(value)
+            require(record["tag_name"] == tag, "Release API returned a different version tag")
+            return record
+        require(isinstance(value, dict) and (value.get("status") == 404 or value.get("status") == "404"),
+                "Release lookup failed; response details suppressed")
+        # The tag endpoint can hide authenticated drafts. Inventory all bounded
+        # pages, then resolve a matching record through its numeric release ID.
+        matches, seen = [], set()
+        for page in range(1, 11):
+            releases = self.api(f"releases?per_page=100&page={page}")
+            require(isinstance(releases, list) and len(releases) <= 100,
+                    "Release API returned an invalid inventory; details suppressed")
+            for item in releases:
+                record = self.release_record(item)
+                require(record["id"] not in seen, "Release inventory repeats a release ID; inspection is blocked")
+                seen.add(record["id"])
+                if record["tag_name"] == tag:
+                    matches.append(record)
+            if len(releases) < 100:
+                break
+        else:
+            raise ReleaseError("Release inventory exceeds its bounded page limit")
+        require(len(matches) <= 1, "Release inventory repeats the requested version tag; inspection is blocked")
+        if not matches:
             return None
-        return json_output(result)
+        listed = matches[0]
+        record = self.release_record(self.api(f"releases/{listed['id']}"))
+        require(record["id"] == listed["id"] and record["tag_name"] == tag
+                and record["draft"] == listed["draft"] and record["prerelease"] == listed["prerelease"],
+                "Existing release changed or could not be inspected by ID")
+        return record
 
 
 def validate_run(run_info, jobs, workflow, repository, revision):

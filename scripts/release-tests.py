@@ -809,6 +809,117 @@ class ReleaseFixture(unittest.TestCase):
         self.assertIs(self.github.existing["prerelease"], False)
 
 
+class GitHubReleaseTests(unittest.TestCase):
+    tag = "v0.1.0"
+
+    def record(self, release_id=42, tag=None, draft=True, prerelease=False):
+        return {"id": release_id, "tag_name": self.tag if tag is None else tag, "draft": draft,
+                "prerelease": prerelease, "body": "Reviewed notes", "assets": []}
+
+    def response(self, value, status=0):
+        return completed(json.dumps(value).encode(), SENTINEL.encode(), status)
+
+    def test_tag_404_finds_authenticated_draft_by_its_numeric_release_id(self):
+        listed = self.record()
+        full = {**listed, "body": "Exact prepared notes", "assets": [{"name": "fixture.tar.gz"}]}
+        with patch.object(service, "run", side_effect=[self.response({"status": "404"}, 1),
+                                                      self.response([listed]), self.response(full)]) as runner:
+            found = service.GitHub(FakeGitHub.repository).release(self.tag)
+        self.assertEqual(found, full)
+        self.assertEqual([call.args[2].split('/c64-keyboard-bridge/', 1)[1] for call in runner.call_args_list],
+                         ["releases/tags/v0.1.0", "releases?per_page=100&page=1", "releases/42"])
+
+    def test_successful_exact_tag_lookup_needs_no_fallback(self):
+        record = self.record(draft=False)
+        with patch.object(service, "run", return_value=self.response(record)) as runner:
+            self.assertEqual(service.GitHub(FakeGitHub.repository).release(self.tag), record)
+        self.assertEqual(runner.call_count, 1)
+
+    def test_draft_after_first_hundred_releases_is_found_without_truncation(self):
+        first = [self.record(release_id=index, tag=f"v1.0.{index}", draft=False) for index in range(1, 101)]
+        found = self.record(release_id=101)
+        with patch.object(service, "run", side_effect=[self.response({"status": 404}, 1), self.response(first),
+                                                      self.response([found]), self.response(found)]) as runner:
+            self.assertEqual(service.GitHub(FakeGitHub.repository).release(self.tag), found)
+        self.assertIn("page=2", runner.call_args_list[2].args[2])
+        self.assertTrue(runner.call_args_list[-1].args[2].endswith("releases/101"))
+
+    def test_complete_authenticated_empty_inventory_is_the_only_absent_release_case(self):
+        with patch.object(service, "run", side_effect=[self.response({"status": 404}, 1), self.response([])]) as runner:
+            self.assertIsNone(service.GitHub(FakeGitHub.repository).release(self.tag))
+        self.assertEqual(runner.call_count, 2)
+
+    def test_network_authentication_and_inventory_errors_never_become_absence(self):
+        failures = ([completed(SENTINEL.encode(), SENTINEL.encode(), 1)],
+                    [self.response({"status": 403, "message": SENTINEL}, 1)],
+                    [self.response({"status": 500, "message": SENTINEL}, 1)],
+                    [self.response({"status": [404], "message": SENTINEL}, 1)],
+                    [self.response({"status": 404}, 1), self.response({"message": SENTINEL}, 1)],
+                    [self.response({"status": 404}, 1), self.response({"releases": []})])
+        for responses in failures:
+            with self.subTest(responses=len(responses)), patch.object(service, "run", side_effect=responses), \
+                    self.assertRaises(service.ReleaseError) as error:
+                service.GitHub(FakeGitHub.repository).release(self.tag)
+            self.assertNotIn(SENTINEL, str(error.exception))
+        with patch.object(service, "run", side_effect=service.ReleaseError("Release tool could not complete; raw output was suppressed")), \
+                self.assertRaises(service.ReleaseError):
+            service.GitHub(FakeGitHub.repository).release(self.tag)
+
+    def test_invalid_record_ids_shapes_and_tags_fail_closed_before_id_lookup(self):
+        invalid = (None, [], {}, self.record(release_id=True), self.record(release_id=0), self.record(release_id=-1),
+                   self.record(release_id="42"), self.record(release_id=2**63),
+                   {**self.record(), "draft": "true"}, {**self.record(), "prerelease": None},
+                   self.record(tag=""), self.record(tag="v0.1.0\n" + SENTINEL))
+        for record in invalid:
+            with self.subTest(record_type=type(record).__name__), \
+                    patch.object(service, "run", side_effect=[self.response({"status": 404}, 1), self.response([record])]) as runner, \
+                    self.assertRaises(service.ReleaseError) as error:
+                service.GitHub(FakeGitHub.repository).release(self.tag)
+            self.assertEqual(runner.call_count, 2)
+            self.assertNotIn(SENTINEL, str(error.exception))
+
+    def test_matching_id_must_be_accessible_and_agree_with_listing_and_requested_tag(self):
+        listed = self.record()
+        mismatches = (self.response({"status": 404, "message": SENTINEL}, 1), self.response(None),
+                      self.response(self.record(release_id=43)), self.response(self.record(tag="v0.2.0")),
+                      self.response(self.record(draft=False)), self.response(self.record(prerelease=True)))
+        for reply in mismatches:
+            with self.subTest(reply_status=reply.returncode), patch.object(service, "run", side_effect=[
+                    self.response({"status": 404}, 1), self.response([listed]), reply]), \
+                    self.assertRaises(service.ReleaseError) as error:
+                service.GitHub(FakeGitHub.repository).release(self.tag)
+            self.assertNotIn(SENTINEL, str(error.exception))
+
+    def test_duplicate_matching_tags_or_release_ids_are_rejected(self):
+        for records in ([self.record(), self.record()], [self.record(), self.record(release_id=43)]):
+            with self.subTest(records=len(records)), patch.object(service, "run", side_effect=[
+                    self.response({"status": 404}, 1), self.response(records)]), self.assertRaises(service.ReleaseError):
+                service.GitHub(FakeGitHub.repository).release(self.tag)
+
+    def test_listing_pagination_is_bounded_even_with_valid_unique_records(self):
+        responses = [self.response({"status": 404}, 1)] + [self.response([
+            self.record(release_id=page * 100 + index, tag=f"v1.{page}.{index}", draft=False)
+            for index in range(1, 101)]) for page in range(10)]
+        with patch.object(service, "run", side_effect=responses) as runner, self.assertRaisesRegex(service.ReleaseError, "page limit"):
+            service.GitHub(FakeGitHub.repository).release(self.tag)
+        self.assertEqual(runner.call_count, 11)
+
+    def test_published_matching_release_is_returned_as_published_and_never_mutated(self):
+        published = self.record(draft=False)
+        with patch.object(service, "run", side_effect=[self.response({"status": 404}, 1),
+                                                      self.response([published]), self.response(published)]) as runner:
+            found = service.GitHub(FakeGitHub.repository).release(self.tag)
+        self.assertIs(found["draft"], False)
+        self.assertTrue(all(call.args[:2] == ("gh", "api") for call in runner.call_args_list))
+
+    def test_invalid_requested_tag_or_direct_response_tag_does_not_select_another_release(self):
+        with patch.object(service, "run") as runner, self.assertRaises(service.ReleaseError):
+            service.GitHub(FakeGitHub.repository).release("../../" + SENTINEL)
+        runner.assert_not_called()
+        with patch.object(service, "run", return_value=self.response(self.record(tag="v0.2.0"))), self.assertRaises(service.ReleaseError):
+            service.GitHub(FakeGitHub.repository).release(self.tag)
+
+
 class StapleTests(unittest.TestCase):
     receipt = {"status": "Accepted", "submission_id": RECEIPT["id"]}
 
@@ -1452,7 +1563,7 @@ class CredentialTests(unittest.TestCase):
 
     def test_github_missing_release_uses_bounded_scrubbed_runner(self):
         github = service.GitHub(FakeGitHub.repository)
-        with patch.object(service, "run", side_effect=[completed(stderr=b"HTTP 404", returncode=1), completed(b"[]")]) as tools:
+        with patch.object(service, "run", side_effect=[completed(b'{"status":"404"}', stderr=b"HTTP 404", returncode=1), completed(b"[]")]) as tools:
             self.assertIsNone(github.release("v0.1.0"))
             self.assertTrue(tools.call_args_list[0].kwargs["allow_nonzero"])
 
