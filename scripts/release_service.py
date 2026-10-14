@@ -78,6 +78,8 @@ def tool_diagnostic(arguments, operation=None, exit_code=None):
     if not (tool == "security" and isinstance(operation, str) and operation in KEYCHAIN_OPERATIONS):
         operation = next((label for prefix, label in TOOL_OPERATIONS[tool].items()
                           if tuple(arguments[1:1 + len(prefix)]) == prefix), None)
+        if tool == "lipo" and len(arguments) > 2 and arguments[2] == "-verify_arch":
+            operation = "verify-architecture"
     fields = ["tool=" + tool]
     if operation is not None:
         fields.append("operation=" + operation)
@@ -661,7 +663,7 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
                     "Unsigned app bundle identity is incorrect")
             provenance = json.loads((payload / "build-provenance.json").read_text())
             for name in BINARIES:
-                run("/usr/bin/lipo", "-verify_arch", "arm64" if target.startswith("aarch64") else "x86_64", payload / name)
+                run("/usr/bin/lipo", payload / name, "-verify_arch", "arm64" if target.startswith("aarch64") else "x86_64")
                 require(sha256(payload / name) == provenance["executables"][name]
                         and sha256(app / "Contents/MacOS" / name) == provenance["executables"][name],
                         "App executable does not match tested CLI/GUI provenance")

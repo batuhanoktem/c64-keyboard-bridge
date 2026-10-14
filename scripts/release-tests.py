@@ -173,6 +173,12 @@ class ReleaseFixture(unittest.TestCase):
         tool = Path(args[0]).name
         if tool == "security":
             return completed(f'  1) {service.FINGERPRINT} "{service.IDENTITY}"\n'.encode())
+        if tool == "lipo":
+            self.assertEqual(len(args), 4)
+            self.assertTrue(Path(args[1]).is_file(), "lipo requires its existing input file before the command")
+            self.assertEqual(args[2], "-verify_arch")
+            architecture = "arm64" if Path(args[1]).read_bytes().startswith(b"aarch64-apple-darwin") else "x86_64"
+            service.require(args[3] == architecture, "Fixture architecture mismatch")
         if tool == "codesign" and "--display" in args:
             target = Path(args[-1])
             identifier = service.APP_ID if target.name.endswith(".app") else service.APP_ID + (".gui" if target.name.endswith("-gui") else ".cli")
@@ -415,6 +421,45 @@ class ReleaseFixture(unittest.TestCase):
                             for args in calls))
         with self.assertRaisesRegex(service.ReleaseError, "approved"):
             service.validate_identity(fingerprint="0" * 40)
+
+    def test_promotion_architecture_checks_use_existing_input_file_first_for_both_frontends(self):
+        calls = []
+        def recording(*args, **kwargs):
+            calls.append(tuple(str(argument) for argument in args))
+            return self.fake_mac(*args, **kwargs)
+        with patch.object(service, "run", side_effect=recording), fixture_environment():
+            service.promote_macos(self.inputs, self.root / "canonical-lipo", self.identity, profile="fixture")
+        checks = [args for args in calls if Path(args[0]).name == "lipo"]
+        self.assertEqual(len(checks), 4)
+        self.assertEqual({(Path(args[1]).parent.name, Path(args[1]).name, args[2], args[3]) for args in checks},
+                         {(f"c64-keyboard-bridge-0.1.0-{target}", binary, "-verify_arch", architecture)
+                          for target, architecture in zip(service.TARGETS[:2], ("arm64", "x86_64"))
+                          for binary in service.BINARIES})
+        for check in checks:
+            check_index = calls.index(check)
+            sign_index = next(index for index, args in enumerate(calls)
+                              if Path(args[0]).name == "codesign" and "--sign" in args and args[-1] == check[1])
+            self.assertLess(check_index, sign_index)
+
+    def test_mismatched_architecture_blocks_signing_and_promotion_evidence(self):
+        root = "c64-keyboard-bridge-0.1.0-aarch64-apple-darwin"
+        path = self.inputs / (root + ".tar.gz")
+        with tarfile.open(path) as archive:
+            files = {member.name[len(root)+1:]: archive.extractfile(member).read()
+                     for member in archive if member.isfile()}
+        files[service.BINARIES[0]] = b"x86_64-apple-darwin wrong architecture fixture"
+        write_tar(path, files, root)
+        calls = []
+        def recording(*args, **kwargs):
+            calls.append(tuple(str(argument) for argument in args))
+            return self.fake_mac(*args, **kwargs)
+        output = self.root / "mismatched-lipo"
+        with patch.object(service, "run", side_effect=recording), fixture_environment(), \
+                self.assertRaisesRegex(service.ReleaseError, "architecture mismatch"):
+            service.promote_macos(self.inputs, output, self.identity, profile="fixture")
+        self.assertTrue(any(Path(args[0]).name == "lipo" for args in calls))
+        self.assertFalse(any(Path(args[0]).name == "codesign" for args in calls))
+        self.assertFalse((output / "promotion.metadata.json").exists())
 
     def test_rejected_and_pending_notarization_block_promotion(self):
         for status in ("Invalid", "In Progress", "Rejected", None):
@@ -754,6 +799,14 @@ class CredentialTests(unittest.TestCase):
                 service.security_command("import", SENTINEL, "-P", SENTINEL)
         self.assertEqual(str(failure.exception), "Release tool failed; raw output was suppressed "
                          "(tool=security, operation=import, exit_code=11)")
+        self.assertNotIn(SENTINEL, str(failure.exception))
+
+    def test_canonical_lipo_failure_phase_never_includes_input_path(self):
+        with patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), SENTINEL.encode(), 1)):
+            with self.assertRaises(service.ReleaseError) as failure:
+                service.run("/usr/bin/lipo", "/private/" + SENTINEL, "-verify_arch", "arm64")
+        self.assertEqual(str(failure.exception), "Release tool failed; raw output was suppressed "
+                         "(tool=lipo, operation=verify-architecture, exit_code=1)")
         self.assertNotIn(SENTINEL, str(failure.exception))
 
     def test_credentials_private_stdin_only_and_cleanup_on_success_failure_cancel(self):
