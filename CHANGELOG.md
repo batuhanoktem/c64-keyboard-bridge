@@ -2,7 +2,9 @@
 
 User-visible changes are collected here. Unreleased changes do not imply that a tag or downloadable release has been published.
 
-## Unreleased — 0.1.0
+## Unreleased
+
+## 0.1.0 — 2026-10-14
 
 ### Added
 
@@ -20,4 +22,4 @@ User-visible changes are collected here. Unreleased changes do not imply that a 
 - Native installers, portable packages, matching corresponding source, licensing notices and verified checksums.
 - An approval-gated workflow for Mac signing and notarization, verified final downloads and draft release preparation. Ordinary CI packages and Windows installers remain unsigned.
 
-Prepared [0.1.0 release notes](docs/release-notes-0.1.0.md) describe acceptance limits. Record a release date and version section here only when that version is published.
+[0.1.0 release notes](docs/release-notes-0.1.0.md) describe acceptance limits.
