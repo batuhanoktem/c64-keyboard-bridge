@@ -914,6 +914,88 @@ class CredentialTests(unittest.TestCase):
                          "(tool=lipo, operation=verify-architecture, exit_code=1)")
         self.assertNotIn(SENTINEL, str(failure.exception))
 
+    def test_codesign_reason_literals_never_expose_surrounding_credentials_or_paths(self):
+        for reason, markers in service.CODESIGN_FAILURES:
+            for marker in markers:
+                stdout, stderr = io.StringIO(), io.StringIO()
+                output = SENTINEL.encode() + b' /private/path\n' + marker + b' "' + SENTINEL.encode() + b'"\n'
+                with self.subTest(reason=reason, marker=marker), redirect_stdout(stdout), redirect_stderr(stderr), \
+                        patch.object(service.subprocess, "run", return_value=completed(output, output, 1)):
+                    with self.assertRaises(service.ReleaseError) as failure:
+                        service.run("/usr/bin/codesign", "--force", "--sign", SENTINEL, "/private/" + SENTINEL,
+                                    env={"PRIVATE_CREDENTIAL": SENTINEL}, diagnostic_role="portable-cli")
+                self.assertEqual(str(failure.exception), "Release tool failed; raw output was suppressed "
+                                 f"(tool=codesign, operation=sign, exit_code=1, role=portable-cli, reason={reason})")
+                self.assertNotIn(SENTINEL, str(failure.exception))
+                self.assertNotIn("/private/", str(failure.exception))
+                self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+
+    def test_codesign_chain_warning_precedes_generic_internal_component_reason(self):
+        for output in (b'Warning: unable to build chain to self-signed root\nerrSecInternalComponent',
+                       b'errSecInternalComponent\nWarning: unable to build chain to self-signed root'):
+            with patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), output, 1)):
+                with self.assertRaises(service.ReleaseError) as failure:
+                    service.run("codesign", "--force", diagnostic_role="portable-gui")
+            self.assertIn("reason=chain-unavailable", str(failure.exception))
+            self.assertNotIn("reason=internal-component", str(failure.exception))
+            self.assertNotIn(SENTINEL, str(failure.exception))
+
+    def test_codesign_unknown_output_and_invalid_roles_are_suppressed(self):
+        for role in (SENTINEL, {"secret": SENTINEL}, [SENTINEL], None):
+            with self.subTest(role=role), \
+                    patch.object(service.subprocess, "run", return_value=completed(b"errSecInternalComponent", SENTINEL.encode(), 1)):
+                with self.assertRaises(service.ReleaseError) as failure:
+                    service.run("codesign", "--force", SENTINEL, diagnostic_role=role)
+            self.assertEqual(str(failure.exception), "Release tool failed; raw output was suppressed "
+                             "(tool=codesign, operation=sign, exit_code=1)")
+            self.assertNotIn(SENTINEL, str(failure.exception))
+        for tool in (SENTINEL, "xcrun"):
+            with self.subTest(tool=tool), \
+                    patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), b"errSecInternalComponent", 1)):
+                with self.assertRaises(service.ReleaseError) as failure:
+                    service.run(tool, "--force", diagnostic_role="app-bundle")
+            self.assertNotIn("role=", str(failure.exception))
+            self.assertNotIn("reason=", str(failure.exception))
+            self.assertNotIn(SENTINEL, str(failure.exception))
+
+    def test_codesign_timeout_does_not_classify_exception_output_or_fabricate_exit_status(self):
+        error = subprocess.TimeoutExpired(SENTINEL, 5, output=SENTINEL.encode(),
+                                          stderr=b"errSecInternalComponent\n" + SENTINEL.encode())
+        with patch.object(service.subprocess, "run", side_effect=error):
+            with self.assertRaises(service.ReleaseError) as failure:
+                service.run("codesign", "--force", SENTINEL, diagnostic_role="app-bundle")
+        self.assertEqual(str(failure.exception), "Release tool could not complete; raw output was suppressed "
+                         "(tool=codesign, operation=sign, role=app-bundle)")
+        self.assertNotIn(SENTINEL, str(failure.exception))
+        self.assertNotIn("reason=", str(failure.exception))
+        self.assertNotIn("exit_code=", str(failure.exception))
+
+    def test_promotion_assigns_only_explicit_cli_gui_app_and_dmg_roles(self):
+        fixture = ReleaseFixture("test_signing_uses_approved_certificate_and_never_executes_package")
+        fixture.setUp()
+        try:
+            calls = []
+            def recording(*args, **kwargs):
+                if Path(str(args[0])).name == "codesign" and "--sign" in args:
+                    calls.append((kwargs.get("diagnostic_role"), Path(args[-1]).name))
+                return fixture.fake_mac(*args, **kwargs)
+            with patch.object(service, "run", side_effect=recording), fixture_environment():
+                service.promote_macos(fixture.inputs, fixture.root / "explicit-role-promotion", fixture.identity, profile="fixture")
+            self.assertEqual(len(calls), 8)
+            for role in service.SIGNING_ROLES:
+                selected = [name for selected_role, name in calls if selected_role == role]
+                self.assertEqual(len(selected), 2)
+                if role == "portable-cli":
+                    self.assertEqual(selected, [service.BINARIES[0]] * 2)
+                elif role == "portable-gui":
+                    self.assertEqual(selected, [service.BINARIES[1]] * 2)
+                elif role == "app-bundle":
+                    self.assertEqual(selected, [service.APP] * 2)
+                else:
+                    self.assertTrue(all(name.endswith(".dmg") for name in selected))
+        finally:
+            fixture.tearDown()
+
     def test_credentials_private_stdin_only_and_cleanup_on_success_failure_cancel(self):
         environment = {"MACOS_CERTIFICATE_P12_BASE64": base64.b64encode(b"fixture certificate").decode(),
                        "MACOS_CERTIFICATE_PASSWORD": SENTINEL,

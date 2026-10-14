@@ -70,10 +70,23 @@ TOOL_OPERATIONS = {
     "lipo": {("-verify_arch",): "verify-architecture"},
 }
 KEYCHAIN_OPERATIONS = {"create-keychain", "set-keychain-settings", "unlock-keychain", "import", "set-key-partition-list"}
+SIGNING_ROLES = {"portable-cli", "portable-gui", "app-bundle", "dmg"}
+# Known Security/codesign literals only. Specific chain evidence precedes the
+# generic errSecInternalComponent wrapper described by Apple DTS (thread 712005).
+# Resource-fork wording is documented in Apple's QA1940.
+CODESIGN_FAILURES = (
+    ("chain-unavailable", (b"unable to build chain to self-signed root", b"errSecCreateChainFailed")),
+    ("interaction-not-allowed", (b"User interaction is not allowed", b"errSecInteractionNotAllowed")),
+    ("identity-unavailable", (b"no identity found", b"errSecItemNotFound")),
+    ("timestamp-unavailable", (b"The timestamp service is not available", b"A timestamp was expected but was not found")),
+    ("permission-denied", (b"Permission denied", b"Operation not permitted", b"errSecAuthFailed")),
+    ("resource-fork", (b"resource fork, Finder information, or similar detritus not allowed", b"errSecCSInvalidAssociatedFileData")),
+    ("internal-component", (b"errSecInternalComponent",)),
+)
 
 
-def tool_diagnostic(arguments, operation=None, exit_code=None):
-    """Only fixed tool/operation labels and an integer status can reach a diagnostic."""
+def tool_diagnostic(arguments, operation=None, exit_code=None, role=None, stderr=None):
+    """Only fixed diagnostic labels and an integer status can reach a diagnostic."""
     tool = Path(str(arguments[0])).name if arguments else ""
     if tool not in TOOL_OPERATIONS:
         return ""
@@ -87,10 +100,19 @@ def tool_diagnostic(arguments, operation=None, exit_code=None):
         fields.append("operation=" + operation)
     if type(exit_code) is int:
         fields.append("exit_code=" + str(exit_code))
+    if tool == "codesign":
+        if isinstance(role, str) and role in SIGNING_ROLES:
+            fields.append("role=" + role)
+        if isinstance(stderr, bytes):
+            reason = next((reason for reason, markers in CODESIGN_FAILURES
+                           if any(marker in stderr for marker in markers)), None)
+            if reason is not None:
+                fields.append("reason=" + reason)
     return " (" + ", ".join(fields) + ")"
 
 
-def run(*arguments, input=None, timeout=300, cwd=None, env=None, allow_nonzero=False, diagnostic_operation=None):
+def run(*arguments, input=None, timeout=300, cwd=None, env=None, allow_nonzero=False,
+        diagnostic_operation=None, diagnostic_role=None):
     """Never expose subprocess arguments, output, raw exceptions or credentials."""
     try:
         child_env = dict(os.environ if env is None else env)
@@ -104,9 +126,9 @@ def run(*arguments, input=None, timeout=300, cwd=None, env=None, allow_nonzero=F
                                 env=child_env)
     except (OSError, subprocess.SubprocessError):
         raise ReleaseError("Release tool could not complete; raw output was suppressed"
-                           + tool_diagnostic(arguments, diagnostic_operation)) from None
+                           + tool_diagnostic(arguments, diagnostic_operation, role=diagnostic_role)) from None
     require(allow_nonzero or result.returncode == 0, "Release tool failed; raw output was suppressed"
-            + tool_diagnostic(arguments, diagnostic_operation, result.returncode))
+            + tool_diagnostic(arguments, diagnostic_operation, result.returncode, diagnostic_role, result.stderr))
     return result
 
 
@@ -608,12 +630,12 @@ def validate_identity(keychain=None, fingerprint=FINGERPRINT, team=TEAM):
             "Approved Developer ID certificate is not available")
 
 
-def sign(path, identifier, keychain=None):
+def sign(path, identifier, keychain=None, diagnostic_role=None):
     arguments = ["/usr/bin/codesign", "--force", "--sign", FINGERPRINT, "--options", "runtime",
                  "--timestamp", "--identifier", identifier]
     if keychain:
         arguments += ["--keychain", keychain]
-    run(*arguments, path)
+    run(*arguments, path, diagnostic_role=diagnostic_role)
     run("/usr/bin/codesign", "--verify", "--strict", path)
     evidence = run("/usr/bin/codesign", "--display", "--verbose=4", path).stderr.decode(errors="replace")
     require(f"TeamIdentifier={TEAM}\n" in evidence and f"Identifier={identifier}\n" in evidence
@@ -687,7 +709,8 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
                 require(sha256(payload / name) == provenance["executables"][name]
                         and sha256(app / "Contents/MacOS" / name) == provenance["executables"][name],
                         "App executable does not match tested CLI/GUI provenance")
-                sign(payload / name, APP_ID + (".gui" if name.endswith("-gui") else ".cli"), keychain)
+                sign(payload / name, APP_ID + (".gui" if name.endswith("-gui") else ".cli"), keychain,
+                     diagnostic_role="portable-gui" if name == BINARIES[1] else "portable-cli")
                 shutil.copy2(payload / name, app / "Contents/MacOS" / name)
             provenance["signing"] = "signed-only"
             provenance["executables"] = {name: sha256(payload / name) for name in BINARIES}
@@ -695,7 +718,7 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
             provenance["notarization_evidence"] = "Final acceptance and stapling evidence is in external release metadata"
             for path in (payload / "build-provenance.json", app / "Contents/Resources/build-provenance.json"):
                 path.write_text(json.dumps(provenance, indent=2) + "\n")
-            sign(app, APP_ID, keychain)
+            sign(app, APP_ID, keychain, diagnostic_role="app-bundle")
             run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
             record = {"payload": {"status": "not-submitted"}, "app_stapled": False,
                       "dmg": {"status": "not-submitted"}, "dmg_stapled": False,
@@ -729,7 +752,7 @@ def promote_macos(inputs, output, identity, credentials=None, profile=None, sign
             args = ["/usr/bin/codesign", "--force", "--sign", FINGERPRINT, "--timestamp"]
             if keychain:
                 args += ["--keychain", keychain]
-            run(*args, dmg)
+            run(*args, dmg, diagnostic_role="dmg")
             run("/usr/bin/codesign", "--verify", "--strict", dmg)
             if not signed_only:
                 record["dmg"] = notarize(dmg, credentials, profile)
