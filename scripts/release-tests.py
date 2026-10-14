@@ -810,6 +810,43 @@ class ReleaseFixture(unittest.TestCase):
 
 
 class CredentialTests(unittest.TestCase):
+    def keychain_scope_fixture(self, prior, controls=None):
+        controls = {} if controls is None else controls
+        scope, calls = list(prior), []
+        def recording(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:3] == ("/usr/bin/security", "list-keychains", "-d"):
+                if controls.pop("read_failure", False):
+                    raise service.ReleaseError(SENTINEL)
+                return completed("".join(f'    "{path}"\n' for path in scope).encode())
+            if args[:2] == ("/usr/bin/security", "-i"):
+                command = shlex.split(kwargs["input"].decode())
+                if command[0] == "create-keychain":
+                    if controls.pop("create_failure", False):
+                        raise service.ReleaseError(SENTINEL)
+                    Path(command[-1]).write_bytes(b"fixture-only keychain")
+                if command[0] == "list-keychains":
+                    self.assertEqual(command[1:4], ["-d", "user", "-s"])
+                    if command[4:] == prior and controls.get("restore_failure"):
+                        raise service.ReleaseError(SENTINEL)
+                    if controls.pop("ignore_registration", False):
+                        return completed()
+                    scope[:] = command[4:]
+                    if command[4:] != prior and controls.pop("registration_cancel", False):
+                        raise KeyboardInterrupt()
+            elif args[:2] == ("/usr/bin/security", "delete-keychain"):
+                if controls.get("delete_failure"):
+                    raise service.ReleaseError(SENTINEL)
+                Path(args[-1]).unlink()
+                scope[:] = [path for path in scope if path != str(args[-1])]
+            return completed()
+        return scope, calls, recording
+
+    def signing_fixture_environment(self):
+        return {"MACOS_CERTIFICATE_P12_BASE64": base64.b64encode(b"fixture encrypted " + SENTINEL.encode()).decode(),
+                "MACOS_CERTIFICATE_PASSWORD": SENTINEL,
+                "APPLE_NOTARY_KEY_P8_BASE64": base64.b64encode(b"-----BEGIN PRIVATE KEY-----\n" + SENTINEL.encode()).decode()}
+
     def test_fixture_environment_preserves_os_process_launch_state(self):
         original_path = os.environ.get("PATH")
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push",
@@ -940,6 +977,24 @@ class CredentialTests(unittest.TestCase):
             self.assertNotIn("reason=internal-component", str(failure.exception))
             self.assertNotIn(SENTINEL, str(failure.exception))
 
+    def test_native_keychain_status_messages_have_fixed_nonsecret_categories(self):
+        messages = (
+            (b"The specified item could not be found in the keychain.", "identity-unavailable"),
+            (b"The specified keychain could not be found.", "keychain-unavailable"),
+            (b"The specified keychain is not a valid keychain file.", "keychain-invalid"),
+            (b"CSSMERR_CSP_INVALID_KEY_REFERENCE", "private-key-unavailable"),
+            (b"One or more certificates required to validate this certificate cannot be found.", "chain-unavailable"),
+            (b"The user name or passphrase you entered is not correct.", "authentication-failed"),
+        )
+        for message, reason in messages:
+            with self.subTest(reason=reason), \
+                    patch.object(service.subprocess, "run", return_value=completed(SENTINEL.encode(), message + b" " + SENTINEL.encode(), 1)):
+                with self.assertRaises(service.ReleaseError) as failure:
+                    service.run("codesign", "--force", diagnostic_role="portable-cli")
+            self.assertIn("reason=" + reason, str(failure.exception))
+            self.assertNotIn(SENTINEL, str(failure.exception))
+            self.assertNotIn(message.decode(), str(failure.exception))
+
     def test_codesign_unknown_output_and_invalid_roles_are_suppressed(self):
         for role in (SENTINEL, {"secret": SENTINEL}, [SENTINEL], None):
             with self.subTest(role=role), \
@@ -1004,8 +1059,11 @@ class CredentialTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary) / "c64-keyboard-bridge-signing"
                 calls = []
+                search_list = []
                 def recording(*args, **kwargs):
                     calls.append((args, kwargs))
+                    if args[:3] == ("/usr/bin/security", "list-keychains", "-d"):
+                        return completed("".join(f'    "{path}"\n' for path in search_list).encode())
                     if args[:2] == ("/usr/bin/security", "-i"):
                         command = shlex.split(kwargs["input"].decode())
                         if command[0] == "create-keychain":
@@ -1013,6 +1071,9 @@ class CredentialTests(unittest.TestCase):
                         if command[0] == "import":
                             self.assertNotIn("-A", command)
                             self.assertIn("-x", command)
+                        if command[0] == "list-keychains":
+                            self.assertEqual(command[1:4], ["-d", "user", "-s"])
+                            search_list[:] = command[4:]
                     if args[:2] == ("/usr/bin/security", "delete-keychain"):
                         Path(args[-1]).unlink()
                     return completed()
@@ -1041,6 +1102,195 @@ class CredentialTests(unittest.TestCase):
                 with self.assertRaisesRegex(service.ReleaseError, "publication"):
                     service.cleanup_credentials(directory)
             self.assertFalse(directory.exists())
+
+    def test_private_keychain_registration_preserves_and_restores_ordered_user_scope(self):
+        prior = ["/fixture/first keychain-db", "/fixture/second.keychain-db"]
+        for outcome in ("success", "operation", "cancel"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "c64-keyboard-bridge-signing"
+                scope, calls, recording = self.keychain_scope_fixture(prior)
+                with patch.object(service, "run", side_effect=recording), fixture_environment():
+                    try:
+                        with service.signing_credentials(directory, self.signing_fixture_environment()):
+                            self.assertEqual(scope, [str(directory / "release.keychain-db"), *prior])
+                            journal = directory / "keychain-search-state.json"
+                            self.assertEqual(json.loads(journal.read_text())["prior_search_list"], prior)
+                            self.assertNotIn(SENTINEL, journal.read_text())
+                            if os.name != "nt":
+                                self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
+                            if outcome == "operation":
+                                raise service.ReleaseError("Fixture operation")
+                            if outcome == "cancel":
+                                raise KeyboardInterrupt()
+                    except (service.ReleaseError, KeyboardInterrupt):
+                        self.assertNotEqual(outcome, "success")
+                self.assertEqual(scope, prior)
+                self.assertFalse(directory.exists())
+                setter = [shlex.split(kwargs["input"].decode()) for args, kwargs in calls if args[:2] == ("/usr/bin/security", "-i")
+                          and shlex.split(kwargs["input"].decode())[0] == "list-keychains"]
+                self.assertEqual(setter[-1][4:], prior)
+                self.assertTrue(all(SENTINEL not in str(args) for args, _kwargs in calls))
+
+    def test_registration_failure_or_cancellation_restores_scope_and_scrubs_credentials(self):
+        for control in ("read_failure", "create_failure", "ignore_registration", "registration_cancel"):
+            with self.subTest(control=control), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "c64-keyboard-bridge-signing"
+                prior = ["/fixture/login.keychain-db"]
+                scope, _calls, recording = self.keychain_scope_fixture(prior, {control: True})
+                with patch.object(service, "run", side_effect=recording), fixture_environment():
+                    with self.assertRaises((service.ReleaseError, KeyboardInterrupt)):
+                        with service.signing_credentials(directory, self.signing_fixture_environment()):
+                            self.fail("Unverified registration yielded signing credentials")
+                self.assertEqual(scope, prior)
+                self.assertFalse(directory.exists())
+
+    def test_failed_restoration_or_deletion_scrubs_keys_and_retains_only_retry_journal(self):
+        for control in ("restore_failure", "delete_failure"):
+            with self.subTest(control=control), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "c64-keyboard-bridge-signing"
+                prior = ["/fixture/original.keychain-db"]
+                controls = {}
+                scope, _calls, recording = self.keychain_scope_fixture(prior, controls)
+                with patch.object(service, "run", side_effect=recording), fixture_environment():
+                    with self.assertRaisesRegex(service.ReleaseError, "cleanup failed") as error:
+                        with service.signing_credentials(directory, self.signing_fixture_environment()):
+                            controls[control] = True
+                    self.assertNotIn(SENTINEL, str(error.exception))
+                    self.assertEqual({path.name for path in directory.iterdir()}, {"keychain-search-state.json"})
+                    self.assertNotIn(SENTINEL, (directory / "keychain-search-state.json").read_text())
+                    controls.clear()
+                    service.cleanup_credentials(directory)
+                self.assertEqual(scope, prior)
+                self.assertFalse(directory.exists())
+
+    def test_empty_search_list_is_supported_without_setting_a_default_keychain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "c64-keyboard-bridge-signing"
+            scope, calls, recording = self.keychain_scope_fixture([])
+            with patch.object(service, "run", side_effect=recording), fixture_environment():
+                with service.signing_credentials(directory, self.signing_fixture_environment()):
+                    self.assertEqual(scope, [str(directory / "release.keychain-db")])
+            self.assertEqual(scope, [])
+            self.assertFalse(directory.exists())
+            self.assertFalse(any("default-keychain" in kwargs.get("input", b"").decode() for _args, kwargs in calls))
+
+    def test_cleanup_unlink_failure_preserves_journal_and_scrubs_other_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "c64-keyboard-bridge-signing"
+            prior = ["/fixture/original.keychain-db"]
+            scope, _calls, recording = self.keychain_scope_fixture(prior)
+            original_unlink, original_iterdir = Path.unlink, Path.iterdir
+            def ordered(path):
+                if path == directory:
+                    entries = list(original_iterdir(path))
+                    return iter(sorted(entries, key=lambda item: item.name != "keychain-search-state.json"))
+                return original_iterdir(path)
+            def fail_certificate(path, *args, **kwargs):
+                if path == directory / "certificate.p12":
+                    raise OSError(SENTINEL)
+                return original_unlink(path, *args, **kwargs)
+            with patch.object(service, "run", side_effect=recording), fixture_environment():
+                with self.assertRaisesRegex(service.ReleaseError, "cleanup failed") as error:
+                    with service.signing_credentials(directory, self.signing_fixture_environment()):
+                        with patch.object(Path, "unlink", fail_certificate), patch.object(Path, "iterdir", ordered):
+                            service.cleanup_credentials(directory)
+                self.assertNotIn(SENTINEL, str(error.exception))
+                # The context's final retry clears the recovered state after the
+                # injected unlink failure; directly exercising the first pass below
+                # verifies the journal survives the deterministic iteration order.
+                self.assertFalse(directory.exists())
+                self.assertEqual(scope, prior)
+            directory.mkdir()
+            journal = directory / "keychain-search-state.json"
+            journal.write_text(json.dumps({"schema": 1, "domain": "user", "prior_search_list": prior}))
+            (directory / "certificate.p12").write_text(SENTINEL)
+            (directory / "notary.p8").write_text(SENTINEL)
+            with patch.object(service, "run", side_effect=recording), patch.object(Path, "unlink", fail_certificate), \
+                    patch.object(Path, "iterdir", ordered), self.assertRaisesRegex(service.ReleaseError, "cleanup failed"):
+                service.cleanup_credentials(directory)
+            self.assertTrue(journal.is_file())
+            self.assertLessEqual(journal.stat().st_size, 4096)
+            self.assertNotIn(SENTINEL, journal.read_text())
+            self.assertFalse((directory / "notary.p8").exists())
+            if os.name != "nt":
+                self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
+            with patch.object(service, "run", side_effect=recording):
+                service.cleanup_credentials(directory)
+            self.assertFalse(directory.exists())
+
+    def test_malformed_or_oversized_search_list_never_mutates_scope(self):
+        outputs = (SENTINEL.encode(), b'    "relative.keychain"\n', b'    "/fixture/a"\n    "/fixture/a"\n',
+                   b"x" * 65537, b'    "/fixture/' + b"x" * 1025 + b'"\n', b'    "/fixture/\0a"\n')
+        for output in outputs:
+            with self.subTest(size=len(output)), patch.object(service, "run", return_value=completed(output)) as runner:
+                with self.assertRaises(service.ReleaseError) as error:
+                    service.keychain_search_list()
+                self.assertNotIn(SENTINEL, str(error.exception))
+                self.assertEqual(runner.call_count, 1)
+                self.assertNotIn("-s", runner.call_args.args)
+
+    def test_invalid_recovery_journal_cannot_restore_arbitrary_scope_and_still_scrubs_keys(self):
+        states = ({"schema": True, "domain": "user", "prior_search_list": []},
+                  {"schema": 1, "domain": "system", "prior_search_list": []},
+                  {"schema": 1, "domain": "user", "prior_search_list": ["-A"]},
+                  {"schema": 1, "domain": "user", "prior_search_list": [], "password": SENTINEL})
+        for state in states:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "c64-keyboard-bridge-signing"
+                directory.mkdir()
+                (directory / "certificate.p12").write_text(SENTINEL)
+                (directory / "notary.p8").write_text(SENTINEL)
+                (directory / "keychain-search-state.json").write_text(json.dumps(state))
+                with patch.object(service, "run") as runner, self.assertRaisesRegex(service.ReleaseError, "cleanup failed") as error:
+                    service.cleanup_credentials(directory)
+                self.assertFalse(directory.exists())
+                self.assertFalse(runner.called)
+                self.assertNotIn(SENTINEL, str(error.exception))
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink fixture")
+    def test_symlink_recovery_journal_is_never_read_or_followed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "c64-keyboard-bridge-signing"
+            directory.mkdir()
+            outside = Path(temporary) / "outside-journal.json"
+            contents = json.dumps({"schema": 1, "domain": "user", "prior_search_list": ["/fixture/outside.keychain-db"]})
+            outside.write_text(contents)
+            (directory / "keychain-search-state.json").symlink_to(outside)
+            (directory / "certificate.p12").write_text(SENTINEL)
+            with patch.object(service, "run") as runner, self.assertRaisesRegex(service.ReleaseError, "cleanup failed"):
+                service.cleanup_credentials(directory)
+            self.assertEqual(outside.read_text(), contents)
+            self.assertFalse(runner.called)
+            self.assertFalse(directory.exists())
+
+    def test_original_scope_cannot_already_contain_new_temporary_keychain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "c64-keyboard-bridge-signing"
+            original = [str(directory / "release.keychain-db")]
+            scope, calls, recording = self.keychain_scope_fixture(original)
+            with patch.object(service, "run", side_effect=recording), fixture_environment(), \
+                    self.assertRaisesRegex(service.ReleaseError, "already present"):
+                with service.signing_credentials(directory, self.signing_fixture_environment()):
+                    self.fail("Existing temporary search entry was accepted")
+            self.assertEqual(scope, original)
+            self.assertFalse(directory.exists())
+            self.assertFalse(any("create-keychain" in kwargs.get("input", b"").decode() for _args, kwargs in calls))
+
+    @unittest.skipIf(os.name == "nt", "POSIX path alias fixture")
+    def test_search_list_readback_accepts_ordered_path_aliases_without_rewriting_original_spellings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owned = root / "owned"
+            owned.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(owned, target_is_directory=True)
+            expected = [str(alias / "temporary.keychain-db"), "/fixture/original.keychain-db"]
+            observed = [str(owned / "temporary.keychain-db"), "/fixture/original.keychain-db"]
+            with patch.object(service, "security_command") as setter, patch.object(service, "keychain_search_list", return_value=observed):
+                service.set_keychain_search_list(expected)
+            self.assertEqual(setter.call_args.args, ("list-keychains", "-d", "user", "-s", *expected))
+            self.assertNotEqual(observed, expected)
+            self.assertEqual(service.canonical_keychain_paths(observed), service.canonical_keychain_paths(expected))
 
     def test_invalid_credentials_cleanup_without_plaintext_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:

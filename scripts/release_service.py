@@ -60,7 +60,8 @@ TOOL_OPERATIONS = {
     "gh": {("api",): "api", ("run", "download"): "download-ci", ("release", "create"): "create-draft",
            ("release", "edit"): "edit-release", ("release", "upload"): "upload-assets",
            ("release", "download"): "download-release", ("release", "delete-asset"): "remove-draft-asset"},
-    "security": {("find-identity",): "find-identity", ("delete-keychain",): "delete-keychain"},
+    "security": {("find-identity",): "find-identity", ("delete-keychain",): "delete-keychain",
+                 ("list-keychains",): "search-list"},
     "codesign": {("--force",): "sign", ("--verify",): "verify", ("--display",): "inspect"},
     "ditto": {("-c",): "archive"},
     "hdiutil": {("create",): "create-dmg"},
@@ -69,17 +70,24 @@ TOOL_OPERATIONS = {
               ("stapler", "validate"): "validate-staple"},
     "lipo": {("-verify_arch",): "verify-architecture"},
 }
-KEYCHAIN_OPERATIONS = {"create-keychain", "set-keychain-settings", "unlock-keychain", "import", "set-key-partition-list"}
+KEYCHAIN_OPERATIONS = {"create-keychain", "set-keychain-settings", "unlock-keychain", "import", "set-key-partition-list",
+                      "list-keychains"}
 SIGNING_ROLES = {"portable-cli", "portable-gui", "app-bundle", "dmg"}
 # Known Security/codesign literals only. Specific chain evidence precedes the
 # generic errSecInternalComponent wrapper described by Apple DTS (thread 712005).
 # Resource-fork wording is documented in Apple's QA1940.
 CODESIGN_FAILURES = (
-    ("chain-unavailable", (b"unable to build chain to self-signed root", b"errSecCreateChainFailed")),
+    ("chain-unavailable", (b"unable to build chain to self-signed root", b"errSecCreateChainFailed",
+                           b"One or more certificates required to validate this certificate cannot be found.")),
     ("interaction-not-allowed", (b"User interaction is not allowed", b"errSecInteractionNotAllowed")),
-    ("identity-unavailable", (b"no identity found", b"errSecItemNotFound")),
+    ("identity-unavailable", (b"no identity found", b"errSecItemNotFound",
+                              b"The specified item could not be found in the keychain.")),
+    ("keychain-unavailable", (b"The specified keychain could not be found.", b"errSecNoSuchKeychain")),
+    ("keychain-invalid", (b"The specified keychain is not a valid keychain file.", b"errSecInvalidKeychain")),
+    ("private-key-unavailable", (b"CSSMERR_CSP_INVALID_KEY_REFERENCE", b"errSecInvalidKeyRef")),
     ("timestamp-unavailable", (b"The timestamp service is not available", b"A timestamp was expected but was not found")),
-    ("permission-denied", (b"Permission denied", b"Operation not permitted", b"errSecAuthFailed")),
+    ("authentication-failed", (b"The user name or passphrase you entered is not correct.", b"errSecAuthFailed")),
+    ("permission-denied", (b"Permission denied", b"Operation not permitted")),
     ("resource-fork", (b"resource fork, Finder information, or similar detritus not allowed", b"errSecCSInvalidAssociatedFileData")),
     ("internal-component", (b"errSecInternalComponent",)),
 )
@@ -565,20 +573,114 @@ def security_command(*arguments):
     return result
 
 
+def validate_keychain_search_list(paths):
+    require(isinstance(paths, list) and len(paths) <= 24
+            and all(isinstance(path, str) and (PurePosixPath(path).is_absolute() or Path(path).is_absolute())
+                    and not any(ord(character) < 32 or ord(character) == 127 for character in path)
+                    and len(path.encode("utf-8")) <= 1024 for path in paths)
+            and len(paths) == len(set(paths)), "Keychain search list is malformed or oversized")
+    require(sum(len(path.encode("utf-8")) for path in paths) < 3000,
+            "Keychain search list exceeds its recovery bounds")
+    return paths
+
+
+def keychain_search_list():
+    output = run("/usr/bin/security", "list-keychains", "-d", "user").stdout
+    require(isinstance(output, bytes) and len(output) <= 65536, "Keychain search list response is oversized")
+    try:
+        paths = []
+        for line in output.decode("utf-8").splitlines():
+            if line.strip():
+                match = re.fullmatch(r'\s*"([^"\r\n]*)"\s*', line)
+                require(match is not None, "Keychain search list response is malformed")
+                paths.append(match[1])
+        return validate_keychain_search_list(paths)
+    except UnicodeError:
+        raise ReleaseError("Keychain search list response is malformed") from None
+
+
+def set_keychain_search_list(paths):
+    paths = validate_keychain_search_list(paths)
+    security_command("list-keychains", "-d", "user", "-s", *paths)
+    require(canonical_keychain_paths(keychain_search_list()) == canonical_keychain_paths(paths),
+            "Keychain search list change could not be verified")
+
+
+def canonical_keychain_paths(paths):
+    try:
+        return [str(Path(path).resolve()) for path in validate_keychain_search_list(paths)]
+    except (OSError, RuntimeError):
+        raise ReleaseError("Keychain search paths could not be verified") from None
+
+
 def cleanup_credentials(directory):
     directory = Path(directory)
     require(directory.name == "c64-keyboard-bridge-signing" and not directory.is_symlink(),
             "Credential cleanup path is invalid")
     if not directory.exists():
         return
+    require(directory.is_dir(), "Credential cleanup path is invalid")
     keychain = directory / "release.keychain-db"
+    journal = directory / "keychain-search-state.json"
+    state = None
     failure = False
-    if keychain.exists():
+    if journal.exists() or journal.is_symlink():
         try:
-            run("/usr/bin/security", "delete-keychain", keychain)
-        except ReleaseError:
+            require(journal.is_file() and not journal.is_symlink() and journal.stat().st_size <= 4096,
+                    "Keychain recovery journal is unsafe or oversized")
+            candidate = json.loads(journal.read_text(encoding="utf-8"))
+            require(isinstance(candidate, dict) and set(candidate) == {"schema", "domain", "prior_search_list"}
+                    and type(candidate.get("schema")) is int and candidate.get("schema") == 1
+                    and candidate.get("domain") == "user",
+                    "Keychain recovery journal is malformed")
+            validate_keychain_search_list(candidate["prior_search_list"])
+            state = candidate
+            set_keychain_search_list(state["prior_search_list"])
+        except (ReleaseError, OSError, ValueError, UnicodeError, KeyboardInterrupt):
             failure = True
-    shutil.rmtree(directory)
+    if keychain.exists() or keychain.is_symlink():
+        try:
+            require(not keychain.is_symlink(), "Temporary signing Keychain is unsafe")
+            run("/usr/bin/security", "delete-keychain", keychain)
+        except (ReleaseError, OSError, KeyboardInterrupt):
+            failure = True
+    if state is not None:
+        try:
+            require(canonical_keychain_paths(keychain_search_list()) == canonical_keychain_paths(state["prior_search_list"]),
+                    "Restored Keychain search list changed during temporary Keychain removal")
+        except (ReleaseError, OSError, KeyboardInterrupt):
+            failure = True
+    # Scrub credentials even when scope restoration/deletion failed. A validated,
+    # bounded path-only journal permits the separate always-cleanup step to retry.
+    for path in directory.iterdir():
+        if state is not None and path == journal:
+            continue
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError:
+            failure = True
+    if not failure:
+        try:
+            if state is not None:
+                journal.unlink()
+            directory.rmdir()
+        except OSError:
+            failure = True
+    if failure and state is not None:
+        try:
+            if not journal.exists():
+                journal.write_text(json.dumps(state) + "\n", encoding="utf-8")
+            journal.chmod(0o600)
+        except OSError:
+            pass
+    elif failure:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
     require(not directory.exists() and not failure, "Signing credential cleanup failed; publication is blocked")
 
 
@@ -604,6 +706,14 @@ def signing_credentials(directory, environment=None):
         for path, content in ((certificate, p12), (api_path, api)):
             path.write_bytes(content)
             path.chmod(0o600)
+        prior = keychain_search_list()
+        require(str(keychain.resolve()) not in canonical_keychain_paths(prior),
+                "New temporary Keychain is already present in the original search scope")
+        journal = directory / "keychain-search-state.json"
+        encoded = (json.dumps({"schema": 1, "domain": "user", "prior_search_list": prior}) + "\n").encode("utf-8")
+        require(len(encoded) <= 4096, "Keychain recovery journal exceeds its private storage bound")
+        journal.write_bytes(encoded)
+        journal.chmod(0o600)
         security_command("create-keychain", "-p", password, keychain)
         security_command("set-keychain-settings", "-lut", "7200", keychain)
         security_command("unlock-keychain", "-p", password, keychain)
@@ -612,6 +722,7 @@ def signing_credentials(directory, environment=None):
         security_command("set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
                          "-s", "-k", password, keychain)
         require(keychain.is_file(), "Temporary signing Keychain was not created")
+        set_keychain_search_list([str(keychain), *prior])
         yield {"keychain": keychain, "api_path": api_path}
     except (ValueError, OSError):
         raise ReleaseError("Signing credential preparation failed; details suppressed") from None
